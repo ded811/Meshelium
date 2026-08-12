@@ -1,0 +1,31 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "com.deds.meshelium.fabric.mixin",
+	"client": [
+		"ChunkMapMixin",
+		"ChunkSectionsToRenderMixin",
+		"ChunkTaskPriorityQueueAccessor",
+		"CompiledSectionMeshMixin",
+		"DistanceManagerMixin",
+		"FrustumAccessor",
+		"GpuDeviceAccessor",
+		"LevelExtractorMixin",
+		"LevelRendererMixin",
+		"OptionInstanceAccessor",
+		"OptionsMixin",
+		"OptionsSubScreenAccessor",
+		"RenderPassAccessor",
+		"RenderSectionMixin",
+		"SectionCompilerMixin",
+		"SectionOcclusionGraphMixin",
+		"SectionRenderDispatcherMixin",
+		"VideoSettingsScreenMixin",
+		"VulkanBackendMixin",
+		"VulkanDeviceMixin",
+		"VulkanRenderPassAccessor"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

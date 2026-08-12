@@ -1,0 +1,325 @@
+#version 460
+// Meshelium — LGPL-3.0-only.
+//
+// Opaque terrain MESH shader (EXT dialect). Quad-expansion logic derived
+// from Nvidium by MCRcortex (LGPL-3.0):
+//   misc/reference/nvidium/.../shaders/terrain/mesh.glsl (vertex fetch
+//   terrainData[(id<<2)+0..3], triangle split {0,1,2}/{2,3,0}, and — in the
+//   wave-5 task path — the bin-table search that maps an invocation to its
+//   quad, mesh.glsl:46-69)
+//   misc/reference/nvidium/.../shaders/terrain/vertex_format.glsl (decoders,
+//   re-derived — see TerrainVertexCodec + docs/TERRAIN-DATA.md §1)
+// restructured for SetMeshOutputsEXT per NVIDIUM-ARCHITECTURE.md §4/§10
+// row 2: counts computed UNIFORMLY up front, SetMeshOutputsEXT called
+// exactly once, THEN threads diverge to write their own compacted slots.
+//
+// THREE COMPILE VARIANTS via host-injected macros (the wave-4
+// MESHELIUM_WG_SIZE pattern):
+//   MESHELIUM_TASK_CULL=1 (wave-5 default): launched by terrain.task; this
+//     stage reads its section + quad range from the task payload —
+//     workgroup id → section via the cumulative groupEnd table (binary
+//     search), thread → arena quad via the cumulative bin table (linear
+//     8-way, Nvidium's own consumption pattern). wgQuads stays uniform
+//     (derived from payload + gl_WorkGroupID only), so the EXT contract is
+//     unchanged from wave 4.
+//   MESHELIUM_TASK_CULL=0 (the meshelium.terrainDraw.cpuCull escape hatch):
+//     the wave-4 direct path, byte-identical behaviour — push constants
+//     carry {FirstQuad, QuadCount} for one contiguous CPU-culled run.
+//   MESHELIUM_TRANSLUCENT=1 (wave 7): the BLEND variant. DRAW ORDER IS
+//     CORRECTNESS here, and VK_EXT_mesh_shader's inter-workgroup primitive
+//     ordering guarantee is the study's UNVERIFIED item (arch §6) — so the
+//     DEFAULT shape is safe: ONE workgroup per draw (the host dispatches
+//     (1,1,1) per ≤MESHELIUM_TRANS_QUADS-quad slice of a section's
+//     translucent prefix, slices recorded in prefix order; ordering
+//     between DRAWS is core rasterization API order, and ordering WITHIN
+//     the workgroup follows the output primitive indices, which ascend
+//     with the prefix slot). Threads loop q += MESHELIUM_WG_SIZE to cover
+//     the draw. The per-section occlusion gate (records + CUR stamps,
+//     bindings 7/8) is evaluated by invocation 0 into shared memory and
+//     barriered — provably workgroup-uniform SetMeshOutputsEXT arguments.
+//     Wave 9 adds the ledger-17 EXPERIMENT (meshelium.translucentMultiWG,
+//     default OFF): the host dispatches ceil(count/MESHELIUM_TRANS_QUADS)
+//     workgroups in ONE draw per section and every workgroup slices by
+//     gl_WorkGroupID.x — see the main() comment for the identity argument
+//     when the property is off.
+//
+// Everything below the quad-mapping preamble (vertex math, lightmap,
+// fog distances, winding) is the wave-4 code unchanged — pixel parity
+// ported forward, not re-derived. See the wave-4 header notes in git
+// history / docs/VANILLA-FRAME-PATH.md wave-4 notes for the parity
+// derivation (vanilla terrain.vsh operation order, lightmap +8 centring,
+// {0,1,2, 2,3,0} winding vs CW front + BACK cull).
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = MESHELIUM_WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+#if MESHELIUM_TRANSLUCENT
+layout(triangles, max_vertices = 4 * MESHELIUM_TRANS_QUADS, max_primitives = 2 * MESHELIUM_TRANS_QUADS) out;
+#else
+layout(triangles, max_vertices = 4 * MESHELIUM_WG_SIZE, max_primitives = 2 * MESHELIUM_WG_SIZE) out;
+#endif
+
+// The wave-3 terrain arena, bound as a std430 SSBO (NO buffer_device_address
+// — wave-3b bytecode finding: vanilla's device/allocator lack the feature).
+// One uvec4 = one packed 16-byte vertex; quad q = elements q*4 .. q*4+3.
+layout(set = 0, binding = 0, std430) readonly buffer TerrainData {
+    uvec4 terrainData[];
+};
+
+// Meshelium's per-frame scene UBO (wave-5 layout — must match terrain.task /
+// terrain.frag and TerrainDrawer.uploadScene byte-for-byte). This stage
+// reads ModelViewMat only.
+layout(set = 0, binding = 1, std140) uniform MesheliumScene {
+    mat4 ModelViewMat;   // CameraRenderState.viewRotationMatrix (camera-relative)
+    vec4 SceneMisc;      // xy = block atlas size in texels (TextureSize)
+    vec4 FrustumPlanes[6];
+    ivec4 CameraChunk;
+};
+
+// Vanilla's own Projection UBO slice (RenderSystem.getProjectionMatrixBuffer())
+// — identical declaration to assets/minecraft/shaders/include/projection.glsl.
+layout(set = 0, binding = 2, std140) uniform Projection {
+    mat4 ProjMat;
+};
+
+// Vanilla's lightmap, sampled per vertex exactly like terrain.vsh does.
+layout(set = 0, binding = 6) uniform sampler2D Sampler2;
+
+// Per-draw data. Task path: one draw = one region (OriginRelCamera is the
+// REGION origin; section offset comes from the payload posKey). CPU path:
+// one draw = one contiguous quad run of one section (wave-4 meaning).
+// Translucent path: one draw = one ≤MESHELIUM_TRANS_QUADS slice of one
+// section's translucent prefix (OriginRelCamera is the SECTION origin).
+layout(push_constant) uniform MesheliumPush {
+    vec3 OriginRelCamera;
+#if MESHELIUM_TASK_CULL
+    uint RegionIndex;      // unused here (task stage consumed it)
+    uint MaskSlot;         // unused here
+#elif MESHELIUM_TRANSLUCENT
+    uint FirstQuad;        // absolute quad index into the terrain arena
+    uint QuadCount;        // quads in THIS draw (single workgroup, looped)
+    uint GateIndex;        // posKey<<20 | regionId*256+slot, or 0xFFFFFFFF
+                           // = no occlusion gate (bfs/cpu frames, occlusion
+                           // list overflow, slot unknown) — fails OPEN
+    uint FrameStamp;       // this frame's occlusion stamp (gate compare)
+#else
+    uint FirstQuad;        // absolute quad index into the terrain arena
+    uint QuadCount;        // quads in this draw (all workgroups)
+#endif
+};
+
+#if MESHELIUM_TASK_CULL
+// Must match terrain.task's payload declaration exactly (struct + variable
+// — taskPayloadSharedEXT is a variable qualifier in the EXT spec, not an
+// interface-block one).
+struct MesheliumSectionTask {
+    uint groupEnd;
+    uint posAndCount;   // bits 0-7 posKey, bits 8-31 surviving quad count
+    uvec4 binIa;        // cumulative surviving-quad END index, bins 0-3
+    uvec4 binIb;        // bins 4-7 (unused bins hold 0)
+    uvec4 binVa;        // ABSOLUTE arena quad index of each bin's start
+    uvec4 binVb;
+};
+struct MesheliumTaskPayload {
+    MesheliumSectionTask sections[MESHELIUM_TASK_WG_SIZE];
+};
+taskPayloadSharedEXT MesheliumTaskPayload payload;
+#endif
+
+#if MESHELIUM_TRANSLUCENT
+// Wave-7 occlusion gate inputs (same layouts as terrain.task's bindings
+// 7/10, MESH stage here). CurStamps is THIS frame's ping-pong buffer —
+// the translucent pass records at vanilla's translucentTerrain position,
+// AFTER the section raster (pass 3), and every pass end carries vanilla's
+// ALL_COMMANDS barrier, so the stamps are complete and visible by now.
+layout(set = 0, binding = 7, std430) readonly buffer SectionRecords {
+    ivec4 sectionRecords[];
+};
+layout(set = 0, binding = 8, std430) readonly buffer CurStamps {
+    uint curStamps[];
+};
+
+// Invocation-0-computed gate verdict; barriered before SetMeshOutputsEXT
+// so the count argument is PROVABLY workgroup-uniform (not merely
+// dynamically uniform through an SSBO load).
+shared uint meshelium_sVisible;
+
+// The section is drawn unless the identity-verified stamp says otherwise.
+// Every mismatch fails OPEN (draws — parity over perf, the wave-6 rule):
+//   GateIndex sentinel  → no occlusion this frame / overflow / no slot
+//   header.w == 0       → GPU record lags the CPU snapshot (staging full)
+//   posKey mismatch     → slot compacted away between snapshot and now
+// Only a POSITIVE identity match consults the stamp; a stale stamp can
+// then only SKIP a section whose box depth-failed against phase-A depth —
+// which is a subset of the final opaque depth, so its every translucent
+// fragment would lose the depth test anyway (the wave-6 guard argument,
+// applied to the blend pass).
+uint meshelium_translucentGate() {
+    if (GateIndex == 0xFFFFFFFFu) {
+        return 1u;
+    }
+    uint idx = GateIndex & 0xFFFFFu;
+    ivec4 header = sectionRecords[idx * 2u];
+    if (header.w == 0) {
+        return 1u;
+    }
+    int cx = header.x >> 8;
+    int cy = (header.y << 15) >> 23;
+    int cz = header.z >> 8;
+    uint pk = uint(((cy & 3) << 6) | ((cz & 7) << 3) | (cx & 7));
+    if (pk != (GateIndex >> 20u)) {
+        return 1u;
+    }
+    return curStamps[idx] == FrameStamp ? 1u : 0u;
+}
+#endif
+
+layout(location = 0) out vec4 vertexColor[];
+layout(location = 1) out vec2 texCoord0[];
+layout(location = 2) out float sphericalVertexDistance[];
+layout(location = 3) out float cylindricalVertexDistance[];
+layout(location = 4) flat out uint materialBits[];
+
+// ---- 16-byte packed-vertex decoders (docs/TERRAIN-DATA.md §1; the GLSL
+// twins of TerrainVertexCodec, ported from vertex_format.glsl) ----
+
+vec3 decodeVertexPosition(uvec4 v) {
+    uvec3 p = uvec3(v.x & 0xFFFFu, (v.x >> 16) & 0xFFFFu, v.y & 0xFFFFu);
+    return vec3(p) * (32.0 / 65536.0) - 8.0;
+}
+
+vec3 decodeVertexColor(uvec4 v) {
+    // R at bits 0-7 (colour was premultiplied by the AO/tint alpha on the
+    // CPU; /255 matches RGBA8_UNORM's c/255 that vanilla's Color attribute
+    // would have produced for an opaque-alpha vertex).
+    uvec3 rgb = (uvec3(v.z) >> uvec3(0, 8, 16)) & uvec3(0xFFu);
+    return vec3(rgb) * (1.0 / 255.0);
+}
+
+vec2 decodeVertexUV(uvec4 v) {
+    return vec2(v.w & 0xFFFFu, (v.w >> 16) & 0xFFFFu) * (1.0 / 32768.0);
+}
+
+vec4 sampleLightmap(uvec4 v) {
+    // Stored bytes are lightmap coord + 8, clamped [8,248] — already
+    // vanilla's sample_lightmap((uv/256)+0.5/16, clamped) input; the +8
+    // centring is verified against the vanilla include (wave-4 notes).
+    uvec2 light = uvec2((v.y >> 24) & 0xFFu, (v.z >> 24) & 0xFFu);
+    return textureLod(Sampler2, vec2(light) / 256.0, 0.0);
+}
+
+// One quad's 4 vertices + 2 triangles into output slot `slot` (wave-4 body
+// verbatim, hoisted so all three variants share the parity-proven math).
+void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
+    uint vertBase = slot * 4u;
+    for (uint i = 0u; i < 4u; ++i) {
+        uvec4 v = terrainData[(quad << 2) + i];
+        uint vi = vertBase + i;
+        vec3 pos = decodeVertexPosition(v) + origin;
+        gl_MeshVerticesEXT[vi].gl_Position = ProjMat * (ModelViewMat * vec4(pos, 1.0));
+        // Vanilla fog.glsl: fog_spherical_distance / fog_cylindrical_distance.
+        sphericalVertexDistance[vi] = length(pos);
+        cylindricalVertexDistance[vi] = max(length(pos.xz), abs(pos.y));
+        vertexColor[vi] = vec4(decodeVertexColor(v), 1.0) * sampleLightmap(v);
+        texCoord0[vi] = decodeVertexUV(v);
+        materialBits[vi] = (v.y >> 16) & 0xFFu; // flat; provoking vertices
+                                                // (vertBase+0/+2) are this quad's
+    }
+
+    // Vanilla's sequential quad index pattern {0,1,2, 2,3,0} (section-build
+    // doc 2.3) — same winding, so CW front + BACK cull match vanilla's raster.
+    gl_PrimitiveTriangleIndicesEXT[slot * 2u + 0u] = uvec3(vertBase + 0u, vertBase + 1u, vertBase + 2u);
+    gl_PrimitiveTriangleIndicesEXT[slot * 2u + 1u] = uvec3(vertBase + 2u, vertBase + 3u, vertBase + 0u);
+}
+
+void main() {
+#if MESHELIUM_TRANSLUCENT
+    // ---- wave-7 translucent path: one workgroup per ≤MESHELIUM_TRANS_QUADS
+    // slice. The host normally dispatches (1,1,1) per slice (wave-7 exact:
+    // base == 0, wgQuads == QuadCount). Under the wave-9 ledger-17
+    // EXPERIMENT (meshelium.translucentMultiWG) the host records ONE draw of
+    // ceil(QuadCount / MESHELIUM_TRANS_QUADS) workgroups per section and
+    // each workgroup derives its own slice from gl_WorkGroupID.x below —
+    // draw order then depends on VK_EXT_mesh_shader's inter-workgroup
+    // primitive ordering, the UNVERIFIED spec question the experiment
+    // exists to test. Single-WG dispatches make this block bit-identical
+    // to the wave-7 code (base is the constant 0).
+    if (gl_LocalInvocationIndex == 0u) {
+        meshelium_sVisible = meshelium_translucentGate();
+    }
+    barrier();
+    uint base = gl_WorkGroupID.x * uint(MESHELIUM_TRANS_QUADS);
+    uint wgQuads = meshelium_sVisible != 0u
+            ? min(uint(MESHELIUM_TRANS_QUADS), QuadCount - base)
+            : 0u;
+    SetMeshOutputsEXT(wgQuads * 4u, wgQuads * 2u);
+    // Threads STRIDE the slice, but output slots are indexed by the prefix
+    // slot q — primitive order ascends with prefix (back-to-front) order
+    // no matter which invocation wrote which quad.
+    for (uint q = gl_LocalInvocationIndex; q < wgQuads; q += uint(MESHELIUM_WG_SIZE)) {
+        meshelium_emitQuad(q, FirstQuad + base + q, OriginRelCamera);
+    }
+#else
+#if MESHELIUM_TASK_CULL
+    // ---- wave-5 task path: workgroup → section → quad via the payload ----
+    // Everything here is uniform across the workgroup: derived from the
+    // payload (uniform) and gl_WorkGroupID only — the EXT requirement for
+    // SetMeshOutputsEXT holds exactly as in wave 4.
+    uint g = gl_WorkGroupID.x;
+    uint lo = 0u;
+    uint hi = uint(MESHELIUM_TASK_WG_SIZE) - 1u;
+    while (lo < hi) { // first section whose cumulative groupEnd exceeds g
+        uint mid = (lo + hi) >> 1u;
+        if (payload.sections[mid].groupEnd > g) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+    uint s = lo;
+    uint gStart = (s == 0u) ? 0u : payload.sections[s - 1u].groupEnd;
+    uint localGroup = g - gStart;
+    uint pc = payload.sections[s].posAndCount;
+    uint sectionQuads = pc >> 8u;
+    uint wgQuads = min(uint(MESHELIUM_WG_SIZE), sectionQuads - localGroup * uint(MESHELIUM_WG_SIZE));
+    // Section origin = region origin + 16 * local section coords (posKey
+    // decode mirrors RegionStore.posKey: y bits 6-7, z bits 3-5, x bits 0-2).
+    vec3 origin = OriginRelCamera
+            + vec3(float(pc & 7u), float((pc >> 6u) & 3u), float((pc >> 3u) & 7u)) * 16.0;
+#else
+    // ---- wave-4 CPU-culled direct path (the cpuCull escape hatch) ----
+    uint wgBase = gl_WorkGroupID.x * uint(MESHELIUM_WG_SIZE);
+    uint wgQuads = min(uint(MESHELIUM_WG_SIZE), QuadCount - wgBase);
+    vec3 origin = OriginRelCamera;
+#endif
+    SetMeshOutputsEXT(wgQuads * 4u, wgQuads * 2u);
+
+    uint t = gl_LocalInvocationIndex;
+    if (t >= wgQuads) {
+        return; // divergence after SetMeshOutputsEXT is legal; every
+                // declared output slot belongs to a thread with t < wgQuads
+    }
+
+#if MESHELIUM_TASK_CULL
+    // Thread → arena quad: linear walk of the 8-bin cumulative table
+    // (Nvidium mesh.glsl:46-69's getOffset, EXT-shaped). Bins fill densely
+    // from 0, unused bins hold end 0 and can never match idx < end.
+    uint idx = localGroup * uint(MESHELIUM_WG_SIZE) + t;
+    uint prevEnd = 0u;
+    uint quad = 0u;
+    bool found = false;
+    for (uint r = 0u; r < 8u; ++r) {
+        uint end = (r < 4u) ? payload.sections[s].binIa[r] : payload.sections[s].binIb[r - 4u];
+        if (!found && idx < end) {
+            uint start = (r < 4u) ? payload.sections[s].binVa[r] : payload.sections[s].binVb[r - 4u];
+            quad = start + (idx - prevEnd);
+            found = true;
+        }
+        prevEnd = max(prevEnd, end);
+    }
+#else
+    uint quad = FirstQuad + wgBase + t;
+#endif
+
+    meshelium_emitQuad(t, quad, origin);
+#endif
+}

@@ -1,0 +1,74 @@
+#version 460
+// Meshelium — LGPL-3.0-only.
+//
+// Wave-6 occlusion SECTION raster, TASK stage (EXT dialect): one task
+// workgroup per dispatched region gates on the region-raster verdict and
+// launches one mesh workgroup per compacted section slot. Derived from
+// Nvidium by MCRcortex (LGPL-3.0):
+//   misc/reference/nvidium/.../shaders/occlusion/section_raster/task.glsl
+//     (the regionVisibility early-out :38-43 and the count dispatch :52-61)
+// with Alphadium's shape as the porting baseline where they diverge
+// (project doctrine): Alphadium's task.glsl no longer writes the indirect
+// command buffers here (that moved to its compute command_buffer_builder)
+// — and Meshelium has no GPU-written command buffers at all (visibility is
+// consumed by the SAME frame's phase-B task stage through stamp buffers,
+// see TerrainOcclusion), so this stage is gate + dispatch only, exactly
+// Alphadium's residue.
+//
+// EXT restructure: gl_TaskCountNV → EmitMeshTasksEXT(count,1,1) called
+// exactly once in uniform control flow (single-invocation workgroup, so
+// uniformity is trivial); taskNV block → taskPayloadSharedEXT variable.
+//
+// The dispatch count is the CPU's dense compacted-slot count (the wave-5
+// dispatch invariant — tighter than Nvidium's GPU-side lastIdx+1; trailing
+// slots hold zeroed records and the mesh stage's header.w==0 check retires
+// any straggler, second line of defense).
+
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+struct OccRegion {
+    vec4 origin;   // xyz = region MIN corner in blocks, camera-relative
+    uvec4 meta;    // x = regionId, y = compacted count, z/w = occ AABB
+};
+// Wave-10: same UBO-vs-SSBO split as region_raster.mesh (rationale +
+// layout-equivalence note there).
+#if MESHELIUM_LISTS_SSBO
+layout(set = 0, binding = 0, std430) readonly buffer OccRegions {
+    OccRegion occRegions[];
+};
+#else
+layout(set = 0, binding = 0, std140) uniform OccRegions {
+    OccRegion occRegions[MESHELIUM_OCC_REGIONS];
+};
+#endif
+
+// Region visibility stamps written by the region raster last pass (the
+// pass-end full barrier orders them — frame-path Q1.3's inherited
+// invariant; indexed by dispatch slot).
+layout(set = 0, binding = 4, std430) readonly buffer RegionStamps {
+    uint regionStamps[];
+};
+
+layout(push_constant) uniform OccPush {
+    uint FrameStamp;
+};
+
+struct OccSectionPayload {
+    vec3 origin;    // region MIN corner rel camera (blocks)
+    uint regionId;  // Meshelium region id → section-record block index
+};
+taskPayloadSharedEXT OccSectionPayload payload;
+
+void main() {
+    uint slot = gl_WorkGroupID.x;
+    uint count = 0u;
+    if (regionStamps[slot] == FrameStamp) {
+        OccRegion e = occRegions[slot];
+        payload.origin = e.origin.xyz;
+        payload.regionId = e.meta.x;
+        count = e.meta.y;
+    }
+    EmitMeshTasksEXT(count, 1u, 1u);
+}

@@ -1,0 +1,141 @@
+#version 460
+// Meshelium — LGPL-3.0-only.
+//
+// Wave-6 occlusion SECTION raster, MESH stage (EXT dialect): one mesh
+// workgroup per compacted section slot of a region-raster-visible region
+// draws the section's TIGHT geometry AABB (the 4-bit geomMin/geomSize
+// fields of the section record) as a watertight box against phase-A
+// depth; surviving fragments stamp the section's global slot in the
+// CURRENT stamp buffer. Derived from Nvidium by MCRcortex (LGPL-3.0):
+//   misc/reference/nvidium/.../shaders/occlusion/section_raster/mesh.glsl
+//     (header AABB decode :68-73 — NOTE scene.glsl's Section struct
+//      comments mislabel the y/z axes; the WRITER (SectionManager.java:
+//      110-114, mirrored by Meshelium's SectionRecord) is authoritative and
+//      this decode follows it — box emission :80-99, camera-inside-section
+//      forced-visible :89-96, 0.1-block inflation :16,68-69)
+// Alphadium's copy is byte-identical here (checked 2026-08-09).
+//
+// EXT restructure + divergences (each deliberate, see region_raster.mesh
+// for the shared rationale):
+//  - SetMeshOutputsEXT(0,0) for empty slots / SetMeshOutputsEXT(8,12)
+//    otherwise, uniform per workgroup (all 8 invocations read the same
+//    record, so the branch is workgroup-uniform).
+//  - Emptiness check is header.w == 0 (the wave-5 convention: arena quad
+//    address 0 is reserved, so a live section can never carry it) instead
+//    of Nvidium's full sectionEmpty(); the hide-bit test (bit 17) is NOT
+//    ported — Meshelium has no api0 and never sets it.
+//  - Visibility history: Nvidium's mesh pre-writes the shifted history
+//    byte ((last<<1)|cameraIn) and its fragment overwrites with
+//    ((last<<1)|1) carried in gl_PrimitiveID's low bits — two same-address
+//    plain stores from different stages whose values DIFFER in bit 0, a
+//    data race under the Vulkan memory model that only NV is known to
+//    tolerate. Meshelium replaces the byte with per-frame stamps (uint ==
+//    FrameStamp ⇔ marked this frame; "last frame" = the other ping-pong
+//    buffer): the shift disappears, every writer of a frame writes the
+//    identical value via atomicExchange, and stale slots (section slot
+//    reuse, world change) self-invalidate because an old stamp can never
+//    equal the current frame. The CONSUMED semantics (Nvidium bits 0 and
+//    1) are reproduced exactly by the phase-A/phase-B stamp tests in
+//    terrain.task.
+//  - gl_PrimitiveID carries ONLY the global section index (regionId*256 +
+//    slot); the history payload Nvidium packed alongside is obsolete.
+
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 8, max_primitives = 12) out;
+
+layout(set = 0, binding = 1, std140) uniform MesheliumScene {
+    mat4 ModelViewMat;
+    vec4 SceneMisc;
+    vec4 FrustumPlanes[6];
+    ivec4 CameraChunk;
+};
+
+layout(set = 0, binding = 2, std140) uniform Projection {
+    mat4 ProjMat;
+};
+
+// CURRENT-frame section stamps (global index = regionId*256 + slot) —
+// same binding index as the region raster's stamp target so box.frag
+// serves both pipelines.
+layout(set = 0, binding = 3, std430) buffer StampOut {
+    uint stampOut[];
+};
+
+// The wave-3 section-record buffer: 256 records × 32 B per region id,
+// two ivec4 per record — [0] header, [1] renderRanges (SectionRecord).
+layout(set = 0, binding = 5, std430) readonly buffer SectionRecords {
+    ivec4 sectionRecords[];
+};
+
+layout(push_constant) uniform OccPush {
+    uint FrameStamp;
+};
+
+struct OccSectionPayload {
+    vec3 origin;
+    uint regionId;
+};
+taskPayloadSharedEXT OccSectionPayload payload;
+
+const float BOX_INFLATE = 0.1;
+
+const uvec3 BOX_TRIS[12] = uvec3[12](
+    uvec3(0u, 1u, 2u), uvec3(1u, 3u, 2u),
+    uvec3(0u, 2u, 6u), uvec3(6u, 4u, 0u),
+    uvec3(0u, 4u, 5u), uvec3(5u, 1u, 0u),
+    uvec3(1u, 5u, 7u), uvec3(7u, 3u, 1u),
+    uvec3(4u, 6u, 7u), uvec3(7u, 5u, 4u),
+    uvec3(2u, 7u, 6u), uvec3(2u, 3u, 7u)
+);
+
+void main() {
+    uint slot = gl_WorkGroupID.x;                      // compacted slot, < count
+    uint globalIdx = payload.regionId * 256u + slot;   // stamp index + record index
+    ivec4 header = sectionRecords[globalIdx * 2u];
+
+    // Empty/tombstoned slot (records lag the CPU snapshot by at most a
+    // pump): nothing to raster. Workgroup-uniform branch.
+    if (header.w == 0) {
+        SetMeshOutputsEXT(0u, 0u);
+        return;
+    }
+
+    // Section-local position within the region from the record's absolute
+    // chunk coords (bits 8+; low bits are valid in two's complement —
+    // RegionStore.posKey's own packing). Geometry AABB from the 4-bit
+    // fields: extent = geomSize + 1 (encoder stores size = max−min−1).
+    vec3 localChunk = vec3(
+            float((header.x >> 8) & 7),
+            float((header.y >> 8) & 3),
+            float((header.z >> 8) & 7));
+    vec3 gmin = vec3(header.xyz & ivec3(0xF));
+    vec3 gsize = vec3((header.xyz >> 4) & ivec3(0xF));
+    vec3 lo = payload.origin + localChunk * 16.0 + gmin - BOX_INFLATE;
+    vec3 hi = lo + gsize + 1.0 + 2.0 * BOX_INFLATE;
+
+    SetMeshOutputsEXT(8u, 12u);
+
+    uint t = gl_LocalInvocationIndex;
+    vec3 corner = vec3(
+            ((t & 1u) == 0u) ? lo.x : hi.x,
+            ((t & 4u) == 0u) ? lo.y : hi.y,
+            ((t & 2u) == 0u) ? lo.z : hi.z);
+    gl_MeshVerticesEXT[t].gl_Position = ProjMat * (ModelViewMat * vec4(corner, 1.0));
+
+    gl_PrimitiveTriangleIndicesEXT[t] = BOX_TRIS[t];
+    gl_MeshPrimitivesEXT[t].gl_PrimitiveID = int(globalIdx);
+    if (t < 4u) {
+        gl_PrimitiveTriangleIndicesEXT[8u + t] = BOX_TRIS[8u + t];
+        gl_MeshPrimitivesEXT[8u + t].gl_PrimitiveID = int(globalIdx);
+    }
+
+    if (t == 0u) {
+        // Camera inside the inflated section box → forced visible (the
+        // near-plane story: see region_raster.mesh header).
+        if (all(lessThanEqual(lo, vec3(0.0))) && all(greaterThanEqual(hi, vec3(0.0)))) {
+            atomicExchange(stampOut[globalIdx], FrameStamp);
+        }
+    }
+}
