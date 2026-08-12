@@ -1,0 +1,15 @@
+{
+	"schemaVersion": 1,
+	"id": "meshelium_test",
+	"version": "1.0.0",
+	"name": "Meshelium GameTests",
+	"environment": "client",
+	"entrypoints": {
+		"fabric-client-gametest": [
+			${gametest_entrypoints}
+		]
+	},
+	"depends": {
+		"meshelium": "*"
+	}
+}

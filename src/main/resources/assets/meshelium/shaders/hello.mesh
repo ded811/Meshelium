@@ -1,0 +1,42 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+// Meshelium wave 2 — "hello meshlet", NDC variant.
+//
+// EXT dialect on purpose (SetMeshOutputsEXT / gl_MeshVerticesEXT /
+// gl_PrimitiveTriangleIndicesEXT), NOT the NV dialect Nvidium used —
+// docs/VANILLA-FRAME-PATH.md Q6. One workgroup, one triangle, hardcoded
+// clip-space coordinates; no descriptors at all.
+//
+// Depth note (deviation from the wave-2 brief, evidence in
+// docs/VANILLA-FRAME-PATH.md "wave-2 implementation notes"): 26.2 is
+// REVERSED-Z — the frame graph clears depth to 0.0 (dconst_0 in
+// LevelRenderer's clear pass) and every vanilla depth-tested pipeline uses
+// CompareOp.GREATER_THAN_OR_EQUAL. z = 0.5 is still mid-range, but "visible
+// against the sky" requires GREATER_OR_EQUAL in our pipeline, and the sky
+// sits at depth 0.0, not 1.0.
+//
+// Vulkan NDC: +Y is DOWN, so the -0.7 vertex is the TOP of the on-screen
+// triangle. Winding is irrelevant: the pipeline culls nothing (CULL_NONE).
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+
+// Per-vertex colour, so the NDC and world-space triangles are
+// distinguishable in one screenshot (magenta here, yellow in
+// hello_world.mesh); hello.frag just passes it through.
+layout(location = 0) out vec4 mesheliumColor[];
+
+void main() {
+    SetMeshOutputsEXT(3u, 1u);
+
+    gl_MeshVerticesEXT[0].gl_Position = vec4( 0.00, -0.70, 0.5, 1.0);
+    gl_MeshVerticesEXT[1].gl_Position = vec4(-0.75,  0.70, 0.5, 1.0);
+    gl_MeshVerticesEXT[2].gl_Position = vec4( 0.75,  0.70, 0.5, 1.0);
+
+    mesheliumColor[0] = vec4(1.0, 0.0, 1.0, 1.0);
+    mesheliumColor[1] = vec4(1.0, 0.0, 1.0, 1.0);
+    mesheliumColor[2] = vec4(1.0, 0.0, 1.0, 1.0);
+
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0u, 1u, 2u);
+}

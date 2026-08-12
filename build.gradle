@@ -1,0 +1,254 @@
+// Meshelium — cross-vendor mesh-shader terrain renderer on Minecraft 26.2's
+// vanilla Vulkan backend. Single-module Fabric mod; toolchain deliberately
+// identical to the sibling attack-of-the-bteam repo (same loom, same gradle,
+// same JDK) so one machine's verified setup serves both projects.
+
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+	id 'java-library'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = 'meshelium'
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+	// 26.2 is unobfuscated — no mappings line, same as the sibling repo.
+
+	// No optional-mod dependencies, deliberately. The ModMenu adapter that
+	// used to live here was the ONLY thing stopping a clean clone from
+	// building: it compiled against a jar at ../test-mods on one machine.
+	// Settings reach players through vanilla's own Video Settings screen
+	// (VideoSettingsScreenMixin) and the /meshelium command, so the adapter
+	// was a third route to a screen that already had two.
+}
+
+fabricApi {
+	configureTests {
+		createSourceSet = true
+		modId = 'meshelium_test'
+		// NO server gametests: this mod is environment "client" — a
+		// dedicated server never loads a line of it, so a server gametest
+		// run could only ever vacuously pass. Client gametests are the
+		// entire test story, which is honest for a renderer.
+		enableGameTests = false
+		// Layer 3 from wave 0 (the lesson the pack repo paid for three
+		// playtest rounds too late): a renderer mod's only honest test is a
+		// real client with a real GPU. `runClientGameTest` is the task; on
+		// this machine that GPU is an RX 9070 XT (RDNA4), which is also the
+		// mod's primary target hardware.
+		enableClientGameTests = true
+		eula = true
+	}
+}
+
+// Wave-1 harness support: `-Pmeshelium.backend=opengl|vulkan|default` pins the
+// client gametest onto one GPU backend and tells the test which path to
+// assert. Two facts verified against the real jars (docs/VANILLA-VULKAN-SEAM.md):
+//  - vanilla's Main accepts `--graphicsBackend <value>` where <value> matches
+//    a PreferredGraphicsApi enum name case-insensitively (joptsimple
+//    EnumConverter, bytecode-checked in both cached jopt versions), and
+//  - loom 1.17's fabricApi.configureTests registers the run config under the
+//    name 'clientGameTest' (task runClientGameTest), whose RunConfigSettings
+//    exposes programArgs(String...)/vmArg(String).
+// With no -P the game boots on vanilla DEFAULT — which is OpenGL-first in
+// 26.2 — and the test's expectation defaults to the GL path to match.
+loom {
+	runs {
+		named('clientGameTest') {
+			if (project.hasProperty('meshelium.backend')) {
+				def mesheliumBackend = project.property('meshelium.backend').toString().toLowerCase()
+				if (!['opengl', 'vulkan', 'default'].contains(mesheliumBackend)) {
+					throw new IllegalArgumentException("meshelium.backend must be opengl, vulkan or default; got '${mesheliumBackend}'")
+				}
+				programArgs '--graphicsBackend', mesheliumBackend
+				vmArg "-Dmeshelium.test.expectBackend=${mesheliumBackend}"
+			}
+			// `-Pmeshelium.res=1920x1080` sets the client window size.
+			// THIS MATTERS MORE THAN IT LOOKS. The harness window defaults
+			// to 854x480, which is 0.41 megapixels: a fifth of 1080p, a
+			// ninth of 1440p, a twentieth of 4K. Anything whose cost scales
+			// with PIXELS is therefore measured at a fraction of its real
+			// price, and the occlusion passes are exactly that. The owner
+			// played at 1440p and found occlusion culling LOSING at render
+			// distance 64, while the 854x480 bench had it winning by 63
+			// percent (2026-08-11). Benchmarks that inform a default must
+			// run at a resolution somebody actually plays at.
+			// vanilla Main options verified by javap: "width" ip 423,
+			// "height" ip 452.
+			if (project.hasProperty('meshelium.res')) {
+				def res = project.property('meshelium.res').toString()
+				def m = (res =~ /^(\d{3,5})x(\d{3,5})$/)
+				if (!m.matches()) {
+					throw new IllegalArgumentException("meshelium.res must look like 1920x1080; got '${res}'")
+				}
+				programArgs '--width', m.group(1), '--height', m.group(2)
+			}
+			// Wave-2 harness support: `-Pmeshelium.hello=true` arms the
+			// hello-meshlet draw (system property meshelium.helloMeshlet —
+			// HelloMeshletRenderer's second gate; the first is the wave-1
+			// backend gate). Only meaningful together with
+			// -Pmeshelium.backend=vulkan; on the GL run the gate keeps the
+			// renderer class from ever loading, so the GL path is untouched
+			// with or without this flag.
+			if (project.hasProperty('meshelium.hello')) {
+				vmArg '-Dmeshelium.helloMeshlet=true'
+			}
+			// Wave-4 harness support: `-Pmeshelium.terrain=true` arms the real
+			// terrain drawer + the vanilla-OPAQUE kill switch (system property
+			// meshelium.terrainDraw; TerrainDrawer re-reads it every frame, so
+			// the gametest can flip it live for the vanilla-twin screenshot).
+			// Only meaningful with -Pmeshelium.backend=vulkan; on GL the gate
+			// keeps every terrain-draw class from loading.
+			if (project.hasProperty('meshelium.terrain')) {
+				vmArg '-Dmeshelium.terrainDraw=true'
+			}
+			// Wave-9 harness support.
+			// `-Pmeshelium.bench=<scene>` turns the run into a BENCHMARK run:
+			// the gametest entrypoint list is swapped to exactly
+			// MesheliumBenchmarkTest (see processGametestResources below) and
+			// the scene name + the terrain property reach the runtime. Use
+			// with -Pmeshelium.backend=vulkan only.
+			if (project.hasProperty('meshelium.bench')) {
+				def benchScene = project.property('meshelium.bench').toString()
+				if (!(benchScene ==~ /[a-z0-9\-]+/)) {
+					throw new IllegalArgumentException("meshelium.bench must be a scene name like plains-rd16; got '${benchScene}'")
+				}
+				vmArg "-Dmeshelium.bench=${benchScene}"
+				vmArg '-Dmeshelium.terrainDraw=true'
+			}
+			// Wave-10 harness support: `-Pmeshelium.rd=<chunks>` (e.g. 48) arms
+			// the extended-render-distance leg. It sets BOTH halves:
+			//  - meshelium.maxRenderDistance — the config-override property
+			//    (must exist at boot: the Options ctor mixin widens the
+			//    vanilla option range from it BEFORE options.txt loads), and
+			//  - meshelium.test.rd — tells the gametests which rd value to
+			//    exercise (Vulkan+terrain run: the rd leg + screenshot
+			//    95_meshelium_rd48; GL run: the clamp-back assertions).
+			if (project.hasProperty('meshelium.rd')) {
+				def mesheliumRd = project.property('meshelium.rd').toString()
+				// 120 = the wave-15 hard max (MesheliumConfig.MAX_MAX_RENDER_DISTANCE;
+				// the requested view distance is a signed byte on the wire).
+				if (!(mesheliumRd ==~ /\d+/) || mesheliumRd.toInteger() < 32 || mesheliumRd.toInteger() > 120) {
+					throw new IllegalArgumentException("meshelium.rd must be a chunk count in 32..120; got '${mesheliumRd}'")
+				}
+				vmArg "-Dmeshelium.maxRenderDistance=${mesheliumRd}"
+				vmArg "-Dmeshelium.test.rd=${mesheliumRd}"
+			}
+			// Workgroup sweep knobs (per-session by design — pipelines cache
+			// the resolved values at first creation; one run per value):
+			// `-Pmeshelium.wg=<quads>`       → MESHELIUM_WG_SIZE      (default 32, max 64)
+			// `-Pmeshelium.taskwg=<sections>` → MESHELIUM_TASK_WG_SIZE (default 32, max 128)
+			if (project.hasProperty('meshelium.wg')) {
+				vmArg "-Dmeshelium.tune.meshWorkgroupQuads=${project.property('meshelium.wg')}"
+			}
+			if (project.hasProperty('meshelium.taskwg')) {
+				vmArg "-Dmeshelium.tune.taskWorkgroupSections=${project.property('meshelium.taskwg')}"
+			}
+			// `-Pmeshelium.frontToBack=false` disables the wave-9 opaque
+			// front-to-back ordering (default ON; the A/B is shots 40/41).
+			if (project.hasProperty('meshelium.frontToBack')) {
+				vmArg "-Dmeshelium.tune.frontToBack=${project.property('meshelium.frontToBack')}"
+			}
+			// `-Pmeshelium.translucentMultiWG=true` arms the ledger-17
+			// EXPERIMENT for the translucent parity scene (shots 60/61).
+			if (project.hasProperty('meshelium.translucentMultiWG')) {
+				vmArg "-Dmeshelium.translucentMultiWG=${project.property('meshelium.translucentMultiWG')}"
+			}
+			// `-Pmeshelium.gpuTimers=false` kills the (default-ON, pixel-
+			// neutral) per-pass timestamp writes — the timer-overhead A/B.
+			if (project.hasProperty('meshelium.gpuTimers')) {
+				vmArg "-Dmeshelium.gpuTimers=${project.property('meshelium.gpuTimers')}"
+			}
+			// Wave-12 harness support.
+			// `-Pmeshelium.cpustages=true|false` arms/disarms the CPU stage
+			// attribution outside bench runs (bench runs arm it by default —
+			// MesheliumCpuStages.ARMED falls back to the bench property).
+			if (project.hasProperty('meshelium.cpustages')) {
+				vmArg "-Dmeshelium.cpustages=${project.property('meshelium.cpustages')}"
+			}
+			// `-Pmeshelium.skipVanillaPrep=true` arms the wave-12 candidate:
+			// skip vanilla's prepareChunkRenders work product on frames
+			// Meshelium owns (default OFF; consumer census in
+			// docs/VANILLA-FRAME-PATH.md wave-12 notes).
+			if (project.hasProperty('meshelium.skipVanillaPrep')) {
+				vmArg "-Dmeshelium.tune.skipVanillaPrep=${project.property('meshelium.skipVanillaPrep')}"
+			}
+			// `-Pmeshelium.cachedCull=true` arms the wave-12 candidate: exact
+			// memoization of the occlusion dispatch-list build (default OFF;
+			// wins on still frames — the bench's static camera measures the
+			// UPPER BOUND, see the TerrainDrawer honesty note).
+			if (project.hasProperty('meshelium.cachedCull')) {
+				vmArg "-Dmeshelium.tune.cachedCull=${project.property('meshelium.cachedCull')}"
+			}
+			// Wave-14 harness support: `-Pmeshelium.vkvalidation=true` arms
+			// vanilla's own --vulkanValidation launch arg (documented in
+			// docs/VANILLA-VULKAN-SEAM.md next to --graphicsBackend). Used
+			// for the arena grow-and-copy fence leg: the validation layer
+			// independently catches any use-after-free on the outgrown,
+			// parked backing. Requires VK_LAYER_KHRONOS_validation on the
+			// machine; if absent the game logs the miss and runs
+			// unvalidated (check the log, never assume the leg validated).
+			if (project.hasProperty('meshelium.vkvalidation')) {
+				programArgs '--vulkanValidation'
+			}
+			// Generic diagnostic passthrough: `-Pmeshelium.vmargs="-Dk=v -Dk2=v2"`
+			// forwards arbitrary -D flags to the client JVM (coordinator
+			// debugging tool — e.g. meshelium.debugStats, terrainDraw.bfsOnly —
+			// without dedicating a -P to every property).
+			if (project.hasProperty('meshelium.vmargs')) {
+				project.property('meshelium.vmargs').toString().trim().split(/\s+/).each { vmArg it }
+			}
+		}
+	}
+}
+
+// Wave-9: the benchmark swaps the gametest ENTRYPOINT LIST — with
+// -Pmeshelium.bench the run registers ONLY MesheliumBenchmarkTest, without it
+// the normal five tests (and never the benchmark). The gametest
+// fabric.mod.json carries a ${gametest_entrypoints} placeholder expanded
+// here; the source set is 'gametest' (fabricApi.configureTests
+// createSourceSet = true; the bin/gametest output dir confirms the name),
+// so its ProcessResources task is processGametestResources — a wrong task
+// name fails loudly at configuration time, never silently.
+def mesheliumBenchScene = project.hasProperty('meshelium.bench') ?
+		project.property('meshelium.bench').toString() : ''
+def mesheliumNormalTests = ['MesheliumBootSmokeTest', 'MesheliumTerrainDataTest',
+		'MesheliumTerrainResidencyTest', 'MesheliumTerrainDrawTest',
+		'MesheliumLifecycleTortureTest'].collect {
+			"\"com.deds.meshelium.gametest.client.${it}\""
+		}.join(',\n\t\t\t')
+def mesheliumGametestEntrypoints = mesheliumBenchScene ?
+		'"com.deds.meshelium.gametest.client.MesheliumBenchmarkTest"' :
+		mesheliumNormalTests
+tasks.named('processGametestResources', ProcessResources) {
+	inputs.property 'meshelium_bench', mesheliumBenchScene
+	filesMatching('fabric.mod.json') {
+		expand 'gametest_entrypoints': mesheliumGametestEntrypoints
+	}
+}
+
+processResources {
+	def v = project.version
+	inputs.property 'version', v
+	filesMatching('fabric.mod.json') {
+		expand 'version': v
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+	it.options.encoding = 'UTF-8'
+}
+
+java {
+	withSourcesJar()
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
