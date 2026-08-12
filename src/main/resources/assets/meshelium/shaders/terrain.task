@@ -1,0 +1,329 @@
+#version 460
+// Meshelium — LGPL-3.0-only.
+//
+// Wave-5 opaque terrain TASK shader (EXT dialect). Per-section culling +
+// facing-bucket bin building derived from Nvidium by MCRcortex (LGPL-3.0):
+//   misc/reference/nvidium/.../shaders/terrain/task.glsl (per-section cull,
+//   header decode :39-49)
+//   misc/reference/nvidium/.../shaders/terrain/task_common.glsl (the
+//   camera-side bucket walk :30-78 and the bin table payload :3-14)
+// restructured for VK_EXT_mesh_shader per NVIDIUM-ARCHITECTURE.md §4/§10
+// row 2: gl_TaskCountNV → one uniform EmitMeshTasksEXT(total,1,1) after a
+// workgroup barrier; NV's one-invocation-per-workgroup shape becomes
+// MESHELIUM_TASK_WG_SIZE sections per workgroup, one invocation each.
+//
+// DISPATCH SHAPE (docs/VANILLA-FRAME-PATH.md wave-5 notes): the CPU records
+// one vkCmdDrawMeshTasksEXT(ceil(compactedCount / MESHELIUM_TASK_WG_SIZE),1,1)
+// per CPU-frustum-visible region. Invocation t of workgroup w owns compacted
+// section slot w*MESHELIUM_TASK_WG_SIZE+t of the region named by the push
+// constants. Slots past the region's live count are dispatched only in the
+// tail workgroup and hold all-zero records (RegionStore's trailing-zeros
+// invariant), so the header.w==0 emptiness check retires them.
+//
+// WHAT GETS CULLED here, and why each cut is pixel-safe (the wave-5 bar:
+// culling may only remove what was never visible):
+//  (a) frustum — the six Gribb-Hartmann planes of the RENDER matrices
+//      (ProjMat * ModelViewMat), extracted CPU-side with JOML
+//      FrustumIntersection.set's exact formulas and tested with its exact
+//      p-vertex >= -w rule (both bytecode-verified — the same class
+//      vanilla's own Frustum wraps), against the section's full 16³ box
+//      inflated by 0.5 blocks. Pixel-safety is the CLIP-VOLUME argument,
+//      not frustum equality: every rendered pixel's geometry lies inside
+//      the render clip volume; a box fully outside one of these planes
+//      puts all its geometry outside that plane, so it contributes no
+//      pixel. (Vanilla's own cull frustum is deliberately LOOSER — Camera
+//      .createProjectionMatrixForCulling widens fov to max(fov, option
+//      fov) with near 0.05 / far depthFar, bytecode-read — so ours culls
+//      more, and only ever pixel-less boxes.)
+//  (b) distance — vanilla applies NO draw-time distance test beyond its
+//      cull frustum's far plane (depthFar enters only through that
+//      projection; prepareChunkRenders iterates visibleSections with no
+//      distance check), and the BFS visibility feed below is already
+//      render-distance-bounded (SectionOcclusionGraph walks at most
+//      renderDistance*16) — so (a)'s far plane + (c) subsume the
+//      render-distance sphere; see the wave-5 notes.
+//  (c) the visibility bitmask — bit posKey of the region's 256-bit mask,
+//      built CPU-side each frame from vanilla's OWN visibleSections list
+//      (the same-frame list vanilla's prepareChunkRenders drew from, read
+//      on the render thread inside the same LevelRenderer.render call).
+//      Vanilla draws EXACTLY visibleSections, so masking to it can only
+//      remove sections vanilla itself would not have drawn. MaskSlot ==
+//      0xFFFFFFFF means "no mask uploaded" (per-frame UBO overflow) and
+//      fails OPEN: every section passes — culling degrades, parity never.
+//  (d) facing buckets — the same camera-side gates the wave-4 CPU applied
+//      (task_common.glsl:39-78 signs; a +X face at plane x=k is invisible
+//      from camera x < k, i.e. only back-facing quads are dropped).
+//
+// PAYLOAD (fixed size by construction — the reference's own bin-table
+// design): one MesheliumSectionTask per invocation. A literal per-mesh-group
+// {base,count} array cannot be bounded — renderRanges carries u16 quad
+// counts per bucket, so ONE section can legally demand thousands of mesh
+// groups — and a capped array would need a drop path, which the parity bar
+// forbids. Instead each mesh workgroup derives its quads from
+// gl_WorkGroupID.x via two searches (section by cumulative groupEnd, quad
+// by cumulative bin ends), exactly how Nvidium's mesh stage consumed
+// binIa/binVa. 72 B/section × MESHELIUM_TASK_WG_SIZE (default 32) = 2304 B,
+// far under the spec-guaranteed maxTaskPayloadSize >= 16384 and asserted
+// against the real device's cap at pipeline creation.
+//
+// No subgroup ops anywhere: the one cross-invocation step (prefix-summing
+// 32 group counts) is done by invocation 0 between barriers — portable to
+// any subgroup size, revisit in wave 9 if profiling says so.
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = MESHELIUM_TASK_WG_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+// Meshelium's per-frame scene UBO (grown in wave 5; layout must match
+// terrain.mesh/terrain.frag and TerrainDrawer.uploadScene byte-for-byte).
+layout(set = 0, binding = 1, std140) uniform MesheliumScene {
+    mat4 ModelViewMat;      // CameraRenderState.viewRotationMatrix
+    vec4 SceneMisc;         // xy = block atlas size in texels
+    vec4 FrustumPlanes[6];  // Gribb-Hartmann rows of ProjMat*ModelViewMat,
+                            // camera-relative space, unnormalized (the
+                            // p-vertex test is scale-invariant)
+    ivec4 CameraChunk;      // xyz = camera section coords (blockPos >> 4)
+};
+
+// The wave-3 section-record buffer (MesheliumTerrainGpu.sectionBuffer): 256
+// records of 32 B per region id, i.e. two ivec4 per record —
+// [0] = header, [1] = renderRanges (layout: SectionRecord javadoc /
+// docs/TERRAIN-DATA.md §3).
+layout(set = 0, binding = 7, std430) readonly buffer SectionRecords {
+    ivec4 sectionRecords[];
+};
+
+// Per-frame visibility masks: 256 bits (= 2 uvec4) per DISPATCHED region,
+// slice-indexed by the MaskSlot push constant. Read ONLY when VisMode ==
+// 0 (the wave-5 BFS feed / the meshelium.terrainDraw.bfsOnly fallback);
+// occlusion frames bind a dummy slice here that is never dynamically
+// accessed. Two bindings since wave 10:
+//  - MESHELIUM_LISTS_SSBO == 0 (standard, configured max RD = 32): a UBO,
+//    because vanilla's transient memory cannot mint STORAGE usage
+//    (wave-3b bytecode finding); the declared array is the fixed 16 KiB
+//    the spec-minimum maxUniformBufferRange guarantees — byte-identical
+//    to every wave since 5.
+//  - MESHELIUM_LISTS_SSBO == 1 (extended render distance): a read-only
+//    SSBO slice of Meshelium's own host-visible ring (MesheliumFrameLists) —
+//    unsized array, so ONE pipeline serves any pinned capacity; uvec4
+//    stride is 16 B under std140 AND std430, so the CPU byte layout is
+//    unchanged.
+#if MESHELIUM_LISTS_SSBO
+layout(set = 0, binding = 8, std430) readonly buffer VisibilityMasks {
+    uvec4 visMasks[];
+};
+#else
+layout(set = 0, binding = 8, std140) uniform VisibilityMasks {
+    uvec4 visMasks[MESHELIUM_VIS_UVEC4S];
+};
+#endif
+
+// ---- wave-6 occlusion visibility (read ONLY when VisMode != 0; bfs/cpu
+// frames bind a harmless dummy SSBO that is never dynamically accessed).
+// Frame-stamped ping-pong buffers, one uint per global section slot
+// (regionId*256 + compactedSlot): a slot is "marked in frame F" iff the
+// buffer whose parity is F holds exactly F at that index. PrevStamps is
+// the buffer the LAST frame's section raster wrote; CurStamps is the one
+// THIS frame's raster wrote (pass 3, before phase B reads it in pass 4 —
+// vanilla's pass-end full barrier orders the two). Semantics map 1:1 to
+// the byte Nvidium consumes: bit0 == (cur == FrameStamp), bit1 == (prev
+// == FrameStamp-1); see occlusion/section_raster.mesh for why the byte
+// itself was replaced (cross-stage same-address store race).
+layout(set = 0, binding = 9, std430) readonly buffer PrevStamps {
+    uint prevStamps[];
+};
+layout(set = 0, binding = 10, std430) readonly buffer CurStamps {
+    uint curStamps[];
+};
+// Tiny GPU stats: [VisMode] += 1 per section that survives all gates —
+// the wave-6 readback consumer (TerrainOcclusion copies + zeroes it each
+// stats frame). [0] = mask mode, [1] = phase A, [2] = phase B.
+layout(set = 0, binding = 11, std430) buffer OccStats {
+    uint occStats[4];
+};
+
+// Per-draw data (one draw = one region).
+layout(push_constant) uniform MesheliumPush {
+    vec3 OriginRelCamera;  // REGION origin (block coords) minus camera pos
+    uint RegionIndex;      // Meshelium region id = section-record block index
+    uint MaskSlot;         // VisMode 0: visMasks slice, or 0xFFFFFFFF = no
+                           // mask (fail OPEN — also the occlusion-overflow
+                           // path: regions beyond the occlusion list cap
+                           // draw all sections in phase A)
+    uint VisMode;          // 0 = BFS mask (wave 5) / 1 = occlusion phase A
+                           // (visible last frame) / 2 = occlusion phase B
+                           // (just became visible this frame)
+    uint FrameStamp;       // this frame's occlusion stamp (VisMode 1/2)
+    uint StatsFlags;       // bit 0: count surviving sections into occStats
+};
+
+// One entry per task invocation (= per compacted section slot).
+struct MesheliumSectionTask {
+    uint groupEnd;      // after the prefix pass: cumulative mesh-workgroup
+                        // end over this task workgroup's sections
+    uint posAndCount;   // bits 0-7 = posKey within the region,
+                        // bits 8-31 = surviving quad count
+    uvec4 binIa;        // cumulative surviving-quad END index, bins 0-3
+    uvec4 binIb;        // bins 4-7 (unused bins stay 0)
+    uvec4 binVa;        // ABSOLUTE arena quad index of each bin's start
+    uvec4 binVb;
+};
+
+struct MesheliumTaskPayload {
+    MesheliumSectionTask sections[MESHELIUM_TASK_WG_SIZE];
+};
+
+// taskPayloadSharedEXT qualifies a VARIABLE of struct type (the EXT spec's
+// form) — not an interface block.
+taskPayloadSharedEXT MesheliumTaskPayload payload;
+
+// The exact test vanilla runs: JOML FrustumIntersection.testAab's p-vertex
+// form, keep iff dot(n, p) >= -w for all six planes, p selecting the max
+// corner where the plane coefficient is >= 0 (bytecode-verified).
+bool inFrustum(vec3 lo, vec3 hi) {
+    for (int i = 0; i < 6; ++i) {
+        vec4 plane = FrustumPlanes[i];
+        vec3 p = mix(lo, hi, greaterThanEqual(plane.xyz, vec3(0.0)));
+        if (dot(plane.xyz, p) < -plane.w) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// task_common.glsl's putBinData, EXT-shaped: bins fill densely in walk
+// order; binI holds cumulative end indices, binV absolute arena starts.
+void putBin(inout uint idx, inout uint lastIndex, uint absStart, uint len, uint t) {
+    uint id = idx++;
+    if (id < 4u) {
+        payload.sections[t].binIa[id] = lastIndex + len;
+        payload.sections[t].binVa[id] = absStart;
+    } else {
+        payload.sections[t].binIb[id - 4u] = lastIndex + len;
+        payload.sections[t].binVb[id - 4u] = absStart;
+    }
+    lastIndex += len;
+}
+
+void main() {
+    uint t = gl_LocalInvocationIndex;
+    uint slot = gl_WorkGroupID.x * uint(MESHELIUM_TASK_WG_SIZE) + t;
+    uint recordBase = (RegionIndex * 256u + slot) * 2u;
+    ivec4 header = sectionRecords[recordBase];
+    ivec4 rangesI = sectionRecords[recordBase + 1u];
+
+    // NO early returns: EmitMeshTasksEXT and barrier() below demand that
+    // every invocation arrives (uniform control flow).
+    uint groups = 0u;
+
+    // Empty-slot check: a live section can never have terrainAddress 0
+    // (quad 0 is reserved — SectionRecord javadoc), and all-zero records
+    // are the tombstone/trailing-slot state.
+    if (header.w != 0) {
+        // Chunk coords: 24-bit signed at bits 8-31 (arithmetic >> 8), 9-bit
+        // signed chunkY at bits 8-16 (terrain/task.glsl:41-43's sign extend).
+        int chunkX = header.x >> 8;
+        int chunkY = (header.y << 15) >> 23;
+        int chunkZ = header.z >> 8;
+        uint posKey = uint(((chunkY & 3) << 6) | ((chunkZ & 7) << 3) | (chunkX & 7));
+
+        // (c) the visibility source — three modes since wave 6:
+        //   VisMode 0: the vanilla-BFS mask bit (wave 5, the bfsOnly
+        //              fallback); 0xFFFFFFFF fails open.
+        //   VisMode 1: occlusion phase A — visible LAST frame (the stamp
+        //              the previous frame's section raster wrote). Draws
+        //              last frame's visible set, priming this frame's
+        //              depth for the raster — Nvidium's phase 1.
+        //   VisMode 2: occlusion phase B — JUST became visible (marked by
+        //              THIS frame's raster, not marked last frame) —
+        //              Nvidium's temporal_task predicate (vis&3)==1
+        //              (temporal_task.glsl:23-26), stamp-shaped.
+        // A section is drawn this frame iff prev==FrameStamp-1 (A) OR
+        // cur==FrameStamp ∧ prev!=FrameStamp-1 (B): the union covers every
+        // raster-marked section, the intersection is empty (no double
+        // draw), and staleness in either buffer can only ADD a draw of a
+        // real, current record — never remove one (the parity guard).
+        bool visible = true;
+        if (VisMode == 0u) {
+            if (MaskSlot != 0xFFFFFFFFu) {
+                uvec4 words = visMasks[MaskSlot * 2u + (posKey >> 7u)];
+                visible = ((words[(posKey >> 5u) & 3u] >> (posKey & 31u)) & 1u) != 0u;
+            }
+        } else {
+            uint gidx = RegionIndex * 256u + slot;
+            bool prevFresh = prevStamps[gidx] == FrameStamp - 1u;
+            if (VisMode == 1u) {
+                visible = prevFresh;
+            } else {
+                visible = curStamps[gidx] == FrameStamp && !prevFresh;
+            }
+        }
+
+        if (visible) {
+            // (a) frustum: full 16³ section box (wave-4 parity precedent),
+            // camera-relative, inflated 0.5 blocks so CPU-vs-GPU float
+            // rounding can only ever over-include.
+            vec3 lo = OriginRelCamera
+                    + vec3(float(posKey & 7u), float(posKey >> 6u), float((posKey >> 3u) & 7u)) * 16.0
+                    - 0.5;
+            if (inFrustum(lo, lo + 17.0)) {
+                // (d) facing buckets — task_common.glsl:30-78's walk, signs
+                // and order pinned by QuadFacing/MesheliumTerrainDataTest.
+                ivec3 rel = ivec3(chunkX, chunkY, chunkZ) - CameraChunk.xyz;
+                uvec4 ranges = uvec4(rangesI);
+                uint base = uint(header.w);
+                uint fr = (ranges.w >> 16) & 0xFFFFu; // skip translucent prefix
+                uint idx = 0u;
+                uint lastIndex = 0u;
+                payload.sections[t].binIa = uvec4(0u);
+                payload.sections[t].binIb = uvec4(0u);
+
+                uint delta = ranges.x & 0xFFFFu;                    // POS_X
+                if (rel.x <= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                fr += delta;
+                delta = (ranges.x >> 16) & 0xFFFFu;                 // POS_Y
+                if (rel.y <= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                fr += delta;
+                delta = ranges.y & 0xFFFFu;                         // POS_Z
+                if (rel.z <= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                fr += delta;
+                delta = (ranges.y >> 16) & 0xFFFFu;                 // NEG_X
+                if (rel.x >= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                fr += delta;
+                delta = ranges.z & 0xFFFFu;                         // NEG_Y
+                if (rel.y >= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                fr += delta;
+                delta = (ranges.z >> 16) & 0xFFFFu;                 // NEG_Z
+                if (rel.z >= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                fr += delta;
+                delta = ranges.w & 0xFFFFu;                         // UNASSIGNED
+                if (delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+
+                if (lastIndex > 0u) {
+                    payload.sections[t].posAndCount = (lastIndex << 8u) | posKey;
+                    groups = (lastIndex + uint(MESHELIUM_WG_SIZE) - 1u) / uint(MESHELIUM_WG_SIZE);
+                    if ((StatsFlags & 1u) != 0u) {
+                        // Wave-6 stats: one atomic per DRAWN section (a
+                        // few thousand/frame — noise). Guarded by the push
+                        // flag so bfs/cpu frames without occlusion
+                        // resources never touch the (dummy) binding.
+                        atomicAdd(occStats[VisMode], 1u);
+                    }
+                }
+            }
+        }
+    }
+
+    payload.sections[t].groupEnd = groups;
+    barrier();
+    if (t == 0u) {
+        // Serial prefix over MESHELIUM_TASK_WG_SIZE entries — trivial work,
+        // zero portability assumptions (no subgroup size dependence).
+        uint sum = 0u;
+        for (uint i = 0u; i < uint(MESHELIUM_TASK_WG_SIZE); ++i) {
+            sum += payload.sections[i].groupEnd;
+            payload.sections[i].groupEnd = sum;
+        }
+    }
+    barrier();
+    EmitMeshTasksEXT(payload.sections[MESHELIUM_TASK_WG_SIZE - 1].groupEnd, 1u, 1u);
+}

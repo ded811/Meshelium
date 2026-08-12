@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "meshelium",
+	"version": "${version}",
+	"name": "Meshelium",
+	"description": "Mesh-shader terrain rendering for every GPU that has them. A cross-vendor reimplementation of Nvidium's renderer on Minecraft's Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. Original renderer and architecture by MCRcortex, and all credit for the design to them.",
+	"authors": [
+		"Ded811"
+	],
+	"contributors": [
+		"MCRcortex (original Nvidium)"
+	],
+	"contact": {},
+	"license": "LGPL-3.0-only",
+	"icon": "assets/meshelium/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"com.deds.meshelium.fabric.MesheliumClient"
+		]
+	},
+	"mixins": [
+		"meshelium.client.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.19.0",
+		"fabric-api": "*",
+		"minecraft": "26.2"
+	},
+	"suggests": {
+		"bobby": "*"
+	}
+}
