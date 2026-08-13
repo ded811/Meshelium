@@ -1,3 +1,5 @@
+// Copyright (C) 2026 Ded811
+// SPDX-License-Identifier: LGPL-3.0-only
 #version 460
 
 // Meshelium wave 2 — shared fragment stage for both hello meshlet variants.

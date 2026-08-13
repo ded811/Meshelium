@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Wave 3a acceptance: pure-CPU pins on the terrain data layer. Expected
  * byte arrays are written out LONGHAND from the original Nvidium writers —

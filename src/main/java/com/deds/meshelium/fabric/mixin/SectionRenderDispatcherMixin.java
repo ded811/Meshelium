@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
+ */
 package com.deds.meshelium.fabric.mixin;
 
 import com.deds.meshelium.MesheliumGate;

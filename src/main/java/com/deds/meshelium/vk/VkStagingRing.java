@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Shape follows Nvidium's UploadingBufferStream (32 MB persistent-mapped
  * staging with per-frame fence retirement, NVIDIUM-ARCHITECTURE.md §3) —

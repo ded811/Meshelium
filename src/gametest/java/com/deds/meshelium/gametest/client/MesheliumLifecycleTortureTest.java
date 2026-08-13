@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Wave 8 acceptance: lifecycle torture + the config graduation + the
  * coverage guard, on the real GPU. Active ONLY on the
@@ -34,8 +35,11 @@ import net.minecraft.client.gui.screens.TitleScreen;
  *       rules; flip the config field false — the drawer freezes within a
  *       few frames (restart-not-required, the toggle's exact semantics);
  *       true again — it revives. Same protocol for
- *       {@code enableOcclusionCulling} against the occlusion/bfsOnly frame
- *       counters. Property restored afterwards.</li>
+ *       {@code occlusionMode} against the occlusion/bfsOnly frame
+ *       counters, plus AUTO's crossover driven from the live effective
+ *       render distance in BOTH directions (a mode stuck on is as wrong as
+ *       one stuck off, and only the pair proves the comparison runs).
+ *       Property restored afterwards.</li>
  *   <li><b>Resource reload</b> (the F3+T equivalent, in-world):
  *       {@code Minecraft.reloadResourcePacks()} (javap-verified name,
  *       returns CompletableFuture&lt;Void&gt;), wait the overlay out, then
@@ -188,40 +192,59 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         // locks the row). Out-of-range input must be unacceptable; an
         // in-range >96 value must land in the config AND the live option
         // range the same tick, and the slider label must refresh.
+        // 1.1: the custom box is INLINE on this screen, not a sub-screen,
+        // so the leg drives it in place. Same three properties: refuse
+        // out-of-range, refuse non-numeric, and land an in-range >96 value
+        // in the config AND the live option range the same tick with the
+        // slider label following. The commit is on Enter/blur rather than
+        // per keystroke, so the leg commits explicitly.
         if (System.getProperty("meshelium.maxRenderDistance") == null) {
             int[] originalCap = new int[1];
             context.runOnClient(client -> {
+                var screen = (com.deds.meshelium.gui.MesheliumOptionsScreen) client.gui.screen();
                 originalCap[0] = MesheliumConfig.get().maxRenderDistance;
-                ((com.deds.meshelium.gui.MesheliumOptionsScreen) client.gui.screen())
-                        .testOpenCapCustom();
-            });
-            context.waitForScreen(com.deds.meshelium.gui.MesheliumCustomValueScreen.class);
-            context.runOnClient(client -> {
-                var custom = (com.deds.meshelium.gui.MesheliumCustomValueScreen) client.gui.screen();
-                custom.setText("121");
-                if (custom.pressDone()) {
-                    throw new AssertionError("custom box accepted 121 above the 120 hard max "
-                            + "(the signed-byte wire cliff)");
+
+                screen.testSetCapBoxText("121");
+                screen.testCommitCapBox();
+                if (MesheliumConfig.get().maxRenderDistance == 121) {
+                    throw new AssertionError("the inline cap box accepted 121, above the 120 "
+                            + "hard max (the signed-byte wire cliff)");
                 }
-                custom.setText("meshelium");
-                if (custom.pressDone()) {
-                    throw new AssertionError("custom box accepted non-numeric input");
+                if (!screen.testCapBoxText().equals(Integer.toString(originalCap[0]))) {
+                    throw new AssertionError("the inline cap box kept a rejected value instead "
+                            + "of reverting: '" + screen.testCapBoxText() + "'");
                 }
-                custom.setText("112");
-                if (!custom.pressDone()) {
-                    throw new AssertionError("custom box rejected 112 inside 32..120");
+
+                screen.testSetCapBoxText("meshelium");
+                // The invalid state must still be READABLE. The first
+                // inline-box build passed every value assertion here while
+                // rendering the text fully transparent, because it set an
+                // RGB colour where EditBox wants ARGB. Alpha 0 is never a
+                // legitimate state for text meant to be read.
+                if (screen.testCapBoxTextAlpha() == 0) {
+                    throw new AssertionError("the inline cap box's text is fully transparent "
+                            + "while showing invalid input; it needs an ARGB colour with alpha "
+                            + "set, not a bare RGB one");
                 }
+                screen.testCommitCapBox();
+                if (!screen.testCapBoxText().equals(Integer.toString(originalCap[0]))) {
+                    throw new AssertionError("the inline cap box kept non-numeric input: '"
+                            + screen.testCapBoxText() + "'");
+                }
+                if (screen.testCapBoxTextAlpha() == 0) {
+                    throw new AssertionError("the inline cap box's text is fully transparent "
+                            + "after reverting to a valid value");
+                }
+
+                screen.testSetCapBoxText("112");
+                screen.testCommitCapBox();
             });
             context.waitTicks(1);
             context.runOnClient(client -> {
-                if (!(client.gui.screen()
-                        instanceof com.deds.meshelium.gui.MesheliumOptionsScreen screen)) {
-                    throw new AssertionError("custom Done did not return to the options "
-                            + "screen; got " + client.gui.screen());
-                }
+                var screen = (com.deds.meshelium.gui.MesheliumOptionsScreen) client.gui.screen();
                 if (MesheliumConfig.get().maxRenderDistance != 112) {
-                    throw new AssertionError("custom 112 did not reach the config: "
-                            + MesheliumConfig.get().maxRenderDistance);
+                    throw new AssertionError("the inline cap box's 112 did not reach the "
+                            + "config: " + MesheliumConfig.get().maxRenderDistance);
                 }
                 if (client.options.renderDistance().values().validateValue(112).isEmpty()) {
                     throw new AssertionError("custom cap 112 did not widen the live option "
@@ -229,7 +252,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
                 }
                 if (!screen.capSliderText().contains("112")) {
                     throw new AssertionError("cap slider label did not refresh after the "
-                            + "custom write: '" + screen.capSliderText() + "'");
+                            + "inline box write: '" + screen.capSliderText() + "'");
                 }
                 screen.testSetCap(originalCap[0]);
             });
@@ -265,24 +288,63 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             // Occlusion toggle: OFF → the wave-5 BFS path draws (bfsOnly
             // frames advance, occlusion frames freeze); ON → occlusion
             // resumes. Mirrors the wave-6 property-flip protocol.
-            context.runOnClient(client -> MesheliumConfig.get().enableOcclusionCulling = false);
+            context.runOnClient(client ->
+                    MesheliumConfig.get().occlusionMode = MesheliumConfig.OcclusionMode.OFF);
             long bfsBefore = TerrainDrawer.bfsOnlyFrames();
             context.waitFor(client -> TerrainDrawer.bfsOnlyFrames() > bfsBefore, TIMEOUT);
             long occAtFlip = TerrainDrawer.occlusionFrames();
             context.waitTicks(10);
             if (TerrainDrawer.occlusionFrames() != occAtFlip) {
-                throw new AssertionError("occlusion frames advanced with "
-                        + "enableOcclusionCulling=false - the config toggle is not live");
+                throw new AssertionError("occlusion frames advanced with occlusionMode=OFF "
+                        + "- the config setting is not live");
             }
-            context.runOnClient(client -> MesheliumConfig.get().enableOcclusionCulling = true);
+            context.runOnClient(client ->
+                    MesheliumConfig.get().occlusionMode = MesheliumConfig.OcclusionMode.ON);
             context.waitFor(client -> TerrainDrawer.occlusionFrames() > occAtFlip, TIMEOUT);
+            assertNoErrors();
+
+            // AUTO decides against the EFFECTIVE render distance, so drive
+            // it from the live value rather than assuming the harness's.
+            // Both directions, because a mode that is stuck on is as wrong
+            // as one that is stuck off and only the pair proves the
+            // comparison is really being evaluated.
+            int[] rd = new int[1];
+            context.runOnClient(client -> rd[0] = client.options.getEffectiveRenderDistance());
+
+            // Crossover ABOVE the current distance: Auto must NOT arm.
+            context.runOnClient(client -> {
+                MesheliumConfig config = MesheliumConfig.get();
+                config.occlusionAutoMinRenderDistance = rd[0] + 1;
+                config.occlusionMode = MesheliumConfig.OcclusionMode.AUTO;
+            });
+            long bfsBeforeAuto = TerrainDrawer.bfsOnlyFrames();
+            context.waitFor(client -> TerrainDrawer.bfsOnlyFrames() > bfsBeforeAuto, TIMEOUT);
+            long occAtAuto = TerrainDrawer.occlusionFrames();
+            context.waitTicks(10);
+            if (TerrainDrawer.occlusionFrames() != occAtAuto) {
+                throw new AssertionError("Auto armed occlusion at render distance " + rd[0]
+                        + " with a crossover of " + (rd[0] + 1) + "; it must only arm at or "
+                        + "ABOVE the crossover");
+            }
+
+            // Crossover AT the current distance: Auto must arm (>=, not >).
+            context.runOnClient(client ->
+                    MesheliumConfig.get().occlusionAutoMinRenderDistance = rd[0]);
+            context.waitFor(client -> TerrainDrawer.occlusionFrames() > occAtAuto, TIMEOUT);
             assertNoErrors();
         } finally {
             // Restore the harness property + config defaults for whatever
             // test runs next in this client session.
             context.runOnClient(client -> {
-                MesheliumConfig.get().enableTerrainRendering = true;
-                MesheliumConfig.get().enableOcclusionCulling = true;
+                MesheliumConfig config = MesheliumConfig.get();
+                config.enableTerrainRendering = true;
+                // Explicit ON, not AUTO: the harness world runs at a low
+                // render distance where AUTO would correctly decide OFF,
+                // and a later test trusting the default would then measure
+                // the BFS path while believing it measured occlusion.
+                config.occlusionMode = MesheliumConfig.OcclusionMode.ON;
+                config.occlusionAutoMinRenderDistance =
+                        MesheliumConfig.DEFAULT_OCCLUSION_AUTO_RD;
                 System.setProperty("meshelium.terrainDraw", "true");
             });
         }

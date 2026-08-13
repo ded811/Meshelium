@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Ported from Nvidium by MCRcortex (LGPL-3.0) — the NON-SPARSE fallback
  * path (the one every Linux Nvidium user runs, Nvidium.java:43-46):

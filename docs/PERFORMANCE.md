@@ -17,15 +17,18 @@ largest constraint is that all of this came from a single graphics card.
 1. [The rig every number came from](#the-rig-every-number-came-from)
 2. [Method](#method)
 3. [Reproducing these numbers](#reproducing-these-numbers)
-4. [The release sweep](#the-release-sweep)
+4. [The release sweep](#the-release-sweep-100-measured-at-1920x1080)
 5. [Resolution changes the answer](#resolution-changes-the-answer-and-this-page-ignored-it-for-months)
 6. [Reading the curve, including the part that loses](#reading-the-curve-including-the-part-that-loses)
-6. [GPU cost per pass](#gpu-cost-per-pass)
-7. [Workgroup sweep](#workgroup-sweep)
-8. [The CPU optimisation pass, and what it removed](#the-cpu-optimisation-pass-and-what-it-removed)
-9. [Traps this page had to survive](#traps-this-page-had-to-survive)
-10. [Cross vendor status](#cross-vendor-status)
-11. [What this page does not cover](#what-this-page-does-not-cover)
+7. [GPU cost per pass](#gpu-cost-per-pass)
+    - [Occlusion culling is not free (superseded)](#occlusion-culling-is-not-free-and-below-render-distance-48-it-loses)
+    - [The numbers after the atomic fix](#the-numbers-after-the-atomic-fix)
+    - [Is occlusion culling worth it now?](#is-occlusion-culling-worth-it-now-only-at-long-distances)
+8. [Workgroup sweep](#workgroup-sweep)
+9. [The CPU optimisation pass, and what it removed](#the-cpu-optimisation-pass-and-what-it-removed)
+10. [Traps this page had to survive](#traps-this-page-had-to-survive)
+11. [Cross vendor status](#cross-vendor-status)
+12. [What this page does not cover](#what-this-page-does-not-cover)
 
 ## The rig every number came from
 
@@ -184,6 +187,21 @@ upward the frames are long enough that repeat runs land within a few percent.
 
 ### Occlusion culling is not free, and below render distance 48 it loses
 
+> **FIXED 2026-08-12. Everything in this section describes the shipped
+> 1.0.0 build and is no longer how the code behaves.** The cost was one
+> line: every fragment of an occlusion box wrote the same word with an
+> atomic, and same-address atomics serialise at the L2, so a box covering
+> the screen cost a million serialised read-modify-writes on a single
+> address. It was never the fill rate this section blames. Read-guarding
+> that store removed about 97 percent of both passes and occlusion is now
+> comfortably FASTER than not having it at every distance measured, not
+> just above 48. See [the numbers after the
+> fix](#the-numbers-after-the-atomic-fix) below and
+> [`OCCLUSION-FILLRATE-DESIGN.md`](OCCLUSION-FILLRATE-DESIGN.md) stage 1a.
+> The section is kept as written because the reasoning it contains is
+> sound and only the premise was wrong, and because the default is still
+> off until the re-enable gate is cleared.
+
 Found by the owner in real play on 2026-08-11 ("i just turned off
 occlusion culling and it seems to majorly increase the fps"), then
 reproduced here. This page had measured how many sections occlusion
@@ -231,6 +249,245 @@ What it costs, at the same render distance, as means:
 | Phase B (newly visible) | 0.082 ms |
 | Translucent | 0.140 ms |
 | **Meshelium GPU total** | **1.01 ms** |
+
+### The numbers after the atomic fix
+
+Same rig, same seed, same camera, same session, 1920x1080, static camera,
+occlusion armed ON in both legs. The only difference is three lines in
+`shaders/occlusion/box.frag`: read the stamp word before writing it, and
+skip the atomic if this frame already stamped it.
+
+| Scene | Before | After |
+|---|---|---|
+| Ground level, rd 32 | 3.484 ms (287 fps) | **0.644 ms (1,553 fps)** |
+| Open plains, rd 64 | 3.802 ms (263 fps) | **1.730 ms (578 fps)** |
+
+That is a 5.4x reduction in the cost of the occlusion path, measured the
+only way it can be trusted: the guarded and unguarded builds run back to
+back in the same session on the same scene, changing nothing but the
+shader. The 2.84 ms saved in the ground scene lands on the 2.97 ms the two
+box passes were independently measured to cost, which is the same
+statement twice: the atomic WAS the passes.
+
+**What this does NOT say, and a correction to the first version of this
+section.** It first claimed occlusion had become "69 percent faster than
+not having it", comparing the fresh ON leg against a BFS leg measured in a
+DIFFERENT session at 1.089 ms. Re-measured same-session, that same BFS leg
+is 0.671 ms and 0.670 ms on two runs. The 1.089 ms was not reproducible and
+should never have carried a conclusion. Making the occlusion path 5.4x
+cheaper is a different question from whether occlusion beats not culling at
+all, and the second question needs its baseline measured beside it.
+
+### Is occlusion culling worth it now? Only at long distances
+
+Every pair below is same-session, 1920x1080, static camera, with repeats
+where the answer was close. `culled` is sections resident minus sections
+drawn, which is what the feature buys; the delta is what it costs.
+
+| Scene | Occlusion ON | BFS | Delta | Resident | Drawn | Culled |
+|---|---|---|---|---|---|---|
+| ground rd 32 | 0.662 ms | 0.671 ms | **-1.3%** | 2,271 | 382 | 1,889 |
+| ground rd 32 (repeat) | 0.730 ms | 0.670 ms | **+9.0%** | 2,267 | 375 | 1,892 |
+| plains rd 32 | 0.989 ms | 0.863 ms | **+14.6%** | 3,291 | 1,623 | 1,668 |
+| plains rd 32 (repeat) | 0.959 ms | 0.860 ms | **+11.5%** | 3,298 | 1,631 | 1,667 |
+| plains rd 64 | 1.748 ms | 2.053 ms | **-14.9%** | 9,455 | 3,287 | 6,168 |
+| ground rd 32 @1440p | 0.771 ms | 0.800 ms | **-3.6%** | 2,268 | 382 | 1,886 |
+
+Positive means occlusion is slower. **The two `ground-rd32` rows are not a
+result in either direction and must not be read as one:** those two ON legs
+are the identical configuration, and the 0.068 ms between them is larger
+than any occlusion-versus-bfsOnly difference ever measured at that scene.
+One of them contains a single 20.5 ms stall frame worth 0.033 ms of its own
+mean. Ground level at render distance 32 is a coin flip.
+
+What is real is `plains-rd32` losing on two independent pairs and
+`plains-rd64` winning by 0.305 ms. The GPU timestamps agree with the frame
+times in both cases, independently putting the rd 64 saving at 0.327 ms.
+The per-pass ledger, warmup rows excluded, shows why:
+
+| Scene | Occlusion adds | Draw time it removes | Net GPU | Net frame |
+|---|---|---|---|---|
+| ground rd 32 | 0.176 ms | 0.263 ms | -0.087 | -0.009 |
+| plains rd 32 | 0.243 ms | 0.137 ms | **+0.106** | +0.099 |
+| plains rd 64 | 0.455 ms | 0.782 ms | **-0.327** | -0.305 |
+
+The tax is near fixed and grows with region count and pixels, not with how
+much is actually hidden; the payoff grows with the draw. When the terrain
+draw is 0.39 ms there is nothing to buy. When it is 1.71 ms there is.
+
+**A caveat on the frame-time column that also constrains the benchmark
+itself.** GPU savings only reach frame time when there is enough GPU work
+to be the bottleneck. The ratio of frame delta to GPU delta is 0.91 and
+0.93 in the two plains scenes, where the GPU pass total is 0.69 to 1.71 ms,
+and it is anywhere between 0.10 and 0.71 at ground rd 32, where the GPU
+total is 0.30 ms against a 0.66 ms frame. Below roughly half a millisecond
+of GPU work this harness is CPU limited and a GPU win is simply invisible
+to it. That is the real reason ground rd 32 refuses to resolve.
+
+Before the fix this same shape cost 3x at rd 32 rather than 10 percent, so
+the fix turned a catastrophe into a trade. That is a real improvement and
+it is still not a reason to turn the feature on for everyone.
+
+**The cull rate relative to bfsOnly has never been measured**:
+`gpuSectionsDrawn` reads 0 in every bfsOnly leg because occlusion
+statistics are only recorded when occlusion resources exist. No percentage
+of the form "occlusion removes N percent of the draw set" in any Meshelium
+document is a measured comparison between the two modes. The cull rates
+quoted below are occlusion's own drawn-versus-resident ratio, which is a
+different and weaker statement.
+
+### The full curve, and the one number that decides it
+
+Twenty more legs, 1920x1080, two repeats per cell, every render size
+verified against GLFW, medians rather than means. Sorted by the GPU ledger:
+`saved` is the terrain draw time occlusion removes, `tax` is what its own
+passes cost, and `net` is the difference. Negative net means occlusion is a
+GPU win.
+
+| Scene | saved | tax | net | cull | frame delta |
+|---|---|---|---|---|---|
+| ground rd 64 | 0.608 ms | 0.233 ms | **-0.375** | 86% | **-31.5%** |
+| plains rd 64 | 0.782 ms | 0.459 ms | **-0.323** | 65% | **-16.7%** |
+| ground rd 64 (rep) | 0.530 ms | 0.245 ms | **-0.285** | 89% | **-19.0%** |
+| ground rd 32 | 0.263 ms | 0.174 ms | -0.090 | 83% | -2.4% (no result) |
+| plains rd 48 | 0.398 ms | 0.333 ms | -0.065 | 58% | -5.3% |
+| ground rd 8 | 0.044 ms | 0.104 ms | +0.060 | 59% | +12.9% |
+| plains rd 32 | 0.136 ms | 0.242 ms | +0.106 | 51% | +12.8% |
+| plains rd 16 | 0.031 ms | 0.150 ms | +0.119 | 46% | +12.9% |
+| plains rd 24 | 0.070 ms | 0.191 ms | +0.121 | 47% | +19.3% |
+
+**`saved > tax` predicts the frame result in 17 of 18 measured cells.** The
+single exception is a `ground-rd32` repeat, which is the cell already known
+to be CPU limited and whose own twin at the identical configuration
+predicts and measures a win. As a cost model that is as good as this
+harness can show.
+
+**The headline is `ground-rd64`: occlusion wins by 19 to 31 percent.** That
+is eye level at long distance, which is both what a real player using this
+mod actually runs and the case every previous rd 64 measurement missed,
+because they all used the bird's eye camera. It culls 86 to 89 percent
+there against 65 percent from above. Long render distance is this mod's
+entire selling point, so this is the case that matters most, and it is
+occlusion's best.
+
+**And a section count cannot decide this, which kills the rule this project
+carried since 1.0.0.** `ground-rd64` has about 4,000 resident sections and
+wins by 31 percent; `plains-rd32` has about 3,300 and loses by 13. Resident
+counts overlap completely between winners and losers (winners from 2,252,
+losers up to 3,298). What separates them is how much is actually hidden,
+which a count cannot see. Cull rate alone does not separate them either:
+`ground-rd8` culls 59 percent and still loses, because 59 percent of almost
+nothing is almost nothing.
+
+The one quantity that does separate cleanly, and which is readable while
+occlusion is OFF, is the bfsOnly terrain draw cost. Every winner is above
+0.719 ms and every loser below 0.580 ms, excluding the CPU-limited
+`ground-rd32` cells. **A threshold near 0.65 ms separates all thirteen
+decidable cells.** That is the trigger Auto should use to decide when it is
+worth probing, with the probe itself making the actual decision.
+
+### Camera pose moves occlusion more than distance or resolution do
+
+The 1.1 Auto default keys on render distance, and this is the measurement
+that says why that is a compromise rather than a solution. Two repeats per
+cell, occlusion ON against the BFS feed, negative meaning occlusion is
+faster:
+
+| Scene | 1920x1080 | 2560x1440 |
+|---|---|---|
+| eye level, rd 32 | **-6.5 / -17.8%** | **-5.6 / -7.2%** |
+| elevated, rd 32 | +14.5 / +14.6% | +20.7 / +20.2% |
+| eye level, rd 64 | **-20.9 / -27.7%** | **-1.3 / -17.4%** |
+| elevated, rd 48 | -4.3 / -3.1% | +2.1 / +0.9% |
+
+**At render distance 32 the same world swings about 25 points on camera
+pose alone.** Eye level looking along the terrain wins; 56 blocks up
+looking down loses, because from up there almost nothing is hidden behind
+anything. That is the whole mechanism in one table: occlusion pays exactly
+in proportion to how much geometry is occluded, and distance is only a
+proxy for that.
+
+The owner reported the same split independently from real play before this
+was measured, which is the strongest confirmation available that it is not
+a harness artifact: "high cinematic shots cause lower fps with occlusion
+while low ground realistic survival gameplay gets higher".
+
+**Resolution moves the crossover UP, not down.** The box-pass tax still
+scales with pixels, 0.245 to 0.299 ms at rd 32 for 78 percent more pixels,
+because the read guard removed the per-fragment atomic but every fragment
+still runs and still performs the guard load. So the tax is sub-linear in
+pixels rather than flat. An earlier claim on this page's sibling documents
+that higher resolutions would see SMALLER occlusion cost after the atomic
+fix was wrong, and was corrected by this measurement.
+
+**Why the default is 48 and not 32.** Averaged over the cells above, the
+elevated loss at rd 32 is about 17 percent and the eye-level gain about 9,
+so a default of 32 only pays for a player who almost never leaves the
+ground. 48 is a small win at eye level and a wash from above: it is the
+value that makes nobody meaningfully slower. Players who know how they play
+have a slider, and the tooltip tells them which direction to move it.
+
+### Phase B is half the cost of occlusion and it draws nothing
+
+Broken out of the tax column above, phase B, the pass that draws sections
+which became visible this frame, is **17 to 52 percent of everything
+occlusion costs**, and it drew **zero sections in every measured window**.
+At `ground-rd64` it is 49 to 52 percent: half the price of the feature, for
+nothing.
+
+It is neither dead code nor free. It fires during world load and when the
+camera reveals new terrain, which is why it exists. But
+`TerrainDrawer.recordPhaseDraws` issues one mesh-shader dispatch per
+dispatched region and `terrain.task` then rejects every section slot one at
+a time on a stamp comparison, so at rd 64 it is 158 regions of task-shader
+work to draw nothing at all.
+
+Removing that cost, by predicating the pass on a freshly-stamped counter or
+by compacting to an indirect dispatch over only the new sections, moves
+every cell by its own phase B figure:
+
+| Scene | net today | net without phase B |
+|---|---|---|
+| plains rd 64 | -0.323 | **-0.557** |
+| ground rd 64 | -0.285 | **-0.413** |
+| plains rd 48 | -0.065 | **-0.209** |
+| plains rd 32 | +0.106 | **+0.024** (a wash, from a clear loss) |
+| plains rd 24 | +0.121 | +0.065 |
+| plains rd 16 | +0.119 | +0.084 |
+| ground rd 8 | +0.060 | +0.042 |
+
+So it roughly triples the rd 48 win, adds 45 to 72 percent to the rd 64
+wins, and turns the rd 32 loss into a wash. It does **not** rescue render
+distance 16 and 24, which still lose, so an Auto mode is still required
+afterwards. This is the next thing to build, before Auto, because it
+changes the numbers Auto would be calibrated against.
+
+**Scene caveat, unchanged and important:** these are open plains and open
+ground, which is close to the worst case for occlusion, because almost
+nothing hides behind anything. Caves, mountains and dense forest should
+move the crossover much nearer. A player in a ravine is not the player this
+table describes.
+
+Why one line mattered that much: `gl_PrimitiveID` identifies the box, not
+the pixel, so every fragment a box produces targets the same 32-bit word.
+Same-address atomics cannot run in parallel, they queue. A box near the
+camera covers most of the screen, so it was issuing on the order of a
+million serialised read-modify-writes against one address, every frame.
+The guard makes all but the first few of them a cache read that fails a
+compare.
+
+Correctness: the stamp writes were always idempotent (every writer in a
+frame writes the identical value), so skipping a redundant one cannot
+change the result. Verified by pixel parity against the BFS reference and
+by the phase-B counter, which stays silent, meaning no section ever lost
+its stamp. The full argument, including why the now non-atomic read is
+safe despite being a formal data race, is in `box.frag` and in the design
+doc.
+
+**The default is still OFF** and the settings row is still hidden. Turning
+them back on is a separate change that has to clear its gate first: a
+1440p leg, a moving-camera leg, `plains-rd32`, and the row returning as
+Auto rather than the plain toggle that caused this.
 
 ## Workgroup sweep
 
@@ -303,6 +560,39 @@ bite anyone benchmarking Minecraft.
   no uploads for two seconds, before it measures anything, with a worldgen
   sized budget.
 - **A busy GPU.** Every number here was taken with nothing else running.
+- **Comparing across sessions. This one is the most dangerous on the list
+  because nothing about it looks wrong.** The identical `ground-rd32`
+  bfsOnly leg measured 1.089 ms in one session and 0.671 and 0.670 ms in
+  another. On 2026-08-12 an occlusion result was written up internally as
+  "69 percent faster than not culling" purely because a fresh number was
+  compared against that stale one; re-measured properly the same scene was a
+  coin flip. The same shift shows in `plains-rd32` bfsOnly, 1.436 ms on
+  11 Aug against 0.860 ms on 12 Aug, with the vanilla control in those legs
+  barely moving. **Rule: a comparison is only valid if BOTH legs were
+  measured in the same session, and an archived number is context, never a
+  baseline.** The cause of the shift is still unexplained; same-session
+  pairing works around it rather than solving it.
+- **The noise floor is bigger than most of the effects being chased, and
+  the first version of this entry understated it.** It claimed the harness
+  repeats "to 0.1 percent" within a session, generalising from one lucky
+  pair. Two `ground-rd32` occlusion-ON legs of the identical
+  resolution-verified configuration measured 0.662 and 0.730 ms, which is
+  10 percent, and that spread is LARGER than any occlusion-versus-bfsOnly
+  difference ever measured at that scene. One of those two legs contains a
+  single 20.5 ms stall frame that moved its own mean by 0.033 ms. So: three
+  repeats per cell, report the median and the 5 percent trimmed mean beside
+  the mean, and treat any difference smaller than the observed spread of the
+  legs themselves as no result at all. Measure the spread before believing
+  the delta.
+- **The resolution the run asked for is not the resolution it got.** The
+  854x480 default window is documented above as the single biggest
+  methodological error this project made; the second layer of it lasted
+  months longer. `-Pmeshelium.res` fixed the REQUEST side while the report
+  stayed silent about the RESULT, so a leg that was silently clamped, by a
+  window manager refusing a size larger than the desktop for instance, would
+  have looked perfectly comparable. Every bench report now records the real
+  framebuffer width, height and megapixels, and the gate runs archive the
+  scene screenshot next to the JSON as independent evidence of the size.
 
 ## Cross vendor status
 

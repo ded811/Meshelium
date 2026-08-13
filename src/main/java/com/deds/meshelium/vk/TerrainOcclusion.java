@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Wave-6 GPU occlusion culling — Nvidium's two-level box-raster
  * architecture (by MCRcortex, LGPL-3.0) in cross-vendor form:

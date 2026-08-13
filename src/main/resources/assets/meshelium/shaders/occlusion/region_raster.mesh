@@ -1,5 +1,6 @@
+// Copyright (C) 2026 Ded811
+// SPDX-License-Identifier: LGPL-3.0-only
 #version 460
-// Meshelium — LGPL-3.0-only.
 //
 // Wave-6 occlusion REGION raster (EXT dialect): one mesh workgroup per
 // CPU-frustum-visible region draws its occupancy AABB as a watertight box
@@ -54,6 +55,13 @@
 
 layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
 layout(triangles, max_vertices = 8, max_primitives = 12) out;
+
+// The box index the fragment shader stamps with. Deliberately NOT
+// gl_PrimitiveID: reading that in a fragment shader declares SPIR-V
+// Capability Geometry, which needs a device feature vanilla does not
+// enable, so box.frag would fail to compile on any driver that enforces it
+// and occlusion would silently fall back. See box.frag for the full story.
+layout(location = 0) perprimitiveEXT out uint vBoxId[];
 
 // Per-frame occlusion region list (TerrainDrawer's occlusion path).
 // Standard mode (MESHELIUM_LISTS_SSBO == 0): MESHELIUM_OCC_REGIONS × 32 B =
@@ -139,10 +147,10 @@ void main() {
     gl_MeshVerticesEXT[t].gl_Position = ProjMat * (ModelViewMat * vec4(corner, 1.0));
 
     gl_PrimitiveTriangleIndicesEXT[t] = BOX_TRIS[t];
-    gl_MeshPrimitivesEXT[t].gl_PrimitiveID = int(slot);
+    vBoxId[t] = slot;
     if (t < 4u) {
         gl_PrimitiveTriangleIndicesEXT[8u + t] = BOX_TRIS[8u + t];
-        gl_MeshPrimitivesEXT[8u + t].gl_PrimitiveID = int(slot);
+        vBoxId[8u + t] = slot;
     }
 
     if (t == 0u) {

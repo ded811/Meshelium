@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Raw VMA buffer creation on vanilla's own allocator handle
  * ({@code VulkanDevice.vma()}, seam doc Q3). The recipe mirrors vanilla's

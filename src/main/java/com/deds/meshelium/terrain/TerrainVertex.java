@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Input contract shaped after the data Nvidium's encoder consumed from
  * Sodium's mesher (misc/reference/nvidium/src/main/java/me/cortex/nvidium/

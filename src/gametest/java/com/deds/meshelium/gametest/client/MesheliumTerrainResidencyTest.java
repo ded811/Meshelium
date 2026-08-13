@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Wave 3b acceptance: the vanilla section tap + GPU residency, proven on
  * a real client. Vulkan run: sections/quads/arena counters go live after

@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Wave 4 acceptance: mesh-shader terrain vs vanilla, same world, same
  * camera, two PNGs. Active ONLY on the `-Pmeshelium.backend=vulkan
@@ -117,13 +118,13 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
             return; // only the -Pmeshelium.terrain=true Vulkan run exercises wave 4
         }
 
-        // ARM OCCLUSION for the wave-5 and wave-6 legs below. Its config
-        // default flipped to OFF at 1.0.0 because the occlusion passes are
-        // rasterisation and cost more than they save at real resolutions
-        // (the measurements are on MesheliumConfig.enableOcclusionCulling).
-        // Those legs exist to prove the machinery still works when it IS
-        // on, so they arm it rather than lean on a default they no longer
-        // own. Dropped again after the wave-6 legs, below.
+        // ARM OCCLUSION for the wave-5 and wave-6 legs below. The shipped
+        // default is AUTO (measurements on MesheliumConfig.occlusionMode),
+        // and this harness world runs at a low render distance where AUTO
+        // correctly decides OFF. These legs exist to prove the machinery
+        // works when it IS on, so they arm it explicitly through the
+        // property rather than lean on a default they do not own. Dropped
+        // again after the wave-6 legs, below.
         context.runOnClient(client ->
                 System.setProperty(TerrainDrawer.PROPERTY_BFS_ONLY, "false"));
 

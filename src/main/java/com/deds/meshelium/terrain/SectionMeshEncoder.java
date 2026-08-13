@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Derived from Nvidium by MCRcortex (LGPL-3.0). Algorithm authority:
  *   misc/reference/nvidium/src/main/java/me/cortex/nvidium/sodiumCompat/SodiumResultCompatibility.java
