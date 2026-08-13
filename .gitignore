@@ -1,0 +1,43 @@
+# Build output and caches
+.gradle/
+build/
+run/
+out/
+bin/
+
+# IDE. bin/ above is the VS Code Java extension's output directory; these
+# are the rest of what that extension and Eclipse drop into a project.
+# NOTE gradle/wrapper/gradle-wrapper.jar is deliberately NOT ignored: it
+# is a tracked part of the wrapper and a clone cannot build without it.
+.idea/
+.vscode/
+.project
+.classpath
+.settings/
+.factorypath
+*.iml
+
+# JVM crash and profiling artifacts. This project runs real Minecraft
+# clients constantly, and a crashed JVM writes these next to the working
+# directory. A heap dump is hundreds of megabytes, so accidentally
+# committing one is not a small mistake.
+hs_err_pid*.log
+replay_pid*.log
+.attach_pid*
+*.hprof
+*.log
+
+# Machine-local configuration. Anything whose value is a path on one
+# person's disk belongs here rather than in build.gradle: shipping such a
+# path is exactly what stopped a clean clone from building before 1.0.0.
+local.properties
+
+# Operating system clutter
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local tooling
+__pycache__/
+.claude/
+CLAUDE.md

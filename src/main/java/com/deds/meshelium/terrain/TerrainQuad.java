@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Host-agnostic quad input for the wave-3a data layer. Shape follows what
  * Nvidium's repackager consumed per quad (facing bucket + pass-derived

@@ -1,5 +1,6 @@
+// Copyright (C) 2026 Ded811
+// SPDX-License-Identifier: LGPL-3.0-only
 #version 460
-// Meshelium — LGPL-3.0-only.
 //
 // Wave-6 occlusion SECTION raster, MESH stage (EXT dialect): one mesh
 // workgroup per compacted section slot of a region-raster-visible region
@@ -44,6 +45,12 @@
 
 layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
 layout(triangles, max_vertices = 8, max_primitives = 12) out;
+
+// The global section index the fragment shader stamps with. Deliberately
+// NOT gl_PrimitiveID; see box.frag for why that would break occlusion on a
+// strict driver. Same location as region_raster.mesh, because box.frag is
+// one module shared by both pipelines.
+layout(location = 0) perprimitiveEXT out uint vBoxId[];
 
 layout(set = 0, binding = 1, std140) uniform MesheliumScene {
     mat4 ModelViewMat;
@@ -125,10 +132,10 @@ void main() {
     gl_MeshVerticesEXT[t].gl_Position = ProjMat * (ModelViewMat * vec4(corner, 1.0));
 
     gl_PrimitiveTriangleIndicesEXT[t] = BOX_TRIS[t];
-    gl_MeshPrimitivesEXT[t].gl_PrimitiveID = int(globalIdx);
+    vBoxId[t] = globalIdx;
     if (t < 4u) {
         gl_PrimitiveTriangleIndicesEXT[8u + t] = BOX_TRIS[8u + t];
-        gl_MeshPrimitivesEXT[8u + t].gl_PrimitiveID = int(globalIdx);
+        vBoxId[8u + t] = globalIdx;
     }
 
     if (t == 0u) {

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
+ */
 package com.deds.meshelium;
 
 import com.deds.meshelium.fabric.MesheliumClient;
@@ -149,8 +153,146 @@ public final class MesheliumConfig {
      * instead of per build is the proper fix and is not done yet: it
      * wants the pass cost weighed against the section count the drawer
      * already tracks, exposed as Auto / On / Off.</p>
+     *
+     * <p><b>STILL FALSE, but the cost above has since been FIXED and the
+     * diagnosis in this javadoc was wrong (2026-08-12).</b> The passes
+     * were never fill-rate bound. Every fragment of a box wrote the same
+     * word with an atomic, and same-address atomics serialise, so a near
+     * box covering the screen cost a million serialised read-modify-writes
+     * on one address. Read-guarding that store
+     * ({@code shaders/occlusion/box.frag}, docs/OCCLUSION-FILLRATE-DESIGN.md
+     * stage 1a) removed about 97 percent of both passes, measured with the
+     * guarded and unguarded builds run back to back on the same scene:</p>
+     * <pre>
+     *   ground-rd32 @1080p: 287 fps -&gt; 1553 fps
+     *   plains-rd64 @1080p: 263 fps -&gt;  578 fps
+     * </pre>
+     *
+     * <p><b>That is a 5.4x cheaper occlusion path, and it is still not a
+     * reason to default this to true.</b> Making the passes cheap is a
+     * different question from whether culling beats not culling, and the
+     * same-session answer to the second question is that it depends on the
+     * scene, exactly as it did before the fix, only with the magnitudes
+     * collapsed. Occlusion ON versus the BFS feed, 1920x1080, static, each
+     * pair measured in one session:</p>
+     * <pre>
+     *   ground rd32   0.662 vs 0.671 ms   -1.3%   (repeat: +9.0%)
+     *   plains rd32   0.989 vs 0.863 ms  +14.6%   (repeat: +11.5%)
+     *   plains rd64   1.748 vs 2.053 ms  -14.9%
+     * </pre>
+     * <p>Positive means occlusion is SLOWER. It costs about 10 percent at
+     * render distance 32 and gains about 15 percent at 64, so the crossover
+     * sits between roughly 3,300 and 9,500 resident sections. Defaulting it
+     * on would make the common case slower, which is the same mistake 1.0.0
+     * shipped, just smaller. The fix for that is Auto, keyed on the section
+     * count this class can already see, not a flipped boolean.</p>
+     *
+     * <p>Note these are OPEN scenes, near the worst case for occlusion.
+     * Caves and mountains should move the crossover much nearer, which is
+     * the argument for deciding per scene at runtime.</p>
+     *
+     * <p>CORRECTION, recorded because it nearly shipped: an earlier version
+     * of this javadoc claimed occlusion had become "substantially faster
+     * than the BFS feed in both scenes". That compared a fresh ON leg with
+     * a BFS leg from a DIFFERENT session (1.089 ms), which re-measures at
+     * 0.671 ms same-session. Never compare against a baseline you did not
+     * measure beside it.</p>
      */
+    /**
+     * @deprecated SUPERSEDED by {@link #occlusionMode} (1.1). Kept as a
+     *     field so existing {@code meshelium.json} files still parse:
+     *     {@code load()} catches only {@code IOException} and
+     *     {@code JsonParseException}, and every shipped config carries this
+     *     key as a JSON boolean, so retyping it in place risks a parse
+     *     failure that would silently reset a player's whole config. Nothing
+     *     reads it any more; a 1.0.0 user who had set it true lands on AUTO,
+     *     which turns occlusion on exactly where it measures faster.
+     */
+    @Deprecated
     public boolean enableOcclusionCulling = false;
+
+    /** How occlusion culling decides whether to run. */
+    public enum OcclusionMode {
+        /** On at or above {@link #occlusionAutoMinRenderDistance}. */
+        AUTO,
+        ON,
+        OFF
+    }
+
+    /**
+     * Occlusion culling: Auto, On or Off. <b>Default AUTO</b> (1.1).
+     *
+     * <p>1.0.0 shipped this as a plain boolean defaulting ON, which was
+     * wrong, and then as a plain boolean defaulting OFF, which was also
+     * wrong. It is not a global answer: measured same-session at 1920x1080
+     * on an RX 9070 XT, occlusion is 11 to 15 percent SLOWER than the BFS
+     * feed at render distance 32 and 19 to 31 percent FASTER at 64. Auto
+     * exists because the correct answer depends on how far you can see.</p>
+     */
+    public OcclusionMode occlusionMode = OcclusionMode.AUTO;
+
+    /** Lowest render distance Auto will arm occlusion at. */
+    public static final int MIN_OCCLUSION_AUTO_RD = 2;
+
+    /**
+     * Highest; equal to the hard render-distance ceiling, so Auto can be
+     * parked above any reachable distance and behave as Off.
+     *
+     * <p>Qualified name deliberately: {@code MAX_MAX_RENDER_DISTANCE} is
+     * declared further down this file and a SIMPLE name there would be an
+     * illegal forward reference. Keeping the occlusion constants next to
+     * the occlusion field beats reordering the file.</p>
+     */
+    public static final int MAX_OCCLUSION_AUTO_RD = MesheliumConfig.MAX_MAX_RENDER_DISTANCE;
+
+    /**
+     * The crossover that is safe for every measured case, which is NOT the
+     * same as the best value for any one of them.
+     *
+     * <p>Render distance is only a PROXY. What occlusion exploits is how
+     * much terrain is hidden behind other terrain, and CAMERA POSE moves
+     * that far more than distance or resolution do. Measured 2026-08-12,
+     * two repeats per cell, occlusion ON versus the BFS feed, negative
+     * meaning occlusion is faster:</p>
+     * <pre>
+     *                        1920x1080        2560x1440
+     *   eye level, rd 32   -6.5 / -17.8%    -5.6 /  -7.2%   occlusion WINS
+     *   elevated,  rd 32  +14.5 / +14.6%   +20.7 / +20.2%   occlusion LOSES
+     *   eye level, rd 64  -20.9 / -27.7%    -1.3 / -17.4%   occlusion WINS
+     *   elevated,  rd 48   -4.3 /  -3.1%    +2.1 /  +0.9%   about even
+     * </pre>
+     *
+     * <p>At render distance 32 the same scene swings roughly 25 points on
+     * camera pose alone: eye level wins, 56 blocks up looking down loses.
+     * No single distance threshold can serve both, so this is set where
+     * neither is meaningfully hurt: a small win at eye level, a wash from
+     * above. 32 would be better for ground play and clearly worse for
+     * anyone flying, and the measured elevated loss (about 17 percent
+     * averaged) is larger than the measured eye-level gain (about 9
+     * percent), so a lower default only pays if a player almost never
+     * leaves the ground. The slider exists for players who know which they
+     * are; the tooltip tells them which way to move it.</p>
+     *
+     * <p>Resolution moves the crossover UP, not down: the box-pass tax
+     * still scales with pixels (0.245 to 0.299 ms at rd 32 for 78 percent
+     * more pixels) because the read guard removed the atomic but every
+     * fragment still runs and still loads. So 48 stays right at 1440p and
+     * above, and a resolution-scaled default would have to raise it, not
+     * lower it. Not worth the hidden magic when a slider is right there.</p>
+     */
+    public static final int DEFAULT_OCCLUSION_AUTO_RD = 48;
+
+    /**
+     * Render distance at or above which Auto arms occlusion culling.
+     *
+     * <p>Tunable because {@link #DEFAULT_OCCLUSION_AUTO_RD} was fitted to
+     * OPEN terrain, which is close to occlusion's worst case. Caves,
+     * ravines and mountains hide far more geometry for the same distance
+     * and should cross over lower; that case is <b>UNMEASURED</b>, so the
+     * shipped default is the conservative one and this exists for players
+     * whose worlds are not open plains.</p>
+     */
+    public int occlusionAutoMinRenderDistance = DEFAULT_OCCLUSION_AUTO_RD;
 
     /**
      * Once-per-5s INFO stat lines (residency + draw path; default false —
@@ -346,15 +488,43 @@ public final class MesheliumConfig {
     }
 
     /**
-     * {@code !meshelium.terrainDraw.bfsOnly} ?? {@link #enableOcclusionCulling}
-     * (the property spells the FALLBACK, so its presence inverts).
+     * Resolve occlusion culling for a frame at {@code effectiveRenderDistance}.
+     *
+     * <p>Precedence: {@code meshelium.terrainDraw.bfsOnly} (the harness pin;
+     * the property spells the FALLBACK, so its presence inverts) beats the
+     * config, and in {@link OcclusionMode#AUTO} the config consults the
+     * render distance against {@link #occlusionAutoMinRenderDistance}.</p>
+     *
+     * <p>The distance is passed IN rather than read here on purpose: this
+     * class is pure loader/GSON code callable from either backend and any
+     * thread, and reaching into {@code Minecraft.getInstance()} would break
+     * that. The one production call site is on the render thread and
+     * already knows the number.</p>
      */
-    public static boolean occlusionCullingEnabled() {
+    public static boolean occlusionCullingEnabled(int effectiveRenderDistance) {
         String property = System.getProperty("meshelium.terrainDraw.bfsOnly");
         if (property != null) {
             return !Boolean.parseBoolean(property);
         }
-        return get().enableOcclusionCulling;
+        MesheliumConfig config = get();
+        return switch (config.occlusionMode) {
+            case ON -> true;
+            case OFF -> false;
+            case AUTO -> effectiveRenderDistance >= config.occlusionAutoMinRenderDistance;
+        };
+    }
+
+    /**
+     * The configured mode, ignoring render distance — for the options
+     * screen and for the boot-smoke default assertion. The harness property
+     * still outranks it so a pinned leg reports what it actually ran.
+     */
+    public static OcclusionMode occlusionMode() {
+        String property = System.getProperty("meshelium.terrainDraw.bfsOnly");
+        if (property != null) {
+            return Boolean.parseBoolean(property) ? OcclusionMode.OFF : OcclusionMode.ON;
+        }
+        return get().occlusionMode;
     }
 
     /** {@code meshelium.debugStats} ?? {@link #debugStats}. */
@@ -475,6 +645,38 @@ public final class MesheliumConfig {
     private static boolean propertyOr(String key, boolean configValue) {
         String property = System.getProperty(key);
         return property != null ? Boolean.parseBoolean(property) : configValue;
+    }
+
+    /**
+     * Restore every PLAYER-FACING setting to its shipped default and save.
+     *
+     * <p>Copies field by field from a fresh instance rather than replacing
+     * the singleton, because call sites hold {@code get()} references and
+     * swapping the object underneath them would leave stale views.</p>
+     *
+     * <p>Deliberately NOT reset: {@link #noMeshShaderNoticeShown} and
+     * {@link #vulkanFailedNoticeShown}. Those are "we have already told you
+     * this once" receipts, not preferences, and clearing them would make a
+     * one-time popup reappear at the next boot as a surprise side effect of
+     * a button labelled "reset settings". {@link #showVulkanPrompt} IS a
+     * preference and IS reset.</p>
+     */
+    public void resetToDefaults() {
+        MesheliumConfig d = new MesheliumConfig();
+        this.enableTerrainRendering = d.enableTerrainRendering;
+        this.occlusionMode = d.occlusionMode;
+        this.occlusionAutoMinRenderDistance = d.occlusionAutoMinRenderDistance;
+        this.enableOcclusionCulling = d.enableOcclusionCulling;
+        this.debugStats = d.debugStats;
+        this.maxRenderDistance = d.maxRenderDistance;
+        this.showVulkanPrompt = d.showVulkanPrompt;
+        // Retention has no rows any more (Bobby owns that job since
+        // 2026-08-11) but the fields are still live behind the config, so a
+        // reset must cover them or "reset to defaults" would quietly leave
+        // a hand-edited config half-reset.
+        this.retainTerrain = d.retainTerrain;
+        this.retainTerrainMinutes = d.retainTerrainMinutes;
+        save();
     }
 
     private static Path path() {

@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
+ */
 package com.deds.meshelium.vk;
 
 import com.deds.meshelium.fabric.MesheliumClient;
@@ -13,6 +17,7 @@ import org.lwjgl.vulkan.VK11;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkMemoryHeap;
 import org.lwjgl.vulkan.VkPhysicalDevice;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderFeaturesEXT;
@@ -60,6 +65,49 @@ public final class MeshShaderDeviceSupport {
     public static final VulkanFeature TASK_SHADER_FEATURE = new VulkanFeature(
             MESH_SHADER_FEATURES_STRUCT, "taskShader", VkPhysicalDeviceMeshShaderFeaturesEXT.TASKSHADER);
 
+    /**
+     * The BASE {@code VkPhysicalDeviceFeatures}, addressed as if it were a
+     * pNext struct.
+     *
+     * <p>Vanilla's helpers only know how to reach chained structs, but
+     * {@code VulkanPNextStruct.findStructInPNextChain} checks the HEAD
+     * struct's own sType before walking the chain (bytecode-verified), and
+     * the head IS a {@code VkPhysicalDeviceFeatures2}. So naming that sType
+     * resolves to the root, and an offset of
+     * {@code FEATURES + <member>} reaches into its inline base-features
+     * block. No new plumbing, no reflection.</p>
+     */
+    private static final VulkanPNextStruct BASE_FEATURES_STRUCT = new VulkanPNextStruct(
+            VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            VkPhysicalDeviceProperties2.SIZEOF);
+
+    /**
+     * {@code fragmentStoresAndAtomics} — REQUIRED by occlusion culling, and
+     * missing since wave 6.
+     *
+     * <p>The whole box-raster technique is a fragment shader writing
+     * visibility into a storage buffer. Without this feature the spec
+     * demands every fragment-stage storage buffer be NonWritable
+     * (VUID-RuntimeSpirv-NonWritable-06340), which forbids exactly that
+     * write. Vanilla does not enable it, AMD's driver allowed it anyway,
+     * and so occlusion culling has never been spec-valid on any machine.
+     * The validation layer refuses pipeline creation outright, and a
+     * stricter driver may too: the failure is silent and total, occlusion
+     * latches an error and the renderer falls back to the BFS feed, which
+     * from the outside just looks like occlusion not helping.</p>
+     *
+     * <p>Unlike the {@code geometryShader} requirement that {@code
+     * gl_PrimitiveID} used to impose, this one cannot be engineered away in
+     * the shader: writing from the fragment stage IS the design. It is also
+     * universally supported on desktop hardware, so requesting it costs
+     * nothing. It is still PROBED before being requested, because asking
+     * for an unsupported feature fails device creation, and Meshelium's one
+     * inviolable rule is never to break a boot vanilla could finish.</p>
+     */
+    public static final VulkanFeature FRAGMENT_STORES_AND_ATOMICS = new VulkanFeature(
+            BASE_FEATURES_STRUCT, "fragmentStoresAndAtomics",
+            VkPhysicalDeviceFeatures.FRAGMENTSTORESANDATOMICS);
+
     private static final VulkanPNextStruct MESH_SHADER_PROPERTIES_STRUCT = new VulkanPNextStruct(
             EXTMeshShader.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT,
             VkPhysicalDeviceMeshShaderPropertiesEXT.SIZEOF);
@@ -93,6 +141,20 @@ public final class MeshShaderDeviceSupport {
             extensions.add(EXTENSION_NAME);
             features.add(MESH_SHADER_FEATURE);
             features.add(TASK_SHADER_FEATURE);
+            // Occlusion culling's fragment shader writes visibility stamps
+            // into a storage buffer, which the spec forbids without this.
+            // Probed, never assumed: requesting an unsupported feature
+            // fails device creation and takes the whole game down with it.
+            // If it is genuinely absent, mesh-shader terrain still works
+            // and only occlusion culling is unavailable.
+            if (isFeatureSupported(vk, FRAGMENT_STORES_AND_ATOMICS)) {
+                features.add(FRAGMENT_STORES_AND_ATOMICS);
+            } else {
+                MesheliumClient.LOGGER.warn(
+                        "Meshelium: this device reports no fragmentStoresAndAtomics, so occlusion "
+                                + "culling cannot run (mesh-shader terrain is unaffected). "
+                                + "Device '{}', driver '{}'", name, driver);
+            }
 
             MesheliumVulkanState.MeshShaderCaps caps = queryCaps(vk);
             MesheliumVulkanState.recordDeviceCreation(name, driver, true, caps, localHeapBytes);

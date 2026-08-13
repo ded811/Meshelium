@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  */
 package com.deds.meshelium.vk;
 
@@ -1448,11 +1449,17 @@ public final class TerrainDrawer {
                     colorView, depthView, atlasView, lightmapView);
         }
         // Wave-6 default: GPU-raster occlusion. Effective setting since
-        // wave 8: bfsOnly property ?? !config.enableOcclusionCulling —
-        // re-read every call (MesheliumConfig matrix), so both the harness
-        // property flip and the options-screen toggle land next frame.
-        // A latched occlusion failure reverts to wave-5 entirely.
-        if (MesheliumConfig.occlusionCullingEnabled() && !occlusionBroken) {
+        // 1.1: bfsOnly property ?? Auto/On/Off, where AUTO compares the
+        // EFFECTIVE render distance against the configured crossover.
+        // Re-read every call (MesheliumConfig matrix), so the harness
+        // property flip, the options-screen mode change and a mid-session
+        // render-distance slider move all land next frame. A latched
+        // occlusion failure reverts to wave-5 entirely.
+        //
+        // getEffectiveRenderDistance, not the raw option: on a server the
+        // client cannot see past the server's cap, so the raw option would
+        // arm occlusion for terrain that is not there.
+        if (MesheliumConfig.occlusionCullingEnabled(effectiveRenderDistance()) && !occlusionBroken) {
             try {
                 Boolean occluded = drawOcclusionCulled(snap, cam, atlasSampler,
                         colorView, depthView, atlasView, lightmapView);
@@ -1771,6 +1778,19 @@ public final class TerrainDrawer {
         occlusionFrames++;
         totalDrawnSections += Math.max(gpuSectionsDrawn, 0);
         return true;
+    }
+
+    /**
+     * The render distance occlusion's Auto mode decides against: vanilla's
+     * EFFECTIVE distance, so a server cap is honoured. Render thread only.
+     * Falls back to the option itself if options are somehow absent, which
+     * keeps Auto conservative rather than crashing a draw.
+     */
+    private static int effectiveRenderDistance() {
+        Minecraft client = Minecraft.getInstance();
+        return client != null && client.options != null
+                ? client.options.getEffectiveRenderDistance()
+                : 0;
     }
 
     /**

@@ -1,5 +1,6 @@
+// Copyright (C) 2026 Ded811
+// SPDX-License-Identifier: LGPL-3.0-only
 #version 460
-// Meshelium — LGPL-3.0-only.
 //
 // Wave-4 opaque terrain FRAGMENT shader. This is a port of VANILLA's
 // terrain.fsh + fog.glsl (both dumped verbatim from the 26.2 jar — that is

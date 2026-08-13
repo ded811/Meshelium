@@ -1,3 +1,7 @@
+/*
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
+ */
 package com.deds.meshelium.gametest.client;
 
 import com.deds.meshelium.MesheliumConfig;
@@ -284,14 +288,31 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         if (System.getProperty(TerrainDrawer.PROPERTY_BFS_ONLY) != null) {
             return; // a run that overrides it cannot judge the default
         }
-        if (MesheliumConfig.occlusionCullingEnabled()) {
-            throw new AssertionError("occlusion culling defaults to ON again. It was "
-                    + "deliberately turned OFF at 1.0.0: the passes are rasterisation, so "
-                    + "they cost more than they save at real resolutions (1080p, rd 32: "
-                    + "317 fps on, 697 off, 362 for vanilla). If this is being flipped back, "
-                    + "the numbers behind the decision are on "
-                    + "MesheliumConfig.enableOcclusionCulling and they need re-measuring at "
-                    + "a resolution somebody plays at, not in the harness window");
+        // 1.1: the default is AUTO, not a boolean. The assertion that
+        // matters is no longer "off" but "not unconditionally on", plus the
+        // crossover being where the measurements put it. A plain ON default
+        // is what 1.0.0 shipped and it made render distance 32, the common
+        // case, measurably slower.
+        MesheliumConfig config = MesheliumConfig.get();
+        if (config.occlusionMode != MesheliumConfig.OcclusionMode.AUTO) {
+            throw new AssertionError("occlusion culling no longer defaults to AUTO (it is "
+                    + config.occlusionMode + "). There is no global right answer: measured "
+                    + "same-session at 1920x1080, occlusion is 11 to 15 percent SLOWER than "
+                    + "the BFS feed at render distance 32 and 19 to 31 percent FASTER at 64. "
+                    + "A plain ON default is 1.0.0's mistake and a plain OFF default hides a "
+                    + "large win from the players this mod exists for. The numbers are on "
+                    + "MesheliumConfig.occlusionMode");
+        }
+        // Auto must not be armed below the measured crossover. Guards the
+        // specific regression of somebody 'tuning' the default down to make
+        // a benchmark look better at short distances.
+        if (config.occlusionAutoMinRenderDistance < MesheliumConfig.DEFAULT_OCCLUSION_AUTO_RD) {
+            throw new AssertionError("the Auto occlusion crossover ships at "
+                    + config.occlusionAutoMinRenderDistance + ", below the measured "
+                    + MesheliumConfig.DEFAULT_OCCLUSION_AUTO_RD + ". Every scene at render "
+                    + "distance 8, 16, 24 and 32 measured SLOWER with occlusion on; 48 and 64 "
+                    + "measured faster. Lowering the shipped default needs new measurements, "
+                    + "not a hunch. Players can still lower it themselves");
         }
         if (!MesheliumConfig.terrainRenderingEnabled()) {
             throw new AssertionError("terrain rendering defaults to OFF, so the mod ships "

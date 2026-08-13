@@ -1,5 +1,6 @@
 /*
- * Meshelium — LGPL-3.0-only.
+ * Copyright (C) 2026 Ded811
+ * SPDX-License-Identifier: LGPL-3.0-only
  *
  * Wave-3b decoder: 26.2's 28-byte DefaultVertexFormat.BLOCK terrain
  * vertices → Meshelium's abstract TerrainQuads. Layout authority is the

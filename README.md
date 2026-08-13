@@ -16,22 +16,26 @@
   <img src="https://img.shields.io/badge/Minecraft-26.2-brightgreen?style=flat-square" alt="Minecraft 26.2">
 </p>
 
-Frames per second at 1920x1080, same computer, same world, looking the same way. One run with Meshelium, one without.
+Frames per second at 1920x1080, same computer, same world, looking the same way, at default settings. One run with Meshelium, one without.
 
-![Bar chart of frames per second with Meshelium compared with plain Minecraft, rising from 1.2 times at render distance 12 to 4.2 times at render distance 64](docs/fps-chart.png)
+![Bar chart showing how many times more frames per second Meshelium gives, rising from 1.5 times at render distance 12 to 5.3 times at render distance 64](docs/fps-chart.png)
 
 **The further you look, the bigger Meshelium wins.** Here are the actual frame rates behind that graph, in frames per second, so higher is better:
 
-| Render distance | Meshelium FPS | Plain Minecraft FPS | Difference |
+| Render distance | Meshelium FPS | Minecraft FPS | Difference |
 |---|---|---|---|
-| 12, Minecraft's default | 1,748 | 1,511 | 1.2x |
-| 16 | 1,486 | 1,054 | 1.4x |
-| 24 | 946 | 597 | 1.6x |
-| 32, as far as Minecraft goes | **696** | 372 | **1.9x** |
-| 48 | **513** | 172 | **3.0x** |
-| 64 | **413** | 99 | **4.2x** |
+| 12, Minecraft's default | 2,437 | 1,621 | 1.5x |
+| 16 | 2,126 | 1,115 | 1.9x |
+| 24 | 1,709 | 641 | 2.7x |
+| 32, as far as Minecraft goes | **1,206** | 393 | **3.1x** |
+| 48 | **761** | 205 | **3.7x** |
+| 64 | **607** | 114 | **5.3x** |
 
-Minecraft's own slider stops at 32. Meshelium unlocks 48 and 64, and we measured plain Minecraft out there too so the comparison stays fair.
+Minecraft's own slider stops at 32. Meshelium unlocks 48 and 64, and we measured Minecraft out there too so the comparison stays fair.
+
+Both columns are Minecraft's Vulkan renderer, the one Meshelium runs on, so the only thing that changes between them is Meshelium itself.
+
+These are our numbers on our computer: one graphics card, one world, one spot. Yours will differ. What should hold everywhere is the shape, that the further you can see, the more Meshelium is doing for you.
 
 ## What you need
 
@@ -79,6 +83,7 @@ Nvidium only runs on NVIDIA cards, so Meshelium rebuilds the same idea in a way 
 
 - **Bobby** by **Johni0702**, the perfect partner for playing online
 - The **Fabric** team, for the loader and Fabric API
+- Meshelium is by **Ded811**. Copyright (C) 2026
 - License: **LGPL-3.0**, the same license Nvidium uses
 
 Want the deep version? It is in [TECHNICAL.md](docs/TECHNICAL.md) and [PERFORMANCE.md](docs/PERFORMANCE.md).

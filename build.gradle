@@ -197,6 +197,32 @@ loom {
 			// unvalidated (check the log, never assume the leg validated).
 			if (project.hasProperty('meshelium.vkvalidation')) {
 				programArgs '--vulkanValidation'
+				// Plain validation catches API misuse. SYNCHRONIZATION
+				// validation is a separate opt-in and it is the one that
+				// matters for GPU-written indirect commands and for the
+				// fence/parked-backing legs: it is what detects a missing
+				// barrier between a shader write and a later read, which
+				// is otherwise invisible until it corrupts a frame on
+				// somebody else's driver.
+				environmentVariable 'VK_LAYER_ENABLES',
+						'VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT'
+			}
+			// Keep third-party OVERLAY layers out of the process. They are
+			// registered as IMPLICIT layers in the registry, which means the
+			// loader injects them into EVERY Vulkan application whether or
+			// not their host program is running: Steam's overlay and its
+			// Fossilize pipeline-capture layer, the OBS capture hook, Epic
+			// Online Services, and whatever else a launcher installed. They
+			// are not free, Fossilize in particular intercepts pipeline
+			// creation, and they make a benchmark depend on the state of the
+			// desktop rather than on the renderer. Defaults ON for bench and
+			// test runs so measurements are insulated by construction;
+			// `-Pmeshelium.allowImplicitLayers=true` restores the player's
+			// real environment for a compatibility check.
+			// VK_LOADER_LAYERS_DISABLE is loader 1.3.234+; older loaders
+			// ignore it, so this can only ever be a no-op, never a break.
+			if (!project.hasProperty('meshelium.allowImplicitLayers')) {
+				environmentVariable 'VK_LOADER_LAYERS_DISABLE', '~implicit~'
 			}
 			// Generic diagnostic passthrough: `-Pmeshelium.vmargs="-Dk=v -Dk2=v2"`
 			// forwards arbitrary -D flags to the client JVM (coordinator

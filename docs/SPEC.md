@@ -1,6 +1,11 @@
 # SPEC — Meshelium
 
-> **Status: SHIPPED as 1.0.0 (2026-08-11).** This file is the wave by
+> **Status: SHIPPED as 1.0.0 (2026-08-11), 1.1.0 (2026-08-12).** The 1.1
+> work is not in the wave list below: it was occlusion culling being made
+> to pay for itself, plus the settings screen that exposes it. See
+> CHANGELOG.md for what changed and docs/OCCLUSION-FILLRATE-DESIGN.md for
+> why, including the two things that were built, measured and thrown away.
+> This file is the wave by
 > wave build log, kept because the reasoning behind each decision is
 > often more useful than the decision. Read it as history, not as a plan:
 > the status lines inside individual rows describe the moment that wave
