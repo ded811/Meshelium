@@ -520,7 +520,8 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
         checkEq(1, arena.liveQuads(), "reserved quad 0 counted");
         int a = arena.allocQuads(10);
         checkEq(1, a, "first real alloc lands after the reserved quad");
-        checkEq(64, arena.byteOffset(a), "byte offset = addr * 64");
+        checkEq(0, arena.blockOf(a), "single-block arena: everything is block 0");
+        checkEq(64, arena.byteOffsetInBlock(a), "byte offset within block = local * 64");
         checkEq(640, arena.byteSize(a), "byte size = quads * 64");
         check(arena.canReuse(a, 10), "canReuse exact size");
         check(!arena.canReuse(a, 9), "canReuse rejects size mismatch");

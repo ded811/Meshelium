@@ -165,6 +165,21 @@ public final class MesheliumExtendedRd {
     private static final SystemToast.SystemToastId TOAST_ID = new SystemToast.SystemToastId();
     private static final SystemToast.SystemToastId REJOIN_TOAST_ID = new SystemToast.SystemToastId();
 
+    /**
+     * Vanilla's own render-distance ceiling, read from the 26.2 jar rather
+     * than remembered: {@code Options.<init>} builds
+     * {@code new IntRange(2, mem >= 1_000_000_000L ? 32 : 16, false)} with
+     * a default of 12 (javap, {@code Options} bytecode offset 4931-4948).
+     *
+     * <p>Used only as a CAP on the captured maximum, never as the value
+     * itself, because 32 is not always right: a JVM under a gigabyte gets
+     * 16, and clamping such a player to 32 would hand
+     * {@code OptionInstance.set} a value its own ValueSet rejects, whereupon
+     * validateValue falls back to the initial 12 and the player silently
+     * loses their setting.</p>
+     */
+    private static final int VANILLA_RD_HARD_MAX = 32;
+
     // Captured once at Options construction (render-thread-confined after).
     private static OptionInstance.ValueSet<?> vanillaValues;
     private static Codec<?> vanillaCodec;
@@ -184,6 +199,80 @@ public final class MesheliumExtendedRd {
     public static final String PROPERTY_BENCH_NO_CLAMP = "meshelium.bench.noClampBack";
     /** Re-armed whenever the option drops to a legal vanilla value. */
     private static boolean clampNoticeArmed = true;
+
+    /**
+     * Arena fraction that triggers a render-distance step DOWN. Above the
+     * 85% mark that starts retained eviction, so the cheap remedy gets
+     * first refusal and this only fires when that was not enough.
+     */
+    private static final long ARENA_BACKOFF_PCT = 92;
+
+    /*
+     * THERE IS DELIBERATELY NO AUTOMATIC RESTORE. The backoff only ever
+     * lowers the render distance; giving a step back is the player's call,
+     * from the ordinary Video Settings slider.
+     *
+     * This was tried and removed (owner's call, 2026-08-12, and the
+     * measurements agree). A restore is worth something only if the bigger
+     * distance would now fit, and the evidence says it usually would not:
+     * the 352 MiB harness run ping-ponged 48 to 40 and back every three
+     * seconds for a minute and a half. Both halves of that cycle were the
+     * design's own fault. Changing the render distance makes vanilla reset
+     * the level, so a second after a step the arena is nearly EMPTY (12%
+     * was recorded) — the low reading authorising the restore was
+     * manufactured by the step before it. And restoring walked back into
+     * the distance that had just failed to fit, so the re-trip was
+     * arithmetic, not bad luck.
+     *
+     * A predictive guard was then built that projected usage to the target
+     * distance by area and refused restores that would not fit. It worked,
+     * and in the run that proved it, it refused EVERY restore. That is the
+     * argument for deleting the whole path rather than tuning it: each step
+     * costs a full level rebuild, so a restore that re-trips buys one hitch
+     * going up and another coming down, in exchange for nothing. Lowering
+     * is cheap to get wrong in the player's favour and expensive to get
+     * wrong against them; raising is the reverse.
+     */
+
+    /**
+     * Arena fraction at which the normal cooldown is abandoned. Measured,
+     * not guessed: in the 192 MiB harness run of 2026-08-12 the arena went
+     * from 78 MiB to 176 MiB in three seconds while a world was streaming
+     * in, so one step per three seconds was never going to keep up, and the
+     * guard tripped with the backoff still waiting out its cooldown. Above
+     * this line the arena is filling faster than the polite rate can shed,
+     * and the fence lag the cooldown exists to respect is the lesser
+     * problem: a step taken against slightly stale numbers costs the player
+     * eight chunks, a step not taken costs them the renderer.
+     */
+    private static final long ARENA_CRITICAL_PCT = 97;
+
+    /** Chunks per step, matching the option's own 8-lattice. */
+    private static final int BACKOFF_STEP = 8;
+
+    /**
+     * Ticks between steps. Freed arena space only comes back after the
+     * fence lag, so an immediate re-read still looks full; without this the
+     * first spike would walk the distance to the floor in about a second.
+     */
+    private static final int BACKOFF_COOLDOWN_TICKS = 60;
+
+    /**
+     * Ticks between steps once past {@link #ARENA_CRITICAL_PCT}. Half a
+     * second: still long enough that a step is not taken twice against the
+     * same stale reading, short enough to shed 16 chunks a second, which
+     * outruns any fill rate this renderer has been measured at.
+     */
+    private static final int BACKOFF_CRITICAL_COOLDOWN_TICKS = 10;
+
+    /**
+     * Ticks since the last step, counting UP. Up rather than down because
+     * how long the wait needs to be is not known when the step is taken: it
+     * depends on the pressure read on each later tick.
+     */
+    private static int backoffElapsedTicks;
+    /** Steps taken this session, for the harness and the log. */
+    private static volatile long pressureSteps;
     // Probes (harness).
     private static volatile long sessionClamps;
     private static volatile boolean rangeWidenedNow;
@@ -197,6 +286,53 @@ public final class MesheliumExtendedRd {
      */
     private static Object hintedSnapshot;
     private static boolean ladderWidened;
+
+    /**
+     * Last seen value of the master switch, so the tick can spot the EDGE.
+     * Deliberately not read from the options screen handler: the harness and
+     * the benchmark flip the {@code meshelium.terrainDraw} property instead,
+     * and that never passes through any screen.
+     */
+    private static boolean masterSwitchWas = true;
+
+    /** Arena-pressure backoff has already written one chat line this world. */
+    private static boolean pressureChatted;
+
+    /** The arena-shape report has been written once for this world. */
+    private static boolean arenaShapeReported;
+
+    /**
+     * Render distance the player had before the MASTER SWITCH clamped it,
+     * or 0 when nothing is owed back.
+     *
+     * <p>Read the big comment above {@link #ARENA_BACKOFF_PCT} before
+     * touching this: automatic restore was built, measured, and deleted
+     * once already, and it must stay deleted for the case it was deleted
+     * for. That case is arena PRESSURE, where the distance came down
+     * because memory ran out, so putting it back walks straight into the
+     * distance that just failed to fit. The harness ping-ponged 48 to 40
+     * and back every three seconds for a minute and a half.</p>
+     *
+     * <p>This is the other case entirely, and none of that reasoning
+     * applies. The clamp here happens because Meshelium is switched OFF and
+     * vanilla cannot draw past 32; the cause is a boolean the player
+     * flipped, not a guess about memory, and when they flip it back the
+     * cause is provably gone. Nothing is being predicted, so nothing can
+     * ping-pong.</p>
+     *
+     * <p>Scoped hard: set ONLY by a clamp whose cause is the master switch,
+     * never by the pressure backoff, never by the gate (a backend needs a
+     * restart anyway), and never by the coverage guard or an error latch
+     * (both last the world, so there is no moment they stop being true).</p>
+     */
+    private static int switchClampedFrom;
+
+    /**
+     * What the clamp actually wrote, so a restore can tell "the player has
+     * not touched it" from "the player chose 32 themselves". Restoring over
+     * a deliberate choice would be worse than not restoring at all.
+     */
+    private static int switchClampedTo;
 
     private MesheliumExtendedRd() {
     }
@@ -268,7 +404,30 @@ public final class MesheliumExtendedRd {
         }
         vanillaValues = range;
         vanillaCodec = ((OptionInstanceAccessor) (Object) rd).meshelium$codec();
-        vanillaMax = range.maxInclusive();
+        // CAP THE CAPTURE. This read range.maxInclusive() directly, which is
+        // only vanilla's number if nothing widened the range before us, and
+        // mod load order does not guarantee that. Bobby raises this same
+        // ceiling, and if it got here first every use of vanillaMax
+        // inherited ITS number: clamp-back would "restore" a struggling
+        // player to 128 instead of 32, the pressure backoff's floor would
+        // sit at 128 so the safety valve could never step down to anything
+        // useful, and extendedWanted (configured > vanillaMax) would read
+        // false for any ceiling under Bobby's, silently disabling Meshelium's
+        // own extended distance.
+        //
+        // Only the NUMBER is capped. vanillaValues keeps the ValueSet object
+        // exactly as found, so applyRange still restores whatever range that
+        // mod installed and its feature keeps working; we simply stop
+        // treating its ceiling as though vanilla had set it.
+        int capturedMax = range.maxInclusive();
+        vanillaMax = Math.min(capturedMax, VANILLA_RD_HARD_MAX);
+        if (capturedMax > VANILLA_RD_HARD_MAX) {
+            MesheliumClient.LOGGER.info(
+                    "Meshelium: the render-distance range was already widened to {} before this "
+                            + "mod looked at it (another mod, Bobby or similar). Treating {} as the "
+                            + "vanilla ceiling for clamp-back and backoff purposes; the other mod's "
+                            + "range is left intact", capturedMax, vanillaMax);
+        }
         vanillaMin = range.minInclusive();
         appliedMax = vanillaMax;
         captured = true;
@@ -367,6 +526,12 @@ public final class MesheliumExtendedRd {
      */
     public static void onWorldPinned() {
         hintedSnapshot = null;
+        pressureChatted = false;
+        arenaShapeReported = false;
+        // Re-sync the edge detector rather than assume: a world can be
+        // entered with the switch already off, and a stale `true` here would
+        // fire a spurious swap on the first tick.
+        masterSwitchWas = MesheliumConfig.terrainRenderingConfigured();
     }
 
     // ------------------------------------------------------------------
@@ -374,6 +539,7 @@ public final class MesheliumExtendedRd {
     // ------------------------------------------------------------------
 
     private static void onEndTick(Minecraft minecraft) {
+        driveVanillaUploadSeamRecovery(minecraft);
         if (!captured || minecraft.options == null) {
             return;
         }
@@ -385,6 +551,37 @@ public final class MesheliumExtendedRd {
         boolean bootGrace = state == MesheliumGate.State.UNKNOWN && minecraft.level == null;
 
         applyRange(options, extendedWanted && (gateOk || bootGrace) ? configured : vanillaMax);
+
+        // Give back what the master switch took. Strictly AFTER applyRange,
+        // because the option's range is only widened past 32 there and a set
+        // before it would be clamped straight back down by the ValueSet.
+        if (switchClampedFrom > 0 && extendedWanted && gateOk) {
+            int current = options.renderDistance().get();
+            if (current != switchClampedTo) {
+                // The player moved the slider themselves while Meshelium was
+                // off. That is a choice, and overwriting it would be worse
+                // than never restoring; forget the debt.
+                switchClampedFrom = 0;
+            } else {
+                int restore = Math.min(switchClampedFrom, configured);
+                switchClampedFrom = 0;
+                if (restore > current) {
+                    options.renderDistance().set(restore);
+                    options.save();
+                    MesheliumClient.LOGGER.info(
+                            "Meshelium put the render distance back to {} now that it is drawing "
+                                    + "again (it was clamped to {} while switched off, because "
+                                    + "vanilla cannot draw past {})",
+                            restore, current, vanillaMax);
+                    MesheliumNotify.error(TOAST_ID,
+                            Component.translatable("meshelium.rd.restored.title", restore),
+                            Component.translatable("meshelium.rd.restored.body"));
+                    // Re-read, because everything below reasons about the
+                    // distance we are actually on now.
+                    return;
+                }
+            }
+        }
 
         int rd = options.renderDistance().get();
         if (rd <= vanillaMax) {
@@ -413,6 +610,7 @@ public final class MesheliumExtendedRd {
             // (grow-and-copy, the wave-14 machinery generalized); the
             // once-per-world rejoin hint fires only when a grow FAILED.
             maybeGrowOrHint(minecraft, rd);
+            maybeBackOffForArenaPressure(minecraft, options, rd);
             return;
         }
         clampBack(minecraft, options, state, extendedWanted);
@@ -459,11 +657,9 @@ public final class MesheliumExtendedRd {
                         + "at pinned capacity; rejoin the world to apply the full distance "
                         + "(wave-15: the hint is the grow path's fallback)",
                 rd, pinned.maxRd());
-        if (minecraft.gui != null) {
-            SystemToast.add(minecraft.gui.toastManager(), REJOIN_TOAST_ID,
-                    Component.translatable("meshelium.rd.rejoin.title"),
-                    Component.translatable("meshelium.rd.rejoin.body", rd, pinned.maxRd()));
-        }
+        MesheliumNotify.error(REJOIN_TOAST_ID,
+                Component.translatable("meshelium.rd.rejoin.title"),
+                Component.translatable("meshelium.rd.rejoin.body", rd, pinned.maxRd()));
     }
 
     /**
@@ -480,18 +676,318 @@ public final class MesheliumExtendedRd {
         return minecraft.level == null || !com.deds.meshelium.vk.TerrainDrawer.coveragePassive();
     }
 
+    // ------------------------------------------------------------------
+    // Arena pressure backoff (1.2)
+    // ------------------------------------------------------------------
+
+    /**
+     * Back the render distance off before the arena runs out, instead of
+     * dropping terrain once it has.
+     *
+     * <p>WHY THIS EXISTS. The arena ceiling is now clamped to what a shader
+     * can address, about 4 GiB, and at render distance 120 a real world can
+     * reach it. Before this, reaching it meant dropped sections and the
+     * coverage guard flipping the whole renderer to passive: a cliff. The
+     * owner's framing was the right one, that hitting the limit should feel
+     * like the render distance being limited, because a player who turns
+     * around and sees chunks failing to load will blame the mod, and they
+     * will be right to.</p>
+     *
+     * <p>WHY IT LOWERS THE OPTION rather than evicting distant sections
+     * directly, which sounds equivalent and is not. Freeing a section
+     * vanilla still believes it handed us means nothing ever asks for it
+     * back, which is precisely the permanent-hole failure this release
+     * fixed. Lowering the option makes VANILLA release the far chunks
+     * through {@code reset()}, the path wave 11 already handles, and
+     * vanilla then knows to rebuild them when the player returns.</p>
+     *
+     * <p>IT ONLY EVER GOES DOWN. See the note on the constants above for
+     * why the automatic restore was built, measured, and then deleted. The
+     * value is written through the ordinary render-distance option and
+     * saved, so the Video Settings slider shows the new number and the
+     * player can drag it straight back up whenever they want to.</p>
+     *
+     * <p>The cooldown is not decoration: freed arena space only returns
+     * after the fence lag, so an immediate re-read still looks full and a
+     * naive loop would walk the distance to the floor in a second. Past
+     * {@link #ARENA_CRITICAL_PCT} that wait is cut short, because a world
+     * streaming in was measured crossing the whole remaining gap inside one
+     * polite cooldown.</p>
+     */
+    private static void maybeBackOffForArenaPressure(Minecraft minecraft, Options options,
+            int rd) {
+        var counters = com.deds.meshelium.terrain.host.TerrainResidency.counters();
+        // The EFFECTIVE ceiling, not the static one: how far the arena could
+        // actually grow on this machine right now. When the card has memory
+        // to spare these are the same number and nothing changes. When it is
+        // genuinely short the effective ceiling collapses toward what is
+        // already committed, so this existing trip fires BEFORE terrain
+        // starts dropping - which matters because a dropped section trips
+        // the coverage guard, and that means passive for the whole world
+        // plus a clamp to 32. Stepping down by 8 is far kinder than the
+        // cliff it prevents, and the slider gives it straight back.
+        long ceiling = MesheliumScaling.effectiveCeilingBytes(counters.arenaCapacityBytes());
+        if (ceiling <= 0) {
+            return;
+        }
+        long used = counters.arenaUsedBytes();
+        long pct = used * 100L / ceiling;
+
+        // How long to wait is decided HERE, from the pressure on this tick,
+        // not at the moment the last step was taken. A world streaming in
+        // can cross the whole remaining gap inside one polite cooldown.
+        backoffElapsedTicks++;
+        int required = pct >= ARENA_CRITICAL_PCT
+                ? BACKOFF_CRITICAL_COOLDOWN_TICKS
+                : BACKOFF_COOLDOWN_TICKS;
+        if (backoffElapsedTicks < required) {
+            return;
+        }
+        if (pct < ARENA_BACKOFF_PCT || rd <= vanillaMax) {
+            return;
+        }
+
+        int target = Math.max(vanillaMax, rd - BACKOFF_STEP);
+        backoffElapsedTicks = 0;
+        pressureSteps++;
+        options.renderDistance().set(target);
+        options.save(); // save() is what re-broadcasts ClientInformation
+        showRenderDistanceChange(minecraft, target);
+        MesheliumClient.LOGGER.info(
+                "Meshelium lowered the render distance {} -> {}: terrain memory is at {}% of the "
+                        + "{} MiB ceiling. The far chunks are released through vanilla's own path. "
+                        + "This does not go back up on its own - raise it in Video Settings when "
+                        + "you want it back",
+                rd, target, pct, ceiling >> 20);
+        reportArenaShapeOnce(counters, ceiling);
+    }
+
+    /**
+     * Say what the arena actually looks like at the one moment it matters.
+     *
+     * <p>Pressure is the only time the shape of the arena decides anything,
+     * and it is the moment we have never measured. The mod has always
+     * printed live-versus-committed, which cannot answer the question that
+     * follows from here, namely whether the memory could be won back and
+     * how. So this splits it three ways:</p>
+     *
+     * <ul>
+     *   <li><b>holes</b>: free space BELOW the high-water mark, scattered
+     *   between live sections. The only thing compaction could ever recover,
+     *   and it would cost a stutter of device-to-device copies to do it.</li>
+     *   <li><b>tail</b>: free space above the high-water mark. Already free,
+     *   recoverable with no copying whatsoever.</li>
+     *   <li><b>empty top blocks</b>: whole blocks that could go straight
+     *   back to the driver today if a release path existed. Zero copy.</li>
+     * </ul>
+     *
+     * <p>Nothing acts on this yet, deliberately. A block release path is
+     * worth building only if this number turns out to be non-trivial in a
+     * real session, and a compactor only if the holes are. Measuring first
+     * is cheaper than being wrong about which one to write.</p>
+     *
+     * <p>The ceiling quoted here is the EFFECTIVE ceiling this call site
+     * already computed, not the static one the residency stats line prints.
+     * They differ, and not saying which would make the two logs look like
+     * they disagree.</p>
+     */
+    private static void reportArenaShapeOnce(
+            com.deds.meshelium.terrain.host.TerrainResidency.Counters counters, long ceiling) {
+        if (arenaShapeReported) {
+            return;
+        }
+        arenaShapeReported = true;
+        long holes = Math.max(0, counters.arenaExtentBytes() - counters.arenaUsedBytes());
+        long tail = Math.max(0, counters.arenaCapacityBytes() - counters.arenaExtentBytes());
+        MesheliumClient.LOGGER.info(
+                "Meshelium arena shape at pressure: live {} MiB, holes {} MiB, unused tail {} MiB, "
+                        + "committed {} MiB of a {} MiB effective ceiling, across {} block(s) of "
+                        + "which {} at the top are completely empty. Holes are what compaction "
+                        + "could recover and it would cost copies; the empty top blocks could go "
+                        + "back to the driver for free. Neither is acted on yet: this line exists "
+                        + "to decide which is worth building",
+                counters.arenaUsedBytes() >> 20, holes >> 20, tail >> 20,
+                counters.arenaCapacityBytes() >> 20, ceiling >> 20,
+                counters.arenaBlocks(), counters.emptyTopBlocks());
+    }
+
+    /**
+     * Put vanilla's terrain back after the upload seam stopped suppressing.
+     *
+     * <p>On the CLIENT TICK deliberately, never from the pump. The rebuild
+     * call constructs a fresh section grid - at render distance 120 that is
+     * 241 x 241 x 24, about 1.4 million slots - and the pump runs inside
+     * LevelRenderer.render's lock window, where every build worker is
+     * waiting on the same lock to stage its uploads. Doing it there would
+     * stall all of them for the duration.</p>
+     *
+     * <p>The request is only cleared once the call RETURNS, so a throw
+     * retries next tick rather than losing the recovery for the world.</p>
+     */
+    private static void driveVanillaUploadSeamRecovery(Minecraft minecraft) {
+        if (minecraft.level == null || minecraft.levelRenderer == null) {
+            // DELIBERATELY NOT freeing the arena here, though it looks like
+            // the obvious place and the owner asked whether it should be.
+            //
+            // The observation behind the question is real: leaving a world
+            // does not return the terrain memory, because vanilla's dispose
+            // only fires from LevelExtractor.extract(), which does not run
+            // without a level, so the teardown waits for the NEXT world.
+            //
+            // Freeing early was tried and a retention test rejected it:
+            // "vanilla keeps its meshes at the title screen but Meshelium's
+            // store went to zero". Vanilla holds its terrain at the menu on
+            // purpose, so rejoining the world you just left is instant, and
+            // Meshelium's residency MIRRORS vanilla's. Break the mirror and
+            // vanilla still believes its meshes are uploaded while ours are
+            // gone: rejoin, vanilla sees no reason to rebuild, and the
+            // terrain is missing. Trading a fast rejoin for memory nobody is
+            // using at the menu is a bad trade twice over.
+            return;
+        }
+        // THE OFF EDGE NOBODY WAS WATCHING.
+        //
+        // The ownership rule and its demote() lived in TerrainDrawer.enabled(),
+        // which had ZERO callers in the whole repository - the draw hook reads
+        // MesheliumConfig.terrainRenderingEnabled() directly and never touches
+        // the drawer. So switching Meshelium off with the seam armed stopped
+        // Meshelium drawing that same frame, never demoted, and left vanilla's
+        // uploads cancelled forever. Nobody drew. Permanently. That is exactly
+        // the see-through world the owner reported, and no amount of fixing
+        // the handover helped, because the handover was never started.
+        //
+        // Here instead, because this tick runs unconditionally. It also covers
+        // the harness flipping the meshelium.terrainDraw PROPERTY, which the
+        // options screen handler never sees.
+        boolean nowEnabled = MesheliumConfig.terrainRenderingConfigured();
+        if (nowEnabled != masterSwitchWas) {
+            masterSwitchWas = nowEnabled;
+            if (nowEnabled) {
+                // Coming back. Re-arm the seam if the player wants vanilla's
+                // duplicate freed; either way the invalidation below is what
+                // makes Meshelium's own copy exist again.
+                com.deds.meshelium.terrain.host.VanillaUploadSeam.onTerrainRenderingEnabled();
+                com.deds.meshelium.terrain.host.VanillaUploadSeam
+                        .requestVanillaRebuild("Meshelium terrain rendering switched on");
+            } else {
+                com.deds.meshelium.terrain.host.VanillaUploadSeam
+                        .demote("terrain rendering turned off");
+                com.deds.meshelium.terrain.host.VanillaUploadSeam
+                        .requestVanillaRebuild("Meshelium terrain rendering switched off");
+            }
+        }
+        if (com.deds.meshelium.terrain.host.VanillaUploadSeam.consumeRebuildRequest()) {
+            try {
+                // allChanged lives on LevelExtractor in 26.2, NOT on
+                // LevelRenderer where the plan placed it. Verified by javap;
+                // Minecraft.levelExtractor is a public final field.
+                minecraft.levelExtractor.allChanged();
+                if (com.deds.meshelium.terrain.host.VanillaUploadSeam.armed()) {
+                    // Armed: the same call, used the other way round. Every
+                    // section is dropped, which empties vanilla's heaps, and
+                    // the seam stops them refilling.
+                    MesheliumClient.LOGGER.info(
+                            "Meshelium dropped vanilla's terrain sections to empty its heaps; "
+                                    + "vanilla terrain memory was {} MiB and should fall to near "
+                                    + "zero over the next few seconds",
+                            com.deds.meshelium.VanillaTerrainCensus.committedBytes() >> 20);
+                } else {
+                    MesheliumClient.LOGGER.info(
+                            "Meshelium asked vanilla to rebuild its terrain after the upload seam "
+                                    + "stood down; Meshelium keeps drawing until it looks complete");
+                }
+            } catch (Throwable t) {
+                com.deds.meshelium.terrain.host.VanillaUploadSeam.reinstateRebuildRequest();
+                MesheliumClient.LOGGER.error(
+                        "Meshelium could not ask vanilla to rebuild; retrying next tick", t);
+                return;
+            }
+        }
+        com.deds.meshelium.terrain.host.VanillaUploadSeam.noteRebuildProgress(
+                minecraft.levelRenderer.hasRenderedAllSections());
+    }
+
+    /**
+     * Make the change VISIBLE. {@code set()} already updates what the
+     * render-distance slider reads, so simply opening Video Settings shows
+     * the new number ({@code OptionInstance.createButton} reads
+     * {@code get()} at widget creation). The gap is a screen that is
+     * ALREADY OPEN: its slider widget was built from the old value and
+     * nothing rebuilds it, so a player sitting in Video Settings while the
+     * world streams in would watch their distance change with the slider
+     * still claiming the old number.
+     *
+     * <p>{@code Screen.resize} is the sanctioned rebuild ({@code resize} to
+     * {@code repositionElements} to {@code rebuildWidgets}, all three
+     * verified in the 26.2 jar), and it is restricted to
+     * {@code OptionsSubScreen} on purpose: that covers vanilla's Video
+     * Settings, which owns the slider, while leaving Meshelium's own screen
+     * alone, because rebuilding that one would discard whatever the player
+     * is part-way through typing into a value box.</p>
+     */
+    private static void showRenderDistanceChange(Minecraft minecraft, int target) {
+        if (minecraft.gui == null) {
+            return;
+        }
+        // Toast every time, chat only the FIRST step of a world. Toasts
+        // coalesce on their id, so a stepped backoff shows as one toast that
+        // keeps updating; chat does not coalesce, and eight identical lines
+        // scrolling past would read as eight separate faults.
+        if (pressureChatted) {
+            SystemToast.add(minecraft.gui.toastManager(), TOAST_ID,
+                    Component.translatable("meshelium.rd.pressure.title", target),
+                    Component.translatable("meshelium.rd.pressure.body"));
+        } else {
+            pressureChatted = true;
+            MesheliumNotify.error(TOAST_ID,
+                    Component.translatable("meshelium.rd.pressure.title", target),
+                    Component.translatable("meshelium.rd.pressure.body"));
+        }
+        // 26.2 moved the current screen onto Gui: Minecraft has no `screen`
+        // field any more and no getter returning one, while Gui has both
+        // `screen()` and `setScreen` (javap on the merged 26.2 jar).
+        net.minecraft.client.gui.screens.Screen screen = minecraft.gui.screen();
+        if (screen instanceof net.minecraft.client.gui.screens.options.OptionsSubScreen
+                && minecraft.getWindow() != null) {
+            screen.resize(minecraft.getWindow().getGuiScaledWidth(),
+                    minecraft.getWindow().getGuiScaledHeight());
+        }
+    }
+
+    /** Steps the arena-pressure backoff has taken this session (harness). */
+    public static long pressureSteps() {
+        return pressureSteps;
+    }
+
     private static void clampBack(Minecraft minecraft, Options options,
             MesheliumGate.State state, boolean extendedWanted) {
         int target = vanillaMax;
-        options.renderDistance().set(target);
-        options.save();
-        sessionClamps++;
+        int before = options.renderDistance().get();
 
         boolean guardPassive = false;
         if (state == MesheliumGate.State.VULKAN_MESH_SHADERS) {
             guardPassive = extendedWanted && minecraft.level != null
                     && com.deds.meshelium.vk.TerrainDrawer.coveragePassive();
         }
+        // Remember the distance ONLY when the master switch is the reason.
+        // The gate needs a restart, and the coverage guard and the error
+        // latch both last the rest of the world, so for those there is no
+        // later moment at which the cause stops being true and a restore
+        // would be honest. This runs every tick while disabled, so the
+        // `before > target` test is what stops the second pass overwriting
+        // the memory with the clamped value.
+        boolean switchIsTheReason = state == MesheliumGate.State.VULKAN_MESH_SHADERS
+                && !guardPassive
+                && !MesheliumConfig.terrainRenderingConfigured();
+        if (switchIsTheReason && before > target) {
+            switchClampedFrom = before;
+            switchClampedTo = target;
+        }
+
+        options.renderDistance().set(target);
+        options.save();
+        sessionClamps++;
+
         if (clampNoticeArmed) {
             clampNoticeArmed = false;
             String bodyKey = guardPassive ? "meshelium.rd.clamped.passive" : "meshelium.rd.clamped.off";
@@ -501,11 +997,9 @@ public final class MesheliumExtendedRd {
                             + "effect while Meshelium draws (wave-10 clamp-back invariant)",
                     target, state, MesheliumConfig.terrainRenderingEnabled(),
                     MesheliumConfig.maxRenderDistanceConfigured(), guardPassive);
-            if (minecraft.gui != null) {
-                SystemToast.add(minecraft.gui.toastManager(), TOAST_ID,
-                        Component.translatable("meshelium.rd.clamped.title", target),
-                        Component.translatable(bodyKey));
-            }
+            MesheliumNotify.error(TOAST_ID,
+                    Component.translatable("meshelium.rd.clamped.title", target),
+                    Component.translatable(bodyKey));
         }
     }
 

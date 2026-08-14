@@ -7,7 +7,8 @@
 <p align="center"><b>See way further in Minecraft, and get more frames doing it.</b></p>
 
 <p align="center">
-  <a href="https://modrinth.com/project/meshelium"><img src="https://img.shields.io/badge/Download-Modrinth-00AF5C?style=for-the-badge&logo=modrinth&logoColor=white" alt="Download Meshelium on Modrinth"></a>
+  <a href="https://modrinth.com/mod/meshelium"><img src="https://img.shields.io/badge/Download-Modrinth-00AF5C?style=for-the-badge&logo=modrinth&logoColor=white" alt="Download Meshelium on Modrinth"></a>
+  <a href="https://github.com/ded811/Meshelium"><img src="https://img.shields.io/badge/Source-GitHub-181717?style=for-the-badge&logo=github&logoColor=white" alt="Meshelium on GitHub"></a>
 </p>
 
 <p align="center">
@@ -67,23 +68,43 @@ A server only sends you the land close to you, so a huge render distance has not
 
 Nothing gets installed on the server. Bobby runs in your game, just like this mod, and the server never knows either one is there.
 
+## The settings
+
+Everything is in **Options > Video Settings > Meshelium Settings...**, and every one of them defaults to the right answer. You should not need to touch any of this.
+
+**Meshelium Rendering** turns the whole thing on and off. Turning it off puts Minecraft back in charge and pulls your render distance down to 32, because that is as far as Minecraft can draw on its own. Turning it back on gives your distance back.
+
+**Distance Cap** is how far the slider in Video Settings is allowed to go. Raising it does not change what you see until you also move the actual render distance slider.
+
+**Occlusion Culling** skips terrain hidden behind other terrain. Auto switches it on past the distance where it usually starts paying off. See the note below if your graphics are modest.
+
+**Distance Fog** is new in 1.2.0 and defaults to **Off**, which is a change worth explaining. Minecraft fades distant terrain to fog at a fixed 1024 blocks, and that number does not care how far you can see. In vanilla it is invisible, because vanilla stops at 32 chunks and the fog sits far past the horizon. At 120 chunks it eats the outer 56: the game loads them, builds them, draws them, and then paints them flat grey. Off drops that haze and keeps only the short fade right at the edge, which is the part that hides chunks appearing, so the horizon still softens rather than ending in a wall. Match View Distance keeps a haze but moves it out with your view, and never makes fog thicker than Minecraft would, so below 64 chunks it changes nothing.
+
+Behind **Advanced** are three things you will probably never want. **Duplicate Terrain Memory** should stay on Freed; it stops Minecraft holding a second copy of the world that nothing draws, worth gigabytes past 64 chunks. Set it to Kept only if another mod needs Minecraft's own terrain buffers. **Debug Stat Logging** writes numbers to the log and changes nothing you can see. **Backend Popup** re-arms the first-run Vulkan prompt.
+
 ## Performance may vary
 
 These numbers come from one computer with an AMD Radeon RX 9070 XT at 1920x1080, so yours will land somewhere else. At short render distances the difference is small, and the mod earns its place when you push the slider out.
+
+**On weaker graphics, turn Occlusion Culling on sooner.** Auto leaves it off below render distance 48, which is where it starts paying on the desktop card above. On a laptop with integrated graphics (Radeon 780M) it pays much earlier and much harder: at render distance 32 it took 130 FPS to 300-400 standing on the ground, and 120 to about 165 flying. Auto would have left that switched off. If your graphics are on the modest side, set "Auto turns on at" to 32 and see what happens.
+
+We do not yet know whether that is about integrated graphics specifically or about weaker graphics in general, so Auto still uses one number for everybody rather than guessing at your hardware. Testing on more cards will settle it.
 
 ## Thanks
 
 ### Nvidium, by MCRcortex
 
-Meshelium exists because of [Nvidium](https://github.com/MCRcortex/nvidium). MCRcortex worked out how to hand Minecraft's terrain to the graphics card and draw it all at once, and proved you really could see for miles without the game falling over. That was the hard part, and it was their idea.
+[Nvidium](https://github.com/MCRcortex/nvidium) is why this mod was worth attempting. MCRcortex pioneered mesh-shader terrain in Minecraft and proved you really could see for miles without the game falling over. Believing that was possible was the hard part.
 
-Nvidium only runs on NVIDIA cards, so Meshelium rebuilds the same idea in a way that works on AMD and Intel too. The design we learned it from is theirs, and a lot of this mod is us following a path they cut first. Go and give their project a star.
+Meshelium is its own mod, not a port of theirs. It targets `VK_EXT_mesh_shader` rather than the NVIDIA dialect, runs on Minecraft's Vulkan backend, and the architecture, the memory model, the culling and everything above the shaders are ours. Some shader logic is derived from Nvidium and says so in the header of each file it applies to, which is why Meshelium carries the same LGPL-3.0 licence.
+
+MCRcortex has no involvement in Meshelium, has not endorsed it, and is not responsible for anything it does. Any bug you find here is ours. Go and star their project anyway.
 
 ### And
 
 - **Bobby** by **Johni0702**, the perfect partner for playing online
 - The **Fabric** team, for the loader and Fabric API
 - Meshelium is by **Ded811**. Copyright (C) 2026
-- License: **LGPL-3.0**, the same license Nvidium uses
+- License: **LGPL-3.0-only**, the same license Nvidium uses
 
 Want the deep version? It is in [TECHNICAL.md](docs/TECHNICAL.md) and [PERFORMANCE.md](docs/PERFORMANCE.md).

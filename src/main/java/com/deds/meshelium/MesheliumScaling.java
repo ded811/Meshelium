@@ -120,6 +120,163 @@ public final class MesheliumScaling {
     // Wave-14: the arena ceiling comes from the DEVICE, not a formula
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // Arena block geometry (multi-buffer)
+    // ------------------------------------------------------------------
+
+    /**
+     * Preferred size of ONE arena block, before the device clamps it down.
+     *
+     * <p>512 MiB, a power of two so the shader decodes a quad address into
+     * (block, local) with a shift and a mask.
+     *
+     * <p>It was 2 GiB, the largest a single binding could hold, and the
+     * owner's rd-120 session showed why bigger is worse. Growth past the
+     * first block is all-or-nothing: with 2 GiB blocks the arena stalled
+     * dead at 4096 MiB because only 1824 MiB were free and a whole block
+     * would not fit, while the same headroom holds THREE 512 MiB blocks.
+     * Smaller blocks also bound the grow-and-copy: only block 0 is ever
+     * copied, so the worst copy drops from ~2 GiB to 512 MiB, and past that
+     * growth is free.
+     *
+     * <p>The cost is more blocks, so more switch arms in the shader and
+     * more descriptors per push. Measured, not assumed: the GPU opaque pass
+     * is 0.687 ms with one arm and 0.689 ms with four, and 16 arms is a
+     * jump table on the same workgroup-uniform value.</p>
+     */
+    public static final long ARENA_BLOCK_PREFERRED_BYTES = 512L << 20;
+
+    /**
+     * Hard cap on block count.
+     *
+     * <p>16 blocks of 2^25 quads is 2^29 absolute quads, so a quad address
+     * shifted left by 2 stays inside 2^31 and can never collide with
+     * {@code TerrainArena.ALLOC_FAILED} (0xFFFFFFFF). Chosen for
+     * small-block devices rather than for this desk: where blocks clamp to
+     * 512 MiB it takes more of them to reach the same ceiling. The
+     * descriptor limits below clamp N far under this on any device that
+     * cannot afford it.</p>
+     */
+    public static final int ARENA_MAX_BLOCKS = 16;
+
+    /**
+     * Size of one arena block on this device, or the preferred size when
+     * nothing has been probed.
+     *
+     * <p>Clamped by THREE separate device limits, not one, because each
+     * bounds a different thing and any of them can be the smallest:
+     * {@code maxStorageBufferRange} is how much of a buffer a shader may
+     * READ, {@code maxMemoryAllocationSize} is how large one allocation may
+     * BE, and they are unrelated numbers. The last of those has no VUID
+     * anywhere, so exceeding it is invisible to the validation layer and
+     * comes back as an opaque VkResult - exactly the "fits but cannot be
+     * reached" class this whole change exists to remove, displaced one
+     * limit sideways.</p>
+     */
+    public static long arenaBlockBytes() {
+        // TEST/TUNE knob. Forcing a small block is the only way to exercise
+        // the multi-block paths on hardware whose real block is 2 GiB: a
+        // harness arena is 256 MiB, so without this the split never engages
+        // and every run would be validating block 0 alone.
+        long forcedMiB = Long.getLong("meshelium.tune.arenaBlockMiB", 0L);
+        if (forcedMiB > 0) {
+            long forced = forcedMiB << 20;
+            return Math.max(com.deds.meshelium.terrain.TerrainVertexCodec.QUAD_STRIDE,
+                    Long.highestOneBit(forced));
+        }
+        MesheliumVulkanState.ArenaLimits limits = MesheliumVulkanState.arenaLimits();
+        long cap = ARENA_BLOCK_PREFERRED_BYTES;
+        if (limits.maxStorageBufferRange() > 0) {
+            cap = Math.min(cap, limits.maxStorageBufferRange());
+        }
+        if (limits.maxMemoryAllocationSize() > 0) {
+            cap = Math.min(cap, limits.maxMemoryAllocationSize());
+        }
+        // Power of two, so the shader's decode stays a shift and a mask.
+        long block = Long.highestOneBit(cap);
+        return Math.max(com.deds.meshelium.terrain.TerrainVertexCodec.QUAD_STRIDE, block);
+    }
+
+    /**
+     * How many blocks this device can afford, from the descriptor limits.
+     *
+     * <p>Resolved from the FULL default-policy ceiling rather than the live
+     * one: pipelines are built once and cached for the device's lifetime,
+     * so the element count baked into the descriptor layout cannot depend
+     * on a value an operator can flip at runtime.</p>
+     *
+     * <p>The three subtractions are the bindings the terrain pipelines
+     * already declare alongside the arena. Clamped here, at probe time,
+     * rather than checked at pipeline build: a throw there is swallowed
+     * into "broken, go passive", which is safe but happens after the
+     * buffers are committed and gives the player a mystery instead of a
+     * smaller N.</p>
+     */
+    public static int arenaBlockCount() {
+        // TUNE knob: pin the declared block count. Exists to A/B the shader
+        // switch (N=1 compiles a single arm, i.e. the pre-split shape) and
+        // to force a small N on hardware that cannot be tested here.
+        long forced = Long.getLong("meshelium.tune.arenaBlocks", 0L);
+        if (forced > 0) {
+            return (int) Math.min(ARENA_MAX_BLOCKS, forced);
+        }
+        long block = arenaBlockBytes();
+        if (block <= 0) {
+            return 1;
+        }
+        // Default policy only: arenaCeilingBytes() now caps itself to
+        // blockBytes * blockCount, so reading it here would recurse.
+        long ceiling = defaultPolicyCeilingBytes();
+        int n = (int) Math.min(ARENA_MAX_BLOCKS, (ceiling + block - 1) / block);
+        MesheliumVulkanState.ArenaLimits limits = MesheliumVulkanState.arenaLimits();
+        // A zero is NOT REPORTED, never "no capacity": a driver that ignores
+        // a chained struct leaves it zeroed, and reading that as a limit
+        // would pin every device to one block for no reason.
+        long capped = n;
+        if (limits.maxPushDescriptors() > 0) {
+            capped = Math.min(capped, limits.maxPushDescriptors() - TASK_NON_ARENA_BINDINGS);
+        }
+        if (limits.maxPerStageDescriptorStorageBuffers() > 0) {
+            capped = Math.min(capped,
+                    limits.maxPerStageDescriptorStorageBuffers() - MESH_STAGE_OTHER_STORAGE);
+        }
+        if (limits.maxDescriptorSetStorageBuffers() > 0) {
+            capped = Math.min(capped,
+                    limits.maxDescriptorSetStorageBuffers() - TASK_SET_OTHER_STORAGE);
+        }
+        return (int) Math.max(1L, capped);
+    }
+
+    /** Bindings the task variant declares besides the arena element(s). */
+    private static final int TASK_NON_ARENA_BINDINGS = 11;
+    /**
+     * Storage buffers the MESH stage declares besides the arena.
+     *
+     * <p>This clamp guards the MESH stage ONLY. The task stage has its own
+     * per-stage count, which no value of N can influence because the arena
+     * never appears there, and it is guarded separately in
+     * {@code TerrainDrawer.taskStageHasRoom()}. Do not assume this line
+     * covers both.</p>
+     */
+    private static final int MESH_STAGE_OTHER_STORAGE = 2;
+    /** Storage buffers the task SET declares besides the arena. */
+    private static final int TASK_SET_OTHER_STORAGE = 5;
+
+    /**
+     * The ceiling the default policy would choose, ignoring the live
+     * overrides. {@link #arenaBlockCount} needs this rather than
+     * {@link #arenaCeilingBytes} because N is frozen for the device's
+     * lifetime and must not move when an operator flips a property.
+     */
+    private static long defaultPolicyCeilingBytes() {
+        long heap = MesheliumVulkanState.deviceLocalHeapBytes();
+        if (heap <= 0) {
+            return ARENA_CEILING_FALLBACK_BYTES;
+        }
+        long fraction = (heap / 100L * ARENA_CEILING_HEAP_PCT) >> 20 << 20;
+        return Math.max(ARENA_CEILING_FLOOR_BYTES, fraction);
+    }
+
     /** Default ceiling = this % of the largest DEVICE_LOCAL heap. */
     public static final int ARENA_CEILING_HEAP_PCT = 50;
     /** Absolute ceiling floor — a tiny reported heap still gets a workable arena. */
@@ -159,21 +316,213 @@ public final class MesheliumScaling {
      * </ol>
      */
     public static long arenaCeilingBytes() {
+        // The overrides are CLAMPED but NOT floored. Clamped because an
+        // operator typing a number bigger than the device can address
+        // deserves a smaller arena, not invisible terrain; not floored
+        // because forcing an arena below 256 MiB is the entire purpose of
+        // the torture knob, and applying the floor here would silently
+        // round 192 MiB up to 256 and make the guard legs untestable.
         long testMiB = Long.getLong("meshelium.test.arenaMiB", 0L);
         if (testMiB > 0) {
-            return testMiB << 20;
+            return clampToAddressable(testMiB << 20);
         }
         long overrideMiB = Long.getLong("meshelium.tune.arenaCeilingMiB", 0L);
         if (overrideMiB > 0) {
-            return overrideMiB << 20;
+            return clampToAddressable(overrideMiB << 20);
         }
         long heap = MesheliumVulkanState.deviceLocalHeapBytes();
         if (heap <= 0) {
-            return ARENA_CEILING_FALLBACK_BYTES;
+            return capToBlocks(ARENA_CEILING_FALLBACK_BYTES);
         }
         // Whole MiB — growth fills/copies then stay trivially 4-aligned.
         long fraction = (heap / 100L * ARENA_CEILING_HEAP_PCT) >> 20 << 20;
-        return Math.max(ARENA_CEILING_FLOOR_BYTES, fraction);
+        return capToBlocks(Math.max(ARENA_CEILING_FLOOR_BYTES, fraction));
+    }
+
+    /**
+     * The ceiling that is actually REACHABLE right now: the static policy
+     * ceiling, or how far the arena could still grow on this machine,
+     * whichever is smaller.
+     *
+     * <p>This is the whole VRAM guard, expressed as one number instead of a
+     * second state machine. Every consumer of the ceiling - the 85%
+     * eviction high-water and the 92% render-distance backoff - already
+     * divides by it, so shrinking it when the card is genuinely short makes
+     * those existing valves fire EARLIER, before terrain starts dropping.
+     * With memory to spare it equals the static ceiling exactly and nothing
+     * behaves differently, which is the point: this must never cost a
+     * player who has the memory.</p>
+     *
+     * <p>WHY IT HAS TO WORK THIS WAY ROUND. Simply refusing to grow is not
+     * the gentle option it sounds like. A refused growth drops the section,
+     * which trips the coverage guard, which puts Meshelium passive for the
+     * whole world AND clamps the render distance to 32. Stepping the
+     * distance down by 8 first is strictly kinder than the cliff it
+     * prevents, and the player can drag it straight back up in Video
+     * Settings.</p>
+     *
+     * <p>Uses the SUSTAINED headroom, not the latest sample, so a momentary
+     * dip cannot cost render distance under the no-restore rule.</p>
+     *
+     * @param currentCapacityBytes what the arena already holds
+     */
+    public static long effectiveCeilingBytes(long currentCapacityBytes) {
+        long staticCeiling = arenaCeilingBytes();
+        long headroom = MesheliumVramState.sustainedHeadroomBytes();
+        if (headroom == Long.MAX_VALUE) {
+            return staticCeiling; // budget unknown: behave exactly as before
+        }
+        // FLOOR THE HEADROOM TO WHOLE BLOCKS. Growth past the first block is
+        // block-granular: the arena cannot take 1824 MiB of headroom and
+        // grow by 1824 MiB, it can only append a whole block or nothing.
+        // Counting the remainder as reachable is what let the owner's
+        // 2026-08-13 session walk into the cliff. At the moment it failed:
+        //
+        //   capacity 4096, headroom 1824, block 2048
+        //   raw     -> ceiling 5920, used 3782 = 64%  ... 92% trip silent
+        //   floored -> ceiling 4096, used 3782 = 92%  ... trip fires
+        //
+        // The refusal to allocate was correct; what was missing was the
+        // render-distance step that should have happened BEFORE it, and it
+        // was missing because the ceiling claimed room that no allocation
+        // could ever occupy.
+        long block = arenaBlockBytes();
+        long reachable = currentCapacityBytes;
+        if (currentCapacityBytes < block) {
+            // Still inside the first block, which grows continuously rather
+            // than in whole-block steps, so every byte of headroom is real.
+            reachable += headroom;
+        } else if (block > 0) {
+            reachable += headroom / block * block;
+        }
+        // Never below what is already committed, or the pressure percentage
+        // would exceed 100 and the backoff would step on every tick.
+        return Math.max(currentCapacityBytes, Math.min(staticCeiling, reachable));
+    }
+
+    /**
+     * Cap a ceiling to what the BLOCKS can actually deliver.
+     *
+     * <p>This is what replaces the old single-binding clamp, and it is the
+     * step that finally raises the 4 GiB wall. maxStorageBufferRange bounds
+     * one BINDING, not the arena: with the terrain data split across N
+     * separately bound blocks the reachable total is blockBytes * N, which
+     * on the dev card is 4 x 2048 MiB = 8192 MiB against the 4095 MiB a
+     * single buffer could ever have offered.</p>
+     *
+     * <p>The per-block guarantee has not gone anywhere, it has moved:
+     * {@link #arenaBlockBytes()} clamps each block to both
+     * maxStorageBufferRange and maxMemoryAllocationSize, so every
+     * individual binding is still readable end to end. What changed is
+     * only that the TOTAL is no longer held to one binding's reach.</p>
+     */
+    private static long capToBlocks(long bytes) {
+        long block = arenaBlockBytes();
+        int blocks = arenaBlockCount();
+        if (block <= 0 || blocks <= 0) {
+            return addressable(bytes); // not probed: the old single-buffer rule
+        }
+        long total = block * (long) blocks;
+        return Math.max(Math.min(ARENA_CEILING_FLOOR_BYTES, total), Math.min(bytes, total));
+    }
+
+    /**
+     * Clamp an arena size to what a shader can actually READ.
+     *
+     * <p>FITTING IN MEMORY IS NOT THE SAME AS BEING ADDRESSABLE, and this
+     * cost a player their terrain. The arena is one storage buffer, and a
+     * shader can only reach {@code maxStorageBufferRange} bytes of it,
+     * which is 4 GiB minus one on essentially all desktop hardware. Sizing
+     * the ceiling purely from the heap let a 16 GiB card grow the arena to
+     * 4,374 MiB. Everything past the 4 GiB line still existed, was still
+     * uploaded, and was still counted resident: it simply could not be
+     * fetched. Reads there return zero under robust buffer access, a zeroed
+     * section record reads {@code header.w == 0}, which is exactly the
+     * tombstone the task shader uses for "empty slot", so the section was
+     * silently skipped.</p>
+     *
+     * <p>The symptom was terrain turning invisible at render distance 96
+     * and 120, spreading as more chunks loaded, spreading again when blocks
+     * were edited because a rebuild reallocates upward, surviving the
+     * occlusion toggle because it was never occlusion, and clearing only on
+     * restart. Every drop counter read zero throughout and the coverage
+     * guard never fired, correctly: nothing was dropped. That is the nasty
+     * part. The guard defends the "does not fit" failure and this was a
+     * "fits but cannot be reached" failure, which had no defence at all.</p>
+     *
+     * <p>Clamped here rather than at the growth site so the ceiling is
+     * honest everywhere it is read: the status screen, the log line, and
+     * the guard's own trip condition. Once the ceiling is reachable, an
+     * overflowing world takes the EXISTING path, dropping sections and
+     * tripping the guard into passive with a named reason, which is a bad
+     * outcome a player can understand instead of a mystery.</p>
+     */
+    private static long addressable(long bytes) {
+        return addressableFor(bytes, MesheliumVulkanState.maxStorageBufferRangeBytes());
+    }
+
+    private static long clampToAddressable(long bytes) {
+        return clampToAddressableFor(bytes, MesheliumVulkanState.maxStorageBufferRangeBytes());
+    }
+
+    /**
+     * The clamp WITHOUT the floor, for the two property overrides.
+     *
+     * <p>They need the clamp for the same reason the default path does: a
+     * number larger than {@code maxStorageBufferRange} produces terrain the
+     * shader cannot read, and an operator override is no safer than a
+     * computed one. They must NOT get the floor, because forcing an arena
+     * below 256 MiB is exactly what {@code meshelium.test.arenaMiB} is for -
+     * the pressure-backoff and coverage-guard legs are driven at 192 and
+     * 352 MiB, and flooring those to 256 would quietly disarm the tests
+     * that prove the safety valves work.
+     */
+    public static long clampToAddressableFor(long bytes, long limit) {
+        if (limit <= 0) {
+            return bytes;
+        }
+        long limitAligned = limit >> 20 << 20;
+        return limitAligned <= 0 ? Math.min(bytes, limit) : Math.min(bytes, limitAligned);
+    }
+
+    /**
+     * {@link #addressable} with the device limit passed in, so the
+     * arithmetic can be exercised against limits no GPU on this desk
+     * reports. Every value that matters here is one this hardware cannot
+     * produce: the bug it exists to catch is invisible at 4095 MiB and only
+     * appears below 256 MiB.
+     *
+     * @param bytes the size being requested
+     * @param limit {@code maxStorageBufferRange}, or 0 when never probed
+     * @return a size the shader can actually reach, never above {@code limit}
+     */
+    public static long addressableFor(long bytes, long limit) {
+        if (limit <= 0) {
+            return bytes;
+        }
+        // THE FLOOR MUST NEVER OUTRANK THE LIMIT. This originally read
+        // `Math.max(ARENA_CEILING_FLOOR_BYTES, clamped)`, which applied the
+        // floor AFTER the clamp and therefore undid it: a device reporting
+        // maxStorageBufferRange below 256 MiB got a 256 MiB ceiling, an
+        // arena larger than the shader can address, and the wave-14
+        // invisible-terrain failure rebuilt exactly. The comment that used
+        // to sit here claimed such a device would "simply go passive early
+        // rather than silently losing terrain", which was the opposite of
+        // what the code did. Vulkan's required minimum for
+        // maxStorageBufferRange is 128 MiB, i.e. BELOW the floor, so this
+        // was reachable on a conformant device and not merely in theory.
+        // No desktop GPU reports anything near it — the dev card reports
+        // 4095 MiB — which is precisely why it would have shipped.
+        long limitAligned = limit >> 20 << 20; // whole MiB, always <= limit
+        if (limitAligned <= 0) {
+            // Cannot address even one MiB of a storage buffer. Hand back the
+            // raw limit rather than zero: the residency guard then reports a
+            // world that does not fit, out loud, instead of this returning a
+            // zero-byte arena for something downstream to divide by.
+            return limit;
+        }
+        return Math.max(Math.min(ARENA_CEILING_FLOOR_BYTES, limitAligned),
+                Math.min(bytes, limitAligned));
     }
 
     /**

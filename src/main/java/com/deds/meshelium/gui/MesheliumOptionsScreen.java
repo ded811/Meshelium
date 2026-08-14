@@ -137,12 +137,30 @@ public final class MesheliumOptionsScreen extends Screen {
     private boolean gateLocked;
     /** The tick-updated status header (see class javadoc). */
     private StringWidget statusLine;
+    private StringWidget memoryLine;
     /** Wave-15: cap value at init — onClose rebuilds a stale parent on change. */
     private int capAtOpen;
+    /**
+     * Vanilla's render distance at init, for the same reason as
+     * {@link #capAtOpen} and covering the case that one missed.
+     *
+     * <p>Toggling Meshelium Rendering changes the render distance VALUE (the
+     * clamp to 32 on the way off, the restore on the way back) and the
+     * option's RANGE, while leaving the cap alone. The back-out fix keyed on
+     * the cap only, so returning to Video Settings handed back a cached
+     * screen whose slider widget had been built from the old range: it read
+     * 32 and would not go higher, no matter what the underlying value said.
+     * The owner reported both halves of that as separate bugs, "it says it
+     * set the render distance to 120 but it never actually does" and "its
+     * still capped at 32 until i leave and re open settings". One cause.</p>
+     */
+    private int rdAtOpen;
     private CapSlider capSlider;
     private ValueBox capBox;
     private OcclusionRdSlider occlusionSlider;
     private ValueBox occlusionBox;
+    private FogEndSlider fogSlider;
+    private ValueBox fogBox;
     /** Reset button arming: first click asks, second click resets. */
     private boolean resetArmed;
     private Button resetButton;
@@ -229,6 +247,9 @@ public final class MesheliumOptionsScreen extends Screen {
         if (this.statusLine != null) {
             this.statusLine.setMessage(buildStatusLine());
         }
+        if (this.memoryLine != null) {
+            this.memoryLine.setMessage(memoryStatus());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -273,6 +294,33 @@ public final class MesheliumOptionsScreen extends Screen {
                 .withStyle(ChatFormatting.GREEN);
     }
 
+    /**
+     * Live terrain memory, appended to the status line.
+     *
+     * <p>Here rather than as a bar in the settings list, and the reason is
+     * that Meshelium's memory is DYNAMIC: it grows as the player explores
+     * and shrinks when they leave. Games that draw a VRAM bar are showing
+     * the cost of STATIC choices - texture quality, shadow resolution -
+     * where an estimate is stable enough to act on. A bar whose number
+     * moves while you walk teaches nobody anything. What is actionable is
+     * what it is using right now, next to whether it is running at all.</p>
+     *
+     * <p>Shows the free figure only when the driver reports a real budget;
+     * on a driver without VK_EXT_memory_budget there is no honest number
+     * for it and inventing one would be worse than omitting it.</p>
+     */
+    private static Component memoryStatus() {
+        long used = com.deds.meshelium.terrain.host.TerrainResidency.counters().arenaUsedBytes();
+        long budget = com.deds.meshelium.MesheliumVramState.budgetBytes();
+        if (budget <= 0) {
+            return Component.translatable("meshelium.options.status.memory", used >> 20)
+                    .withStyle(ChatFormatting.GRAY);
+        }
+        long free = Math.max(0L, budget - com.deds.meshelium.MesheliumVramState.usageBytes());
+        return Component.translatable("meshelium.options.status.memory_free",
+                used >> 20, free >> 20).withStyle(ChatFormatting.GRAY);
+    }
+
     private static Component off(String reasonKey) {
         return Component.translatable("meshelium.options.status.off",
                 Component.translatable(reasonKey)).withStyle(ChatFormatting.RED);
@@ -298,7 +346,19 @@ public final class MesheliumOptionsScreen extends Screen {
                     "meshelium.options.status.reason.passive.oversize", trip.value(), trip.limit());
             case "region" -> Component.translatable(
                     "meshelium.options.status.reason.passive.region", trip.value(), trip.limit());
-            default -> Component.translatable("meshelium.options.status.reason.passive.encoding");
+            // "vram" was missing here and fell to the default, so a graphics
+            // card refusing more memory told the player a section had failed
+            // to encode. The owner hit exactly that and reported the wrong
+            // cause back, because we printed the wrong cause. The sibling
+            // switch in TerrainResidency was fixed earlier; this one was not,
+            // and this is the one the player actually reads.
+            case "vram" -> Component.translatable(
+                    "meshelium.options.status.reason.passive.vram", trip.value(), trip.limit());
+            case "encoding" -> Component.translatable(
+                    "meshelium.options.status.reason.passive.encoding");
+            // Name every cause above. A new kind reaching here is a bug in
+            // the caller, and saying so beats blaming the encoder again.
+            default -> Component.translatable("meshelium.options.status.reason.passive");
         };
         return Component.translatable("meshelium.options.status.off", reason)
                 .withStyle(ChatFormatting.RED);
@@ -332,14 +392,24 @@ public final class MesheliumOptionsScreen extends Screen {
         MesheliumGate.State gate = MesheliumGate.state();
         this.gateLocked = gate != MesheliumGate.State.VULKAN_MESH_SHADERS;
         this.capAtOpen = config.maxRenderDistance;
+        this.rdAtOpen = this.minecraft != null && this.minecraft.options != null
+                ? this.minecraft.options.renderDistance().get() : -1;
         boolean terrainOverridden = System.getProperty("meshelium.terrainDraw") != null;
-        boolean statsOverridden = System.getProperty("meshelium.debugStats") != null;
         boolean maxRdOverridden = System.getProperty("meshelium.maxRenderDistance") != null;
+        // Hoisted from the occlusion row below so the dev-override banner,
+        // which is built before it, can count it.
+        boolean occlusionOverridden = System.getProperty("meshelium.terrainDraw.bfsOnly") != null;
+        boolean fogOverridden = System.getProperty("meshelium.fogMode") != null;
         // meshelium.retainTerrain / meshelium.retainSeconds are deliberately
         // absent from this census: retention has no row left to lock
         // (2026-08-11, see the class javadoc), so a dev arming it must
         // not raise the "some rows are locked" banner over rows it
         // cannot touch.
+        //
+        // meshelium.debugStats left for the same reason when Debug Stat
+        // Logging moved to the Advanced screen. That screen runs its own
+        // census over its own rows; a banner here would point at a row this
+        // screen no longer has.
 
         this.layout.defaultCellSetting().alignHorizontallyCenter();
         this.layout.addChild(new StringWidget(this.getTitle(), this.font));
@@ -350,6 +420,13 @@ public final class MesheliumOptionsScreen extends Screen {
                 new StringWidget(buildStatusLine(), this.font), s -> s.paddingTop(2));
         this.statusLine.setTooltip(Tooltip.create(
                 Component.translatable("meshelium.options.tooltip.status")));
+
+        // Terrain memory on its OWN line under the status, not appended to
+        // it (owner's request). The status answers "is it running"; the
+        // memory answers "what is it costing", and jamming both into one
+        // line made the row long enough to crowd the screen.
+        this.memoryLine = this.layout.addChild(
+                new StringWidget(memoryStatus(), this.font), s -> s.paddingTop(1));
 
         // Gate banner: WHY the rows below are locked, by exact cause —
         // plus the wave-1 [Enable Vulkan] affordance on the plain-GL path
@@ -379,7 +456,7 @@ public final class MesheliumOptionsScreen extends Screen {
                 this.layout.addChild(enable);
             }
         }
-        if (terrainOverridden || statsOverridden || maxRdOverridden) {
+        if (terrainOverridden || maxRdOverridden || occlusionOverridden) {
             this.layout.addChild(new MultiLineTextWidget(
                     Component.translatable("meshelium.options.dev_override"), this.font)
                     .setMaxWidth(BANNER_MAX_WIDTH)
@@ -400,6 +477,9 @@ public final class MesheliumOptionsScreen extends Screen {
                     config.enableTerrainRendering = value;
                     config.save();
                     com.deds.meshelium.MesheliumExtendedRd.onConfigChanged(this.minecraft);
+                    // Both edges of this switch are handled by the client
+                    // tick's edge detector, which also catches the harness
+                    // flipping the property. One owner for the logic.
                 });
         terrain.setWidth(WIDGET_WIDTH);
         terrain.active = !this.gateLocked && !terrainOverridden;
@@ -445,7 +525,6 @@ public final class MesheliumOptionsScreen extends Screen {
         // lose, 48 and 64 both win) where a section count does not:
         // ground-rd64 wins 31% at ~4,000 resident sections while
         // plains-rd32 loses at ~3,300.
-        boolean occlusionOverridden = System.getProperty("meshelium.terrainDraw.bfsOnly") != null;
         CycleButton<MesheliumConfig.OcclusionMode> occlusion = CycleButton
                 .builder((MesheliumConfig.OcclusionMode m) -> Component.translatable(
                         switch (m) {
@@ -487,31 +566,86 @@ public final class MesheliumOptionsScreen extends Screen {
                 "meshelium.options.applies.now"));
         this.layout.addChild(sliderRow(this.occlusionSlider, this.occlusionBox));
 
-        // 4. Advanced / diagnostic rows.
-
-        CycleButton<Boolean> stats = toggle("meshelium.options.debug_stats",
-                config.debugStats, !this.gateLocked && !statsOverridden, value -> {
-                    config.debugStats = value;
+        // 3b. Distance fog.
+        //
+        // A rendering setting rather than an advanced one, because it is the
+        // only row here that changes what the world LOOKS like, and because
+        // at the distances this mod unlocks the vanilla behaviour is simply
+        // wrong: the atmospheric haze ends at a hard-coded 1024 blocks that
+        // ignores render distance, so at 120 chunks the outer 56 chunks are
+        // loaded, meshed and then painted flat grey. See
+        // AtmosphericFogEnvironmentMixin for the bytecode.
+        //
+        // Active on every backend, unlike the rows above it. The fog mixin
+        // has nothing to do with mesh shaders, so it keeps working with
+        // Meshelium switched off or on OpenGL, and greying it out on a
+        // gate-locked screen would be a lie.
+        CycleButton<MesheliumConfig.FogMode> fog = CycleButton
+                .builder((MesheliumConfig.FogMode m) -> Component.translatable(
+                        switch (m) {
+                            case VANILLA -> "meshelium.options.fog.vanilla";
+                            case SCALED -> "meshelium.options.fog.scaled";
+                            case OFF -> "meshelium.options.fog.off";
+                        }), config.fogMode)
+                .withValues(MesheliumConfig.FogMode.values())
+                .create(Component.translatable("meshelium.options.fog"), (b, value) -> {
+                    config.fogMode = value;
                     config.save();
+                    // The slider only means anything in Scaled, and it greys
+                    // out rather than vanishing, so the row has to be rebuilt
+                    // to re-evaluate that. Same trick the occlusion mode row
+                    // uses for its crossover slider.
+                    rebuildOcclusionRows();
                 });
-        stats.setTooltip(tip("meshelium.options.tooltip.debug_stats",
+        fog.setWidth(WIDGET_WIDTH);
+        fog.active = !fogOverridden;
+        fog.setTooltip(tipAlways("meshelium.options.tooltip.fog", "meshelium.options.applies.now"));
+        this.layout.addChild(fog, s -> s.paddingTop(4));
+
+        boolean fogSliderActive = !fogOverridden
+                && config.fogMode == MesheliumConfig.FogMode.SCALED;
+        this.fogSlider = new FogEndSlider(config, fogSliderActive);
+        this.fogSlider.setTooltip(tipAlways("meshelium.options.tooltip.fog_end",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(stats);
+        this.fogBox = new ValueBox(MesheliumConfig.MIN_FOG_END_PERCENT,
+                MesheliumConfig.MAX_FOG_END_PERCENT,
+                () -> MesheliumConfig.get().fogEndPercent,
+                this::applyFogEnd,
+                Component.translatable("meshelium.options.fog_end.box",
+                        Component.literal("")));
+        this.fogBox.active = fogSliderActive;
+        this.fogBox.setTooltip(tipAlways("meshelium.options.tooltip.fog_end_custom",
+                "meshelium.options.applies.now"));
+        this.layout.addChild(sliderRow(this.fogSlider, this.fogBox));
 
-        // The backend-popup re-arm: active on EVERY backend (it is about
-        // the non-Vulkan case); next-boot semantics by nature — its
-        // tooltip states them even on a locked screen.
-        CycleButton<Boolean> popup = toggle("meshelium.options.popup",
-                config.showVulkanPrompt, true, value -> {
-                    config.showVulkanPrompt = value;
-                    config.noMeshShaderNoticeShown = !value;
-                    config.vulkanFailedNoticeShown = !value;
-                    config.save();
-                });
-        popup.setTooltip(Tooltip.create(withSemantics(
-                Component.translatable("meshelium.options.tooltip.popup"),
-                "meshelium.options.applies.restart")));
-        this.layout.addChild(popup);
+        // 4. Everything else lives one click away.
+        //
+        // These rows all default to the right answer and the only reason to
+        // touch any of them is a mod conflict or a bug report. Keeping them
+        // on the front page put a memory setting worth gigabytes next to a
+        // logging switch, invited fiddling with both, and pushed the flat
+        // list past the height budget this class's javadoc records.
+        //
+        // The live instance is handed over as the parent, never a fresh one:
+        // returning to a cached Screen only repositions it, so this screen
+        // keeps its widgets, its tick loop and its capAtOpen snapshot, and
+        // the wave-15 back-out fix keeps working.
+        this.layout.addChild(Button.builder(
+                Component.translatable("meshelium.options.advanced"),
+                b -> {
+                    // Disarm the two-click reset on the way out, or it would
+                    // still be armed and relabelled when the player comes
+                    // back and one stray click would wipe their settings.
+                    this.resetArmed = false;
+                    if (this.resetButton != null) {
+                        this.resetButton.setMessage(
+                                Component.translatable("meshelium.options.reset"));
+                    }
+                    if (this.minecraft != null) {
+                        this.minecraft.gui.setScreen(new MesheliumAdvancedScreen(this));
+                    }
+                })
+                .width(WIDGET_WIDTH).build(), s -> s.paddingTop(6));
 
         // Reset. TWO CLICKS on purpose: the first arms and relabels, the
         // second does it. A single click would be one slip away from wiping
@@ -682,6 +816,20 @@ public final class MesheliumOptionsScreen extends Screen {
                 this.gateLocked ? "meshelium.options.applies.vulkan" : appliesKey));
     }
 
+    /**
+     * A tooltip that keeps its apply semantics even on a gate-locked screen.
+     *
+     * <p>{@link #tip} replaces the semantics line with the gate reason,
+     * which is the honest thing to do for a row that genuinely cannot take
+     * effect without Vulkan and mesh shaders. The fog rows are not such a
+     * row: they are a plain vanilla-side change that works on OpenGL, with
+     * Meshelium switched off, on any hardware. Telling a player it needs
+     * Vulkan would be the lie the gate rule exists to prevent.</p>
+     */
+    private Tooltip tipAlways(String descriptionKey, String appliesKey) {
+        return Tooltip.create(withSemantics(Component.translatable(descriptionKey), appliesKey));
+    }
+
     private static Component withSemantics(MutableComponent description, String semanticsKey) {
         return description.append(Component.literal("\n\n"))
                 .append(Component.translatable(semanticsKey).withStyle(ChatFormatting.GRAY));
@@ -836,6 +984,89 @@ public final class MesheliumOptionsScreen extends Screen {
         }
     }
 
+    /**
+     * Percentage of the view distance at which the haze finishes.
+     *
+     * <p>Labelled with the resulting distance in blocks as well as the
+     * percentage, because "120%" means nothing on its own and "120% of view
+     * (2304 blocks)" tells the player what they are actually choosing. That
+     * also answers wanting the control in blocks rather than percent without
+     * adding a second unit and a second knob: percent is the unit that keeps
+     * looking right when the render distance changes, blocks is the number
+     * that makes it concrete, so the slider is one and the label is both.</p>
+     */
+    private final class FogEndSlider extends AbstractSliderButton {
+        private int displayed;
+
+        FogEndSlider(MesheliumConfig config, boolean active) {
+            super(0, 0, SLIDER_WIDTH, 20, Component.empty(),
+                    fogFraction(config.fogEndPercent));
+            this.active = active;
+            this.displayed = config.fogEndPercent;
+            updateMessage();
+        }
+
+        void refreshFromConfig() {
+            this.displayed = MesheliumConfig.get().fogEndPercent;
+            this.value = fogFraction(this.displayed);
+            updateMessage();
+        }
+
+        @Override
+        protected void updateMessage() {
+            setMessage(Component.translatable("meshelium.options.fog_end.label",
+                    Component.literal(Integer.toString(this.displayed)),
+                    Component.literal(Integer.toString(fogBlocksFor(this.displayed)))));
+        }
+
+        @Override
+        protected void applyValue() {
+            int span = MesheliumConfig.MAX_FOG_END_PERCENT - MesheliumConfig.MIN_FOG_END_PERCENT;
+            int pct = MesheliumConfig.MIN_FOG_END_PERCENT + (int) Math.round(this.value * span);
+            pct = Math.round(pct / 5.0f) * 5; // 5% steps; 1% is not a visible difference
+            pct = Math.max(MesheliumConfig.MIN_FOG_END_PERCENT,
+                    Math.min(MesheliumConfig.MAX_FOG_END_PERCENT, pct));
+            if (pct != this.displayed) {
+                this.displayed = pct;
+                applyFogEnd(pct);
+            }
+            updateMessage();
+        }
+    }
+
+    private static double fogFraction(int pct) {
+        int span = MesheliumConfig.MAX_FOG_END_PERCENT - MesheliumConfig.MIN_FOG_END_PERCENT;
+        double f = (pct - MesheliumConfig.MIN_FOG_END_PERCENT) / (double) span;
+        return Math.max(0.0, Math.min(1.0, f));
+    }
+
+    /**
+     * The percentage expressed in blocks, against the distance the player is
+     * actually on right now. Falls back to the mod's cap when there is no
+     * world yet, so the number in the label is never blank or zero.
+     */
+    private int fogBlocksFor(int pct) {
+        int chunks = MesheliumConfig.get().maxRenderDistance;
+        if (this.minecraft != null && this.minecraft.options != null
+                && this.minecraft.level != null) {
+            chunks = this.minecraft.options.getEffectiveRenderDistance();
+        }
+        return Math.round(chunks * 16 * (pct / 100.0f));
+    }
+
+    /** The one write path for the fog percentage. */
+    private void applyFogEnd(int pct) {
+        MesheliumConfig config = MesheliumConfig.get();
+        config.fogEndPercent = pct;
+        config.save();
+        if (this.fogSlider != null) {
+            this.fogSlider.refreshFromConfig();
+        }
+        if (this.fogBox != null) {
+            this.fogBox.refreshFromConfig();
+        }
+    }
+
     private static double rdFraction(int rd) {
         int span = MesheliumConfig.MAX_OCCLUSION_AUTO_RD - MesheliumConfig.MIN_OCCLUSION_AUTO_RD;
         double f = (rd - MesheliumConfig.MIN_OCCLUSION_AUTO_RD) / (double) span;
@@ -880,8 +1111,14 @@ public final class MesheliumOptionsScreen extends Screen {
     @Override
     public void onClose() {
         boolean capChanged = MesheliumConfig.get().maxRenderDistance != this.capAtOpen;
+        // The render distance itself, not just the cap. Toggling Meshelium
+        // Rendering moves the value and the option's range without touching
+        // the cap, and a cached Video Settings screen keeps the slider widget
+        // it built from the old range.
+        boolean rdChanged = this.rdAtOpen >= 0 && this.minecraft.options != null
+                && this.minecraft.options.renderDistance().get() != this.rdAtOpen;
         Screen target = this.parent;
-        if (capChanged
+        if ((capChanged || rdChanged)
                 && this.parent instanceof net.minecraft.client.gui.screens.options.VideoSettingsScreen) {
             // Fresh instance, vanilla-style: rebuildWidgets() on the cached
             // parent DUPLICATES its HeaderAndFooterLayout contents and the

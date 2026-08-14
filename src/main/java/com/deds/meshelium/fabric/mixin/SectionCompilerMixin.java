@@ -4,6 +4,7 @@
  */
 package com.deds.meshelium.fabric.mixin;
 
+import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumGate;
 import com.deds.meshelium.fabric.MesheliumClient;
 import com.deds.meshelium.terrain.host.SectionBuildTap;
@@ -52,7 +53,13 @@ abstract class SectionCompilerMixin {
     private void meshelium$afterCompile(SectionPos sectionPos, RenderSectionRegion region,
             VertexSorting vertexSorting, SectionBufferBuilderPack pack,
             CallbackInfoReturnable<SectionCompiler.Results> cir) {
-        if (meshelium$tapBroken || MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS) {
+        // terrainRenderingEnabled() is checked here, not just at the draw:
+        // encoding into an arena nobody draws is what made the doubled VRAM
+        // a steady state rather than a swap transient. Every master-switch
+        // edge issues an allChanged(), which is what re-encodes the world
+        // when this comes back.
+        if (meshelium$tapBroken || MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS
+                || !MesheliumConfig.terrainRenderingConfigured()) {
             return;
         }
         try {

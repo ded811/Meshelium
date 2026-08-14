@@ -59,12 +59,123 @@ layout(triangles, max_vertices = 4 * MESHELIUM_TRANS_QUADS, max_primitives = 2 *
 layout(triangles, max_vertices = 4 * MESHELIUM_WG_SIZE, max_primitives = 2 * MESHELIUM_WG_SIZE) out;
 #endif
 
-// The wave-3 terrain arena, bound as a std430 SSBO (NO buffer_device_address
-// — wave-3b bytecode finding: vanilla's device/allocator lack the feature).
+// The terrain arena, bound as an ARRAY of std430 SSBOs (NO
+// buffer_device_address — wave-3b bytecode finding: vanilla's
+// device/allocator lack the feature).
 // One uvec4 = one packed 16-byte vertex; quad q = elements q*4 .. q*4+3.
+//
+// WHY AN ARRAY. A shader can only reach maxStorageBufferRange bytes of ONE
+// storage buffer, which is 4095 MiB on the dev card no matter how much
+// memory it has. Past that, reads return zero, and a zeroed section record
+// is indistinguishable from the empty-slot tombstone, so terrain silently
+// vanished at render distance 96+. The arena is therefore split into
+// MESHELIUM_ARENA_BLOCKS buffers of MESHELIUM_ARENA_BLOCK_BYTES each, and
+// the absolute quad address carries the block in its high bits.
+//
+// At MESHELIUM_ARENA_BLOCKS == 1 this is the old single binding with a
+// one-element array, and the compiled SPIR-V must be equivalent: the switch
+// below collapses to its only arm.
 layout(set = 0, binding = 0, std430) readonly buffer TerrainData {
     uvec4 terrainData[];
-};
+} terrainBlocks[MESHELIUM_ARENA_BLOCKS];
+
+// Fetch one 16-byte vertex from whichever block owns it.
+//
+// EVERY index into terrainBlocks[] IS A LITERAL. That is the entire point
+// of the switch, and it is not stylistic. Indexing an array of storage
+// buffer descriptors with a non-constant index requires the index to be
+// dynamically uniform, and needs
+// shaderStorageBufferArrayDynamicIndexing/...NonUniformIndexing to be a
+// legal SPIR-V module at all (VUID-StandaloneSpirv-
+// StorageBufferArrayDynamicIndexing-10129). Nobody on this project can
+// establish from primary sources what "dynamically uniform" means for a
+// mesh shader invocation group, and this codebase has ALREADY shipped a
+// shader that was invalid Vulkan and silently tolerated by one vendor's
+// driver. A switch on literals makes the question not exist: no feature,
+// no extension, no uniformity argument. The cost is one OpSwitch per
+// vertex fetch.
+//
+// The #if guards are PER ARM on purpose. Grouping them (say cases 4-7 under
+// one "> 4") is a compile error at any N inside the group: at N=5 the
+// shader would reference terrainBlocks[6] against a 5-element array.
+//
+// AND THERE IS NO SAFETY NET HERE, which is the finding that makes the
+// switch non-negotiable rather than merely tidy. Measured 2026-08-13: this
+// function was temporarily replaced with the dynamic form,
+// terrainBlocks[blk].terrainData[idx], and the client was run with
+// --vulkanValidation on the RX 9070 XT. shaderStorageBufferArrayDynamicIndexing
+// is NOT enabled - vanilla requests ten features and that is not one of them
+// (javap on VulkanBackend), and Meshelium adds only meshShader, taskShader
+// and fragmentStoresAndAtomics. So the module was invalid. It compiled, it
+// drew, it passed the opaque parity assertions, and the validation layer
+// said NOTHING.
+//
+// That is the fragmentStoresAndAtomics story repeating exactly: AMD tolerates
+// it, validation does not flag it, and the first evidence would have been a
+// bug report from an NVIDIA or Intel user. A clean validation run is
+// therefore NOT evidence that a shader module is legal for this class of
+// rule. Do not "simplify" this switch back to a dynamic index because the
+// validation layer is quiet - quiet is exactly what it was for the broken
+// version.
+uvec4 meshelium_fetchVertex(uint quad, uint i) {
+    uint blk = quad >> MESHELIUM_ARENA_BLOCK_SHIFT;
+    uint idx = ((quad & MESHELIUM_ARENA_BLOCK_MASK) << 2) + i;
+    switch (blk) {
+        case 0u: return terrainBlocks[0].terrainData[idx];
+#if MESHELIUM_ARENA_BLOCKS > 1
+        case 1u: return terrainBlocks[1].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 2
+        case 2u: return terrainBlocks[2].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 3
+        case 3u: return terrainBlocks[3].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 4
+        case 4u: return terrainBlocks[4].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 5
+        case 5u: return terrainBlocks[5].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 6
+        case 6u: return terrainBlocks[6].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 7
+        case 7u: return terrainBlocks[7].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 8
+        case 8u: return terrainBlocks[8].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 9
+        case 9u: return terrainBlocks[9].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 10
+        case 10u: return terrainBlocks[10].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 11
+        case 11u: return terrainBlocks[11].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 12
+        case 12u: return terrainBlocks[12].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 13
+        case 13u: return terrainBlocks[13].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 14
+        case 14u: return terrainBlocks[14].terrainData[idx];
+#endif
+#if MESHELIUM_ARENA_BLOCKS > 15
+        case 15u: return terrainBlocks[15].terrainData[idx];
+#endif
+    }
+    // Unreachable while the host keeps its side of the invariant: no
+    // allocation straddles a block, and no address names a block that was
+    // never committed. Returning zero rather than reading block 0 is
+    // deliberate - a degenerate vertex draws nothing, whereas block 0 at a
+    // wild offset would draw plausible garbage somewhere in the world, and
+    // wrong-looking terrain is far harder to diagnose than missing terrain.
+    return uvec4(0u);
+}
 
 // Meshelium's per-frame scene UBO (wave-5 layout — must match terrain.task /
 // terrain.frag and TerrainDrawer.uploadScene byte-for-byte). This stage
@@ -213,7 +324,7 @@ vec4 sampleLightmap(uvec4 v) {
 void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
     uint vertBase = slot * 4u;
     for (uint i = 0u; i < 4u; ++i) {
-        uvec4 v = terrainData[(quad << 2) + i];
+        uvec4 v = meshelium_fetchVertex(quad, i);
         uint vi = vertBase + i;
         vec3 pos = decodeVertexPosition(v) + origin;
         gl_MeshVerticesEXT[vi].gl_Position = ProjMat * (ModelViewMat * vec4(pos, 1.0));

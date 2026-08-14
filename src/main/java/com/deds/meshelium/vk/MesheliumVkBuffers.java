@@ -140,9 +140,56 @@ final class MesheliumVkBuffers {
         }
     }
 
-    private static void check(int vkResult, String what) {
-        if (vkResult != VK10.VK_SUCCESS) {
-            throw new IllegalStateException(what + " failed: VkResult " + vkResult);
+    /**
+     * Thrown when an allocation failed because the card is FULL, as
+     * distinct from failing for any other reason.
+     *
+     * <p>The distinction is the whole point. Out of memory is the one
+     * failure Meshelium can do something intelligent about - allocate less,
+     * pull the render distance in, refuse to grow - while every other
+     * VkResult means something is wrong that backing off will not fix.
+     * Vanilla makes no such distinction: {@code VulkanUtils.crashIfFailure}
+     * turns every negative result except {@code VK_ERROR_DEVICE_LOST} into
+     * a bare {@code IllegalStateException}, with no OOM branch and no
+     * retry. Catching a typed exception is the difference between backing
+     * off and crashing the game.</p>
+     */
+    public static final class OutOfDeviceMemoryException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+        private final int vkResult;
+
+        OutOfDeviceMemoryException(String message, int vkResult) {
+            super(message);
+            this.vkResult = vkResult;
         }
+
+        /** {@code VK_ERROR_OUT_OF_DEVICE_MEMORY} or {@code ..._HOST_MEMORY}. */
+        public int vkResult() {
+            return vkResult;
+        }
+    }
+
+    /**
+     * True for the two "there is no memory left" results. Host-memory
+     * exhaustion is included deliberately: from a caller's point of view it
+     * is the same decision, allocate less, and treating it as a generic
+     * failure would crash for a condition that backing off can survive.
+     */
+    public static boolean isOutOfMemory(int vkResult) {
+        return vkResult == VK10.VK_ERROR_OUT_OF_DEVICE_MEMORY
+                || vkResult == VK10.VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    private static void check(int vkResult, String what) {
+        if (vkResult == VK10.VK_SUCCESS) {
+            return;
+        }
+        String message = what + " failed: VkResult " + vkResult;
+        if (isOutOfMemory(vkResult)) {
+            throw new OutOfDeviceMemoryException(message
+                    + " (out of memory - the graphics card could not fit this allocation)",
+                    vkResult);
+        }
+        throw new IllegalStateException(message);
     }
 }

@@ -1289,6 +1289,93 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
         context.waitFor(client -> TerrainDrawer.translucentFrames() > transFramesAtFlip,
                 DRAW_TIMEOUT_TICKS);
         assertNoErrors();
+
+        assertFabulousTransparency(context);
+    }
+
+    /**
+     * The same scene again with IMPROVED TRANSPARENCY on, which is the
+     * 26.2 spelling of what used to be called fabulous graphics.
+     *
+     * <p>WHY THIS EXISTS. docs/VANILLA-FRAME-PATH.md wave-4 deviation (d)
+     * recorded this path as simply untested: the drawer asks
+     * {@code ChunkSectionLayerGroup.TRANSLUCENT.outputTarget()} for its
+     * target, which is generically whatever vanilla would have drawn into,
+     * but the harness has only ever run the default graphics mode, so the
+     * separate-translucent-target branch had never once executed. Untested
+     * is not the same as broken, and gating a feature that might work fine
+     * would have been the wrong fix, so this runs it instead.
+     *
+     * <p>The mechanism, traced through the 26.2 jar rather than assumed:
+     * {@code Options.improvedTransparency()} is read per frame by
+     * {@code GameRenderer} into {@code OptionsRenderState}, which becomes
+     * {@code GameRenderState.useShaderTransparency()}, which is the only
+     * thing gating {@code LevelRenderer.getTransparencyChain()}, which in
+     * turn is what makes the frame graph allocate the internal
+     * "translucent" target and {@code translucentTarget()} return non-null.
+     * No restart is needed; the option takes effect on the next frame.
+     *
+     * <p>Note there is no {@code GraphicsStatus} in 26.2 any more. FABULOUS
+     * survives as a {@code GraphicsPreset}, but the preset is a bundle of
+     * several toggles, and the one that actually moves terrain to a
+     * different render target is this single boolean. Flipping it directly
+     * keeps the test aimed at the thing under test.
+     */
+    private static void assertFabulousTransparency(ClientGameTestContext context) {
+        boolean[] restore = new boolean[1];
+        context.runOnClient(client -> {
+            restore[0] = client.options.improvedTransparency().get();
+            client.options.improvedTransparency().set(true);
+        });
+        try {
+            // Prove the branch is REALLY active before grading anything,
+            // otherwise this passes by drawing the ordinary path twice and
+            // calling it fabulous coverage.
+            //
+            // It has to be measured from INSIDE the frame. The first version
+            // of this waited on LevelRenderer.translucentTarget() != null and
+            // timed out, which looked like the feature failing and was
+            // actually the test being wrong: LevelTargetBundle.clear() runs
+            // at the end of every frame (LevelRenderer.renderLevel, javap
+            // offset 586), so that getter reads null between frames on every
+            // graphics setting there is. The drawer counts it at the point
+            // it picks its target instead.
+            long separateBefore = TerrainDrawer.translucentSeparateTargetFrames();
+            quiesce(context);
+            context.waitFor(
+                    client -> TerrainDrawer.translucentSeparateTargetFrames() > separateBefore,
+                    DRAW_TIMEOUT_TICKS);
+
+            long framesBefore = TerrainDrawer.translucentFrames();
+            context.waitFor(client -> TerrainDrawer.translucentFrames() > framesBefore
+                    && TerrainDrawer.lastTranslucentSections() > 0
+                    && TerrainDrawer.lastTranslucentDraws() > 0
+                    && TerrainDrawer.cancelledTranslucentGroups() > 0, DRAW_TIMEOUT_TICKS);
+            assertNoErrors();
+            context.takeScreenshot(TestScreenshotOptions.of("62_meshelium_translucent_fabulous"));
+
+            // The vanilla twin on the SAME path, so the pair isolates the
+            // renderer rather than the graphics setting.
+            context.runOnClient(client -> System.setProperty(TerrainDrawer.PROPERTY, "false"));
+            context.waitTicks(3);
+            long framesAtFlip = TerrainDrawer.translucentFrames();
+            context.takeScreenshot(
+                    TestScreenshotOptions.of("63_vanilla_translucent_fabulous_reference"));
+            context.waitTicks(3);
+            if (TerrainDrawer.translucentFrames() != framesAtFlip) {
+                throw new AssertionError("translucent drawer kept running after the flip - "
+                        + "shot 63 is not a clean vanilla reference");
+            }
+            assertNoErrors();
+            context.runOnClient(client -> System.setProperty(TerrainDrawer.PROPERTY, "true"));
+            context.waitFor(client -> TerrainDrawer.translucentFrames() > framesAtFlip,
+                    DRAW_TIMEOUT_TICKS);
+            assertNoErrors();
+        } finally {
+            // Leave the option as found: later assertions in this class run
+            // against the default graphics path and must not inherit this.
+            context.runOnClient(client -> client.options.improvedTransparency().set(restore[0]));
+        }
     }
 
     /**

@@ -88,7 +88,15 @@ public final class MesheliumTerrainResidencyTest implements FabricClientGameTest
         // Wave-14: the snapshot's arenaBytes is the INITIAL size and the
         // arena is elastic — capacity equals it until the first growth,
         // never falls below it.
-        long expectedInitial = com.deds.meshelium.MesheliumScaling.arenaInitialBytes();
+        //
+        // Multi-buffer: block 0 is capped at the block size, so the initial
+        // capacity is min(initial, blockBytes). On real hardware the block
+        // is 2 GiB and this changes nothing (256 MiB initial is far below
+        // it); it only differs under -Dmeshelium.tune.arenaBlockMiB, the
+        // knob that exists precisely to force the multi-block paths to run.
+        long expectedInitial = Math.min(
+                com.deds.meshelium.MesheliumScaling.arenaInitialBytes(),
+                com.deds.meshelium.MesheliumScaling.arenaBlockBytes());
         if (c.arenaCapacityBytes() < expectedInitial) {
             throw new AssertionError("arena capacity " + c.arenaCapacityBytes()
                     + " below the initial " + expectedInitial + ": " + c);

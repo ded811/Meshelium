@@ -3,14 +3,15 @@
 	"id": "meshelium",
 	"version": "${version}",
 	"name": "Meshelium",
-	"description": "Mesh-shader terrain rendering for every GPU that has them. A cross-vendor reimplementation of Nvidium's renderer on Minecraft's Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. Original renderer and architecture by MCRcortex, and all credit for the design to them.",
+	"description": "Mesh-shader terrain rendering for every GPU that has them, on Minecraft's own Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. See a great deal further without the game falling over.",
 	"authors": [
 		"Ded811"
 	],
-	"contributors": [
-		"MCRcortex (original Nvidium)"
-	],
-	"contact": {},
+	"contact": {
+		"homepage": "https://modrinth.com/mod/meshelium",
+		"sources": "https://github.com/ded811/Meshelium",
+		"issues": "https://github.com/ded811/Meshelium/issues"
+	},
 	"license": "LGPL-3.0-only",
 	"icon": "assets/meshelium/icon.png",
 	"environment": "client",

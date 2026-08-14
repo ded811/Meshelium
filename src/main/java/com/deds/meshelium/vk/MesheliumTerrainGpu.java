@@ -5,6 +5,7 @@
 package com.deds.meshelium.vk;
 
 import com.deds.meshelium.MesheliumScaling;
+import com.deds.meshelium.MesheliumVramState;
 import com.deds.meshelium.fabric.MesheliumClient;
 import com.deds.meshelium.fabric.mixin.GpuDeviceAccessor;
 import com.deds.meshelium.terrain.RegionRecord;
@@ -109,6 +110,9 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
      */
     static final int STAGING_BYTES = 32 << 20;
 
+    /** Budget re-sample interval. Seconds, because that is how fast it moves. */
+    private static final long BUDGET_SAMPLE_INTERVAL_NANOS = 1_000_000_000L;
+
     private final VulkanCommandEncoder encoder;
     private final long vma;
 
@@ -191,26 +195,104 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
         MesheliumScaling.pinForWorld(
                 net.minecraft.client.Minecraft.getInstance().options.renderDistance().get());
         com.deds.meshelium.MesheliumExtendedRd.onWorldPinned();
+        // Arm the upload seam HERE and nowhere else. Vanilla's heaps only
+        // release when an allocator is completely free, so suppressing
+        // mid-session frees nothing; the saving comes from heaps never
+        // being committed in the first place, which means arming before
+        // the world has any.
+        com.deds.meshelium.terrain.host.VanillaUploadSeam.armForNewWorld();
 
+        // EVERY allocation below is unwound if a LATER one throws. Without
+        // this the standup was a leak waiting for a full card: the object
+        // that owns these handles is not constructed until the end, so a
+        // throw at the staging ring stranded the arena and both record
+        // buffers with no surviving reference to free them by - hundreds of
+        // megabytes, invisible, for the rest of the process. It is
+        // unreachable while allocations succeed, which is exactly why it
+        // has never been seen, and it becomes reachable the moment the
+        // ceiling goes up. The split multiplies the surface by N.
+        //
+        // Direct destroys, not encoder.queueForDestroy: nothing here has
+        // ever been referenced by a command buffer, so there is no fence to
+        // respect, and the deferred queue may not be usable if the failure
+        // happened during standup.
         VkArenaBacking arenaBacking = new VkArenaBacking(vma);
-        // The TerrainArena ctor calls arenaBacking.allocate(arenaBytes).
-        long arenaBytes = arenaBytes();
-        TerrainArena arena =
-                new TerrainArena(arenaBacking, arenaBytes, TerrainVertexCodec.VERTEX_STRIDE);
-        long regionBytes = RegionRecord.regionBufferBytes(TerrainResidency.maxRegions());
-        long sectionBytes = SectionRecord.sectionBufferBytes(TerrainResidency.maxRegions());
-        MesheliumVkBuffers.DeviceBuffer regionBuffer = MesheliumVkBuffers.createDeviceLocal(vma,
-                regionBytes, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                "vmaCreateBuffer(meshelium region records)");
-        MesheliumVkBuffers.DeviceBuffer sectionBuffer = MesheliumVkBuffers.createDeviceLocal(vma,
-                sectionBytes, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                "vmaCreateBuffer(meshelium section records)");
-        VkStagingRing ring = VkStagingRing.create(vma, STAGING_BYTES);
+        MesheliumVkBuffers.DeviceBuffer regionBuffer = null;
+        MesheliumVkBuffers.DeviceBuffer sectionBuffer = null;
+        VkStagingRing ring = null;
+        boolean handedOff = false;
+        try {
+            // The TerrainArena ctor calls arenaBacking.allocate(arenaBytes).
+            long arenaBytes = arenaBytes();
+            TerrainArena arena = new TerrainArena(arenaBacking, arenaBytes,
+                    TerrainVertexCodec.VERTEX_STRIDE,
+                    MesheliumScaling.arenaBlockBytes(), MesheliumScaling.arenaBlockCount());
+            long regionBytes = RegionRecord.regionBufferBytes(TerrainResidency.maxRegions());
+            long sectionBytes = SectionRecord.sectionBufferBytes(TerrainResidency.maxRegions());
+            regionBuffer = MesheliumVkBuffers.createDeviceLocal(vma,
+                    regionBytes, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    "vmaCreateBuffer(meshelium region records)");
+            sectionBuffer = MesheliumVkBuffers.createDeviceLocal(vma,
+                    sectionBytes, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    "vmaCreateBuffer(meshelium section records)");
+            ring = VkStagingRing.create(vma, STAGING_BYTES);
 
-        MesheliumTerrainGpu gpu =
-                new MesheliumTerrainGpu(device, encoder, arenaBacking, regionBuffer, sectionBuffer, ring);
-        gpu.recordCapacityRegions = TerrainResidency.maxRegions();
-        gpu.zeroInitialize(regionBytes, sectionBytes);
+            MesheliumTerrainGpu gpu = new MesheliumTerrainGpu(
+                    device, encoder, arenaBacking, regionBuffer, sectionBuffer, ring);
+            gpu.recordCapacityRegions = TerrainResidency.maxRegions();
+            gpu.zeroInitialize(regionBytes, sectionBytes);
+            handedOff = true; // gpu owns all of it from here; destroy() frees it
+            return finishCreate(gpu, arena, arenaBytes, regionBytes, sectionBytes,
+                    sectionBuffer, device);
+        } finally {
+            if (!handedOff) {
+                releasePartialStandup(vma, arenaBacking, regionBuffer, sectionBuffer, ring);
+            }
+        }
+    }
+
+    /**
+     * Unwind a standup that threw part-way. Each step is independently
+     * guarded: one failing destroy must not strand the buffers after it,
+     * because this only ever runs when something has already gone wrong.
+     */
+    private static void releasePartialStandup(long vma, VkArenaBacking arenaBacking,
+            MesheliumVkBuffers.DeviceBuffer regionBuffer,
+            MesheliumVkBuffers.DeviceBuffer sectionBuffer, VkStagingRing ring) {
+        MesheliumClient.LOGGER.warn("Meshelium terrain standup failed part-way - releasing "
+                + "whatever was already allocated so it does not leak for the process lifetime");
+        try {
+            for (long[] block : arenaBacking.takeAllForDestroy()) {
+                if (block[0] != 0L) {
+                    MesheliumVkBuffers.destroy(vma, block[0], block[1]);
+                }
+            }
+        } catch (Throwable t) {
+            MesheliumClient.LOGGER.warn("Meshelium: arena backing release failed during unwind", t);
+        }
+        for (MesheliumVkBuffers.DeviceBuffer b : new MesheliumVkBuffers.DeviceBuffer[] {
+                regionBuffer, sectionBuffer }) {
+            if (b == null) {
+                continue;
+            }
+            try {
+                MesheliumVkBuffers.destroy(vma, b.vkBuffer(), b.allocation());
+            } catch (Throwable t) {
+                MesheliumClient.LOGGER.warn("Meshelium: record buffer release failed during unwind", t);
+            }
+        }
+        if (ring != null) {
+            try {
+                ring.destroy();
+            } catch (Throwable t) {
+                MesheliumClient.LOGGER.warn("Meshelium: staging ring release failed during unwind", t);
+            }
+        }
+    }
+
+    private static MesheliumTerrainGpu finishCreate(MesheliumTerrainGpu gpu, TerrainArena arena,
+            long arenaBytes, long regionBytes, long sectionBytes,
+            MesheliumVkBuffers.DeviceBuffer sectionBuffer, VulkanDevice device) {
         // The section-records buffer handle rides along for wave 5's task
         // stage (opaque long — the host package stays LWJGL-free).
         TerrainResidency.attachArena(arena, sectionBuffer.vkBuffer());
@@ -243,6 +325,10 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
     @Override
     public boolean beginFrame(long frame) {
         currentFrame = frame;
+        long now = System.nanoTime();
+        if (now - MesheliumVramState.lastSampleNanos() >= BUDGET_SAMPLE_INTERVAL_NANOS) {
+            MeshShaderDeviceSupport.refreshMemoryBudget(now);
+        }
         // Wave-14: destroy outgrown arena backings whose last possible
         // reader (frames in flight at park time, incl. the old→new copy
         // itself) has provably completed — the FREE_FRAME_LAG derivation.
@@ -280,13 +366,13 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
     }
 
     @Override
-    public boolean stageArenaCopy(ByteBuffer data, long arenaByteOffset) {
-        return stage(data, arenaByteOffset, arenaCopies);
+    public boolean stageArenaCopy(ByteBuffer data, int block, long blockByteOffset) {
+        return stage(data, blockByteOffset, arenaCopies, block);
     }
 
     @Override
-    public boolean stageArenaCopyLate(ByteBuffer data, long arenaByteOffset) {
-        return stage(data, arenaByteOffset, arenaLateCopies);
+    public boolean stageArenaCopyLate(ByteBuffer data, int block, long blockByteOffset) {
+        return stage(data, blockByteOffset, arenaLateCopies, block);
     }
 
     @Override
@@ -300,6 +386,16 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
     }
 
     private boolean stage(ByteBuffer data, long dstOffset, List<long[]> copies) {
+        return stage(data, dstOffset, copies, 0);
+    }
+
+    /**
+     * @param block destination arena block. Carried in the tuple because an
+     *        arena copy's offset is meaningless without knowing WHICH buffer
+     *        it indexes; the record/section copies always target one buffer
+     *        and pass 0.
+     */
+    private boolean stage(ByteBuffer data, long dstOffset, List<long[]> copies, int block) {
         int size = data.remaining();
         if (size <= 0) {
             return true;
@@ -311,7 +407,7 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
         // Heap-safe copy into the persistent mapping (geometry and mirrors
         // are heap buffers; memByteBuffer wraps the mapped range).
         MemoryUtil.memByteBuffer(ring.mappedAddress() + srcOffset, size).put(data.duplicate());
-        copies.add(new long[] {srcOffset, dstOffset, size});
+        copies.add(new long[] {srcOffset, dstOffset, size, block});
         return true;
     }
 
@@ -346,8 +442,28 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
      * lineage this arena already ports.</p>
      */
     @Override
+    public void onArenaBlockAppended(long blockBytes) {
+        // Zero the fresh block. Its bytes are undefined out of VMA, and
+        // while nothing should ever read an unallocated range, "should" is
+        // what the wave-14 bug was made of: a defined zero reads back as an
+        // empty section rather than as arbitrary geometry.
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkCommandBuffer cb = encoder.allocateAndBeginTransientCommandBuffer();
+            VK10.vkCmdFillBuffer(cb, arenaBacking.lastBlockBuffer(), 0, blockBytes, 0);
+            VulkanCommandEncoder.memoryBarrier(cb, stack);
+            checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(meshelium arena append)");
+            encoder.execute(cb);
+        }
+        MesheliumClient.LOGGER.info(
+                "Meshelium terrain arena APPENDED a {} MiB block (no copy, no retirement - every "
+                        + "existing address keeps its meaning; total {} MiB across {} blocks, "
+                        + "ceiling {} MiB)",
+                blockBytes >> 20, arenaBacking.sizeBytes() >> 20, arenaBacking.blockCount(),
+                MesheliumScaling.arenaCeilingBytes() >> 20);
+    }
+
     public long growArena(long newSizeBytes) {
-        long oldSize = arenaBacking.sizeBytes();
+        long oldSize = arenaBacking.lastBlockBytes();
         if (newSizeBytes <= oldSize) {
             return 0L;
         }
@@ -366,7 +482,7 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
                 VK10.vkCmdFillBuffer(cb, grown.vkBuffer(), oldSize, newSizeBytes - oldSize, 0);
                 VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
                 region.get(0).srcOffset(0).dstOffset(0).size(oldSize);
-                VK10.vkCmdCopyBuffer(cb, arenaBacking.vkBuffer(), grown.vkBuffer(), region);
+                VK10.vkCmdCopyBuffer(cb, arenaBacking.lastBlockBuffer(), grown.vkBuffer(), region);
                 VulkanCommandEncoder.memoryBarrier(cb, stack);
                 checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(meshelium arena growth)");
                 encoder.execute(cb);
@@ -534,7 +650,7 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
                 // the same bytes (WAW needs an explicit dependency).
                 VulkanCommandEncoder.memoryBarrier(cb, stack);
             }
-            recordCopies(cb, stack, arenaCopies, arenaBacking.vkBuffer());
+            recordArenaCopies(cb, stack, arenaCopies);
             recordCopies(cb, stack, sectionCopies, sectionBuffer.vkBuffer());
             recordCopies(cb, stack, regionCopies, regionBuffer.vkBuffer());
             if (!arenaLateCopies.isEmpty()) {
@@ -542,7 +658,7 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
                 // overwrite bytes the normal batch just wrote for the same
                 // section — barrier makes the WAW an ordered dependency.
                 VulkanCommandEncoder.memoryBarrier(cb, stack);
-                recordCopies(cb, stack, arenaLateCopies, arenaBacking.vkBuffer());
+                recordArenaCopies(cb, stack, arenaLateCopies);
             }
             VulkanCommandEncoder.memoryBarrier(cb, stack);
             checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(meshelium terrain pump)");
@@ -557,6 +673,39 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
     }
 
     /** Batch one vkCmdCopyBuffer per destination, ≤256 regions per call (stack budget). */
+    /**
+     * Arena copies, routed to the block each one names.
+     *
+     * <p>Grouped by destination rather than issued one at a time: sections
+     * stream in bursts and almost all of a pump's copies land in the same
+     * block, so this is normally one vkCmdCopyBuffer batch exactly like
+     * before the split. It costs a pass over the list to partition, which
+     * is nothing beside the copies themselves.</p>
+     */
+    private void recordArenaCopies(VkCommandBuffer cb, MemoryStack stack, List<long[]> copies) {
+        if (copies.isEmpty()) {
+            return;
+        }
+        long[] handles = arenaBacking.blockHandles();
+        int blocks = handles.length;
+        if (blocks == 1) {
+            recordCopies(cb, stack, copies, handles[0]);
+            return;
+        }
+        List<long[]> perBlock = new ArrayList<>();
+        for (int b = 0; b < blocks; b++) {
+            perBlock.clear();
+            for (long[] copy : copies) {
+                if ((int) copy[3] == b) {
+                    perBlock.add(copy);
+                }
+            }
+            if (!perBlock.isEmpty()) {
+                recordCopies(cb, stack, perBlock, handles[b]);
+            }
+        }
+    }
+
     private void recordCopies(VkCommandBuffer cb, MemoryStack stack, List<long[]> copies, long dst) {
         for (int start = 0; start < copies.size(); start += 256) {
             int n = Math.min(256, copies.size() - start);
@@ -576,7 +725,13 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
      * vanilla calls {@code dispose()} there (LevelRenderer teardown).
      */
     void destroy() {
-        long[] arenaHandles = arenaBacking.takeForDestroy();
+        // EVERY block, not block 0. takeForDestroy() returned only the first
+        // pair while takeAllForDestroy() underneath it CLEARED the whole
+        // list, so blocks 1..N-1 were dropped on the floor: their VkBuffers
+        // and VMA allocations were never destroyed. At 512 MiB a block that
+        // is the entire arena minus one block leaked on every world exit,
+        // and a long-render-distance session leaked gigabytes per rejoin.
+        long[][] arenaHandles = arenaBacking.takeAllForDestroy();
         // Wave-14: outgrown backings still inside their fence lag ride the
         // same deferred-destroy rotation (their last reader is in flight
         // by definition of the lag — exactly what queueForDestroy fences).
@@ -584,7 +739,9 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
         retiredBackings.clear();
         long vmaHandle = this.vma;
         encoder.queueForDestroy(() -> {
-            MesheliumVkBuffers.destroy(vmaHandle, arenaHandles[0], arenaHandles[1]);
+            for (long[] block : arenaHandles) {
+                MesheliumVkBuffers.destroy(vmaHandle, block[0], block[1]);
+            }
             for (long[] old : parked) {
                 MesheliumVkBuffers.destroy(vmaHandle, old[1], old[2]);
             }
@@ -603,8 +760,9 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
      * {@code vmaDestroyAllocator}.
      */
     void destroyNow() {
-        long[] arenaHandles = arenaBacking.takeForDestroy();
-        MesheliumVkBuffers.destroy(vma, arenaHandles[0], arenaHandles[1]);
+        for (long[] block : arenaBacking.takeAllForDestroy()) {
+            MesheliumVkBuffers.destroy(vma, block[0], block[1]);
+        }
         while (!retiredBackings.isEmpty()) { // wave-14: legal only post-waitIdle
             long[] old = retiredBackings.pollFirst();
             MesheliumVkBuffers.destroy(vma, old[1], old[2]);

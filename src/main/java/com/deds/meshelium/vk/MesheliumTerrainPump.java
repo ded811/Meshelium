@@ -37,6 +37,15 @@ public final class MesheliumTerrainPump {
     private static boolean broken;             // render thread only
     private static MesheliumTerrainGpu gpu;      // render thread only
 
+    /**
+     * Frames left before the arena is handed back regardless of stragglers.
+     * Re-armed every time the arena stands up, so each switch-off gets a
+     * fresh countdown. Generous, because the release storm has to reach us
+     * through vanilla's section reset first.
+     */
+    private static final int DISABLED_RELEASE_FRAMES = 120;
+    private static int disabledFramesLeft = DISABLED_RELEASE_FRAMES;
+
     private MesheliumTerrainPump() {}
 
     public static void afterVanillaTerrainUpload() {
@@ -44,11 +53,22 @@ public final class MesheliumTerrainPump {
             return;
         }
         try {
+            if (!com.deds.meshelium.MesheliumConfig.terrainRenderingConfigured()) {
+                // Meshelium is switched off. Until now that stopped only the
+                // DRAW: the build tap kept encoding and this pump kept
+                // uploading, so Meshelium held a complete arena copy of a
+                // world it was not drawing, for the whole session. That is
+                // not a swap transient, it is the steady state, and it is
+                // where the doubled VRAM actually came from.
+                releaseWhileDisabled();
+                return;
+            }
             if (gpu == null) {
                 gpu = MesheliumTerrainGpu.create();
                 if (gpu == null) {
                     return; // device facade not up yet; retry next frame
                 }
+                disabledFramesLeft = DISABLED_RELEASE_FRAMES;
             }
             TerrainResidency.pump(gpu);
         } catch (GpuDeviceLossException t) {
@@ -68,6 +88,77 @@ public final class MesheliumTerrainPump {
             MesheliumClient.LOGGER.error(
                     "Meshelium terrain pump failed; residency disabled for this session", t);
         }
+    }
+
+    /**
+     * Hand the arena back while the master switch is off.
+     *
+     * <p>Ordering is the whole of the safety here, and two of the three
+     * rules cost a permanently empty world if broken:</p>
+     *
+     * <ul>
+     *   <li>Only AFTER the invalidation has emptied us. The master-switch
+     *   edge issues an {@code allChanged()}, whose release storm frees every
+     *   Meshelium range and installs a new ViewArea. Destroying before that
+     *   lands would strand sections that are already compiled: vanilla never
+     *   recompiles them, so the build tap never re-encodes them, and
+     *   Meshelium's half never returns. Hence the wait for an empty
+     *   residency with no frees still in flight.</li>
+     *   <li>Never {@code disposeAndReset()}, which resets the seam. See
+     *   {@link TerrainResidency#disposeAndResetKeepingSeam()}.</li>
+     *   <li>Idempotent. Once the arena is gone this is a null check per
+     *   frame, and standup stays blocked by the same config test above, so
+     *   nothing re-allocates until the switch comes back.</li>
+     * </ul>
+     */
+    private static void releaseWhileDisabled() {
+        if (gpu == null) {
+            return; // already handed back, or never stood up
+        }
+        // KEEP PUMPING WHILE DRAINING. The release storm frees every range,
+        // but those frees retire through the pump's own epoch rotation, so
+        // an early return here freezes the drain at whatever it was and the
+        // condition below can never come true: the arena would be held for
+        // the rest of the world by the very code written to hand it back.
+        // With the build tap gated off there is nothing left to upload, so
+        // this call now only retires.
+        TerrainResidency.pump(gpu);
+        TerrainResidency.Counters c = TerrainResidency.counters();
+        boolean drained = c.sectionsResident() == 0 && c.pendingFreeRanges() == 0
+                && c.stagingBacklogEntries() == 0;
+        if (!drained && --disabledFramesLeft > 0) {
+            return; // still draining, and the deadline has not run out
+        }
+        // THE DEADLINE IS NOT A SHORTCUT, IT IS THE CORRECT RULE.
+        //
+        // Waiting for a perfectly empty store looked right and is not
+        // reachable: the harness sees a handful of sections survive the
+        // release storm every time, and a condition that is usually but not
+        // always true means the arena is usually but not always handed back,
+        // which is the same as not handing it back.
+        //
+        // Holding them is pointless anyway. With Meshelium switched off
+        // nothing it holds can ever be drawn, and every route back on issues
+        // its own invalidation, so the stragglers are re-encoded from
+        // scratch. The fence safety that actually matters is not this
+        // counter: it is gpu.destroy() deferring through vanilla's own
+        // destroy rotation.
+        if (!drained) {
+            MesheliumClient.LOGGER.debug(
+                    "Meshelium released its arena with {} section(s) still resident; they cannot "
+                            + "be drawn while it is switched off and the switch back on rebuilds "
+                            + "them", c.sectionsResident());
+        }
+        MesheliumTerrainGpu dying = gpu;
+        gpu = null;
+        TerrainResidency.Counters snapshot = TerrainResidency.disposeAndResetKeepingSeam();
+        dying.destroy();
+        TerrainDrawer.onDispatcherDispose();
+        MesheliumClient.LOGGER.info(
+                "Meshelium terrain rendering was switched off, so its {} MiB arena went back to "
+                        + "the graphics card rather than sitting there holding a copy of a world "
+                        + "it is not drawing. Switching it back on reloads the terrain",
+                snapshot.arenaCapacityBytes() >> 20);
     }
 
     public static void onDispatcherDispose() {

@@ -9,6 +9,9 @@ import com.deds.meshelium.terrain.TerrainArena;
 
 import org.lwjgl.vulkan.VK10;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
  * The wave-3b filling of wave 3a's one-method {@link ArenaBacking} seam:
  * one device-local VkBuffer backing the whole terrain-quad arena, created
@@ -41,10 +44,13 @@ import org.lwjgl.vulkan.VK10;
  */
 public final class VkArenaBacking implements ArenaBacking {
 
+    private static final int USAGE = VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+            | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT
+            | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+
     private final long vma;
-    private long vkBuffer;
-    private long allocation;
-    private long sizeBytes;
+    /** One entry per block: {vkBuffer, allocation, sizeBytes}. */
+    private final List<long[]> blocks = new ArrayList<>();
 
     public VkArenaBacking(long vma) {
         this.vma = vma;
@@ -52,28 +58,70 @@ public final class VkArenaBacking implements ArenaBacking {
 
     @Override
     public long allocate(long sizeBytes) {
-        if (vkBuffer != 0L) {
+        if (!blocks.isEmpty()) {
             throw new IllegalStateException("arena backing allocated twice");
         }
         // TRANSFER_SRC joined in wave 14: every arena backing must be
         // READABLE by the next growth's old→new vkCmdCopyBuffer (usage
         // bits are free — they change no memory-type decision here).
         MesheliumVkBuffers.DeviceBuffer buffer = MesheliumVkBuffers.createDeviceLocal(vma, sizeBytes,
-                VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                        | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                "vmaCreateBuffer(meshelium terrain arena)");
-        this.vkBuffer = buffer.vkBuffer();
-        this.allocation = buffer.allocation();
-        this.sizeBytes = sizeBytes;
+                USAGE, "vmaCreateBuffer(meshelium terrain arena)");
+        blocks.add(new long[] {buffer.vkBuffer(), buffer.allocation(), sizeBytes});
         return buffer.vkBuffer();
     }
 
-    long vkBuffer() {
-        return vkBuffer;
+    /**
+     * Allocate an additional block. Returns 0 rather than throwing when the
+     * card is full: growth exhaustion is an ordinary outcome the caller
+     * degrades on, not an error.
+     */
+    @Override
+    public long appendBlock(long sizeBytes) {
+        try {
+            MesheliumVkBuffers.DeviceBuffer buffer = MesheliumVkBuffers.createDeviceLocal(
+                    vma, sizeBytes, USAGE,
+                    "vmaCreateBuffer(meshelium terrain arena block " + blocks.size() + ")");
+            blocks.add(new long[] {buffer.vkBuffer(), buffer.allocation(), sizeBytes});
+            return buffer.vkBuffer();
+        } catch (MesheliumVkBuffers.OutOfDeviceMemoryException e) {
+            return 0L;
+        }
     }
 
+    /** Block 0's buffer, for the callers that only need "is there an arena". */
+    long vkBuffer() {
+        return blocks.isEmpty() ? 0L : blocks.get(0)[0];
+    }
+
+    /** Every block's VkBuffer, index == block. */
+    long[] blockHandles() {
+        long[] out = new long[blocks.size()];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = blocks.get(i)[0];
+        }
+        return out;
+    }
+
+    int blockCount() {
+        return blocks.size();
+    }
+
+    /** Total committed bytes across all blocks. */
     long sizeBytes() {
-        return sizeBytes;
+        long total = 0;
+        for (long[] b : blocks) {
+            total += b[2];
+        }
+        return total;
+    }
+
+    /** Physical size of the LAST block, the one grow-and-copy extends. */
+    long lastBlockBytes() {
+        return blocks.isEmpty() ? 0L : blocks.get(blocks.size() - 1)[2];
+    }
+
+    long lastBlockBuffer() {
+        return blocks.isEmpty() ? 0L : blocks.get(blocks.size() - 1)[0];
     }
 
     /**
@@ -86,18 +134,33 @@ public final class VkArenaBacking implements ArenaBacking {
      * {@link #allocate(long)}.
      */
     long[] swapForGrowth(MesheliumVkBuffers.DeviceBuffer grown, long grownSizeBytes) {
-        long[] old = {vkBuffer, allocation, sizeBytes};
-        this.vkBuffer = grown.vkBuffer();
-        this.allocation = grown.allocation();
-        this.sizeBytes = grownSizeBytes;
+        int last = blocks.size() - 1;
+        long[] old = blocks.get(last).clone();
+        blocks.set(last, new long[] {grown.vkBuffer(), grown.allocation(), grownSizeBytes});
         return old;
     }
 
-    /** Handles for the deferred-destroy queue; zeroes the fields. */
-    long[] takeForDestroy() {
-        long[] handles = {vkBuffer, allocation};
-        vkBuffer = 0L;
-        allocation = 0L;
-        return handles;
+    /**
+     * Handles for the deferred-destroy queue; empties the block list.
+     *
+     * <p>Returns a FLAT {buffer, allocation} pair per block. The caller
+     * destroys each pair; missing one leaks a whole block, which is why
+     * this empties the list rather than leaving stale entries behind.</p>
+     */
+    long[][] takeAllForDestroy() {
+        long[][] out = new long[blocks.size()][];
+        for (int i = 0; i < out.length; i++) {
+            out[i] = new long[] {blocks.get(i)[0], blocks.get(i)[1]};
+        }
+        blocks.clear();
+        return out;
     }
+
+    // takeForDestroy() is deliberately gone. It read as a convenience for
+    // "the legacy single-buffer destroy paths" and was in fact a leak: it
+    // called takeAllForDestroy(), which EMPTIES this list, and then returned
+    // block 0 alone. Every other block was silently unreferenced and never
+    // destroyed. All three callers wanted every block, and the javadoc
+    // above already said missing one leaks a whole block. There is now one
+    // way to do this and it hands back all of them.
 }

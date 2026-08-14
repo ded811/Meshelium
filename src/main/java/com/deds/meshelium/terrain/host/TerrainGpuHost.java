@@ -43,7 +43,7 @@ public interface TerrainGpuHost {
     long stagingUsedBytes();
 
     /** Geometry bytes → terrain arena at {@code arenaByteOffset}. */
-    boolean stageArenaCopy(ByteBuffer data, long arenaByteOffset);
+    boolean stageArenaCopy(ByteBuffer data, int block, long blockByteOffset);
 
     /**
      * Wave-7: like {@link #stageArenaCopy} but recorded in the LATE copy
@@ -52,7 +52,7 @@ public interface TerrainGpuHost {
      * (a resorted prefix over a fresh section upload) is WAW-ordered.
      * Resort prefix re-uploads always travel here.
      */
-    boolean stageArenaCopyLate(ByteBuffer data, long arenaByteOffset);
+    boolean stageArenaCopyLate(ByteBuffer data, int block, long blockByteOffset);
 
     /** Section-record bytes → section metadata buffer at {@code byteOffset}. */
     boolean stageSectionRecords(ByteBuffer data, long byteOffset);
@@ -77,6 +77,17 @@ public interface TerrainGpuHost {
      *         exhausted for this attempt)
      */
     long growArena(long newSizeBytes);
+
+    /**
+     * A new arena block was just committed by the allocator: zero it.
+     *
+     * <p>The allocation itself happens through the {@code ArenaBacking}
+     * seam, so this only has to make the fresh bytes DEFINED. Undefined VMA
+     * memory that something later reads is how the wave-14 bug looked from
+     * the outside, and a zeroed block reads back as an empty section rather
+     * than as arbitrary geometry.</p>
+     */
+    void onArenaBlockAppended(long blockBytes);
 
     /**
      * Wave-15: grow the region-record and section-record buffers to hold

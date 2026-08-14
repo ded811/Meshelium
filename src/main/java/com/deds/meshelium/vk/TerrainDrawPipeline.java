@@ -271,7 +271,18 @@ public final class TerrainDrawPipeline {
             int vkDepthFormat, int workgroupQuads, int taskWgSections, int visMaskRegions,
             boolean taskCull, boolean extendedLists, int transQuads) {
         boolean translucent = transQuads > 0;
+        // Arena block geometry. Frozen at device creation, never read from a
+        // live-flippable value: pipelines are built once and cached in
+        // statics for the device's lifetime, so the element count baked into
+        // the descriptor layout must match what these macros compiled.
+        int arenaBlocks = com.deds.meshelium.MesheliumScaling.arenaBlockCount();
+        long arenaBlockBytes = com.deds.meshelium.MesheliumScaling.arenaBlockBytes();
+        long quadsPerBlock = arenaBlockBytes / com.deds.meshelium.terrain.TerrainVertexCodec.QUAD_STRIDE;
+        int blockShift = Long.numberOfTrailingZeros(quadsPerBlock);
         Map<String, String> macros = Map.of(
+                "MESHELIUM_ARENA_BLOCKS", Integer.toString(arenaBlocks),
+                "MESHELIUM_ARENA_BLOCK_SHIFT", Integer.toString(blockShift),
+                "MESHELIUM_ARENA_BLOCK_MASK", Long.toUnsignedString(quadsPerBlock - 1) + "u",
                 "MESHELIUM_WG_SIZE", Integer.toString(workgroupQuads),
                 "MESHELIUM_TASK_WG_SIZE", Integer.toString(taskWgSections),
                 "MESHELIUM_VIS_UVEC4S", Integer.toString(visMaskRegions * 2),
@@ -322,7 +333,11 @@ public final class TerrainDrawPipeline {
             int bindingCount = taskCull ? 12 : (translucent ? 9 : 7);
             VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(bindingCount, stack);
             int sceneStages = taskCull ? (taskStage | meshStage | fragStage) : (meshStage | fragStage);
-            binding(bindings.get(0), 0, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, meshStage);
+            // Binding 0 is the arena, now one element per block. Compiled
+            // from the same MesheliumScaling.arenaBlockCount() the shader
+            // macros used, and both are frozen at device creation.
+            binding(bindings.get(0), 0, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, meshStage,
+                    com.deds.meshelium.MesheliumScaling.arenaBlockCount());
             binding(bindings.get(1), 1, VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sceneStages);
             binding(bindings.get(2), 2, VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, meshStage);
             binding(bindings.get(3), 3, VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, fragStage);
@@ -500,9 +515,21 @@ public final class TerrainDrawPipeline {
     }
 
     private static void binding(VkDescriptorSetLayoutBinding b, int index, int type, int stages) {
+        binding(b, index, type, stages, 1);
+    }
+
+    /**
+     * @param count descriptor ARRAY length. Only the terrain arena at
+     *        binding 0 uses anything but 1: it becomes one element per arena
+     *        block, and this count MUST equal MESHELIUM_ARENA_BLOCKS in the
+     *        shader that was compiled against this layout, or the module
+     *        indexes past the array.
+     */
+    private static void binding(VkDescriptorSetLayoutBinding b, int index, int type, int stages,
+            int count) {
         b.binding(index)
                 .descriptorType(type)
-                .descriptorCount(1)
+                .descriptorCount(count)
                 .stageFlags(stages);
     }
 
