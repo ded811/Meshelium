@@ -121,6 +121,87 @@ public final class MesheliumConfig {
     public boolean enableTerrainRendering = true;
 
     /**
+     * Stop vanilla uploading its own copy of the terrain that nothing draws.
+     *
+     * <p>DEFAULT ON as of schema v1. It shipped OFF, and the reason was never
+     * doubt about the saving - that is measured, vanilla's copy runs 1.3x to
+     * 2.6x Meshelium's whole arena. It was that vanilla's copy was the safety
+     * net every giving-up path fell back on, so suppressing it turned a bad
+     * frame into an empty world. It did exactly that, twice, in testing.</p>
+     *
+     * <p>What changed is that the net was replaced rather than removed. The
+     * renderers now hand over one at a time (dump one, load the other), the
+     * demotion runs from the client tick where nothing can skip it, and the
+     * whole round trip is covered by a test that asks the only honest
+     * question: after the handover, does the other renderer actually have
+     * geometry to draw. Against that, leaving this off costs gigabytes for
+     * nothing.</p>
+     *
+     * <p>Worth almost nothing at ordinary render distances, where vanilla's
+     * copy is a few hundred MiB, and worth gigabytes past 64 chunks.</p>
+     */
+    public boolean suppressVanillaUploads = true;
+
+    /**
+     * Schema version of the file on disk, for one-shot migrations.
+     *
+     * <p>Zero on purpose. Gson runs the field initialisers and then
+     * overwrites only the keys the file actually contains, so a file written
+     * before this field existed loads as 0 and a fresh install also starts at
+     * 0. Both then run every migration, which is correct as long as each
+     * migration is idempotent.</p>
+     *
+     * <p>This exists because the mod writes EVERY field on save. Changing a
+     * Java default therefore reaches nobody who has ever opened the settings:
+     * their file already contains the old value explicitly, and it wins. A
+     * default is only a real default for a brand new install.</p>
+     */
+    public int configVersion = 0;
+
+    /** Current schema version. Bump when adding a migration below. */
+    private static final int CURRENT_CONFIG_VERSION = 2;
+
+    /**
+     * Bring an older file up to the current schema. Returns true if anything
+     * changed and the file should be rewritten.
+     */
+    private boolean migrate() {
+        if (configVersion >= CURRENT_CONFIG_VERSION) {
+            return false;
+        }
+        if (configVersion < 1) {
+            // v1: duplicate-terrain freeing becomes the default.
+            //
+            // It shipped off because vanilla's copy was Meshelium's safety
+            // net and suppressing it turned a bad frame into an empty world.
+            // The sequenced swap replaced that net with something better: the
+            // renderers hand over one at a time, and the handover is covered
+            // by a round-trip test. Meanwhile the cost of leaving it off is
+            // gigabytes at long render distance, measured at 3264 MiB against
+            // a 2048 MiB arena. Off is no longer the cautious choice, it is
+            // just the expensive one.
+            //
+            // This overwrites an explicit false, which is normally rude. It
+            // is right here because no released build ever exposed this
+            // setting, so any false on disk is a leftover from testing rather
+            // than a considered choice.
+            suppressVanillaUploads = true;
+        }
+        if (configVersion < 2) {
+            // v2: distance fog defaults OFF rather than SCALED.
+            //
+            // Only reaches the handful of configs written by a build that
+            // shipped SCALED, since fogMode did not exist before that and an
+            // absent key already picks up the new default. Safe to overwrite
+            // for the same reason as v1: nobody has had time to form an
+            // opinion about a setting that is hours old.
+            fogMode = FogMode.OFF;
+        }
+        configVersion = CURRENT_CONFIG_VERSION;
+        return true;
+    }
+
+    /**
      * Wave-6 GPU occlusion culling. False = the wave-5 BFS visibility
      * feed, which is vanilla's own culling and is always correct, just
      * less aggressive. Overridden by the
@@ -210,6 +291,69 @@ public final class MesheliumConfig {
      */
     @Deprecated
     public boolean enableOcclusionCulling = false;
+
+    /**
+     * What to do about the outdoor distance haze.
+     *
+     * <h2>The problem this exists for</h2>
+     * <p>Minecraft 26.2 fogs terrain with two independent ramps combined by
+     * {@code max()} in fog.glsl. One is tied to render distance and is fine:
+     * it ends exactly at the horizon and its band is
+     * {@code clamp(horizon/10, 4, 64)} blocks, so past render distance 40 it
+     * is a fixed 64 blocks, four chunks, which is the soft edge that hides
+     * chunks popping in.</p>
+     *
+     * <p>The other is the atmospheric haze, and it is a FIXED ABSOLUTE
+     * DISTANCE that ignores render distance completely:
+     * {@code EnvironmentAttributes.FOG_END_DISTANCE}, default 1024 blocks.
+     * The Overworld dimension does not override it, no biome overrides it,
+     * nothing animates it. So it saturates at chunk 64 no matter how far you
+     * can see, and every chunk beyond that is drawn, lit, rasterised and
+     * then painted flat fog colour. At render distance 120 the horizon is
+     * 1920 blocks, so 56 chunks of the view are solid paint.</p>
+     *
+     * <p>Which is the opposite of the intuitive reading: the fog is not a
+     * percentage that grows with distance, it is a constant that the view
+     * outgrows. Below render distance 64 it sits beyond the horizon and
+     * nobody notices. Vanilla's own maximum is 32, so vanilla never had to
+     * care.</p>
+     */
+    public enum FogMode {
+        /** Leave Minecraft's fog exactly as it is. */
+        VANILLA,
+        /**
+         * Push the haze out with the view, so it always ends at the same
+         * fraction of the horizon. Never makes fog THICKER than vanilla:
+         * below render distance 64 the constant is already past the horizon
+         * and this changes nothing at all.
+         */
+        SCALED,
+        /** No outdoor distance haze. The render-distance edge fade stays. */
+        OFF
+    }
+
+    /**
+     * Default OFF, on the owner's call after seeing all three at render
+     * distance 120 (2026-08-14): "turning the fog off by default looks the
+     * best".
+     *
+     * <p>SCALED was the cautious choice and looking at it decided otherwise.
+     * The reason OFF is not the drastic option it sounds like is that it
+     * only removes the ATMOSPHERIC haze. The render-distance fade is a
+     * separate term this setting never touches, so the last four chunks
+     * still soften into the sky and chunks do not pop in against a hard
+     * edge. The owner's words for it: "it has a tiny bit around the edges
+     * still, but not like where a lot of the map is covered in a small
+     * amount of fog then a ton right at the edge".</p>
+     */
+    public FogMode fogMode = FogMode.OFF;
+
+    /** Where the haze finishes, as a percentage of how far you can see. */
+    public int fogEndPercent = 100;
+
+    public static final int MIN_FOG_END_PERCENT = 50;
+    public static final int MAX_FOG_END_PERCENT = 200;
+    public static final int DEFAULT_FOG_END_PERCENT = 100;
 
     /** How occlusion culling decides whether to run. */
     public enum OcclusionMode {
@@ -488,6 +632,31 @@ public final class MesheliumConfig {
     }
 
     /**
+     * The master switch as the PLAYER set it, ignoring the property override.
+     *
+     * <p>Deliberately different from {@link #terrainRenderingEnabled()}, and
+     * the distinction is load-bearing. Flipping the switch now performs a
+     * sequenced renderer swap: stop encoding, release the arena, reload the
+     * terrain so the other renderer fills in. That is right for a player
+     * clicking a button and completely wrong for {@code meshelium.terrainDraw},
+     * which the benchmark and the draw test flip on and off between frames to
+     * photograph the same scene both ways. Tearing the world down each time
+     * would break the twin comparison and cost seconds per flip.</p>
+     *
+     * <p>So: the property stays a cheap DRAW-level toggle, and only the config
+     * field drives the swap. For a real player, with no property set, the two
+     * are the same value.</p>
+     */
+    public static boolean terrainRenderingConfigured() {
+        return get().enableTerrainRendering;
+    }
+
+    /** {@code meshelium.suppressVanillaUploads} ?? {@link #suppressVanillaUploads}. */
+    public static boolean suppressVanillaUploads() {
+        return propertyOr("meshelium.suppressVanillaUploads", get().suppressVanillaUploads);
+    }
+
+    /**
      * Resolve occlusion culling for a frame at {@code effectiveRenderDistance}.
      *
      * <p>Precedence: {@code meshelium.terrainDraw.bfsOnly} (the harness pin;
@@ -512,6 +681,25 @@ public final class MesheliumConfig {
             case OFF -> false;
             case AUTO -> effectiveRenderDistance >= config.occlusionAutoMinRenderDistance;
         };
+    }
+
+    /** {@code meshelium.fogMode} ?? {@link #fogMode}. */
+    public static FogMode fogMode() {
+        String property = System.getProperty("meshelium.fogMode");
+        if (property != null) {
+            try {
+                return FogMode.valueOf(property.toUpperCase(java.util.Locale.ROOT));
+            } catch (IllegalArgumentException ignored) {
+                // A typo in a dev flag must not decide how the world looks.
+            }
+        }
+        return get().fogMode;
+    }
+
+    /** Clamped, because the file is hand-editable and the shader is not. */
+    public static int fogEndPercent() {
+        return Math.max(MIN_FOG_END_PERCENT,
+                Math.min(MAX_FOG_END_PERCENT, get().fogEndPercent));
     }
 
     /**
@@ -670,6 +858,12 @@ public final class MesheliumConfig {
         this.debugStats = d.debugStats;
         this.maxRenderDistance = d.maxRenderDistance;
         this.showVulkanPrompt = d.showVulkanPrompt;
+        this.fogMode = d.fogMode;
+        this.fogEndPercent = d.fogEndPercent;
+        // suppressVanillaUploads was missing here, so Reset To Defaults
+        // quietly left it wherever the player had put it. Every field with a
+        // row has to be listed or the button does not do what it says.
+        this.suppressVanillaUploads = d.suppressVanillaUploads;
         // Retention has no rows any more (Bobby owns that job since
         // 2026-08-11) but the fields are still live behind the config, so a
         // reset must cover them or "reset to defaults" would quietly leave
@@ -690,6 +884,12 @@ public final class MesheliumConfig {
                 try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
                     MesheliumConfig loaded = GSON.fromJson(reader, MesheliumConfig.class);
                     if (loaded != null) {
+                        if (loaded.migrate()) {
+                            MesheliumClient.LOGGER.info(
+                                    "Meshelium migrated {} to settings schema v{}", path,
+                                    CURRENT_CONFIG_VERSION);
+                            loaded.save();
+                        }
                         return loaded;
                     }
                 }
@@ -697,7 +897,9 @@ public final class MesheliumConfig {
         } catch (IOException | JsonParseException e) {
             MesheliumClient.LOGGER.warn("Could not read {}; starting from defaults", path, e);
         }
-        return new MesheliumConfig();
+        MesheliumConfig fresh = new MesheliumConfig();
+        fresh.migrate();
+        return fresh;
     }
 
     public void save() {

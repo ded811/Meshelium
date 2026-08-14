@@ -85,7 +85,16 @@ slider out.
 
 ## Thanks
 
-Meshelium exists because of [Nvidium](https://modrinth.com/mod/nvidium) by
-**MCRcortex**, who worked out how to hand Minecraft's terrain to the graphics
-card and proved you really could see for miles. Nvidium is NVIDIA only, so
-Meshelium rebuilds the idea for AMD and Intel as well. Go and star their project.
+[Nvidium](https://modrinth.com/mod/nvidium) by **MCRcortex** is why this was
+worth attempting. They pioneered mesh-shader terrain in Minecraft and proved
+you really could see for miles without the game falling over.
+
+Meshelium is its own mod, not a port of theirs. It targets a different
+extension, runs on Minecraft's Vulkan backend, and its architecture, memory
+model and culling are ours. Some shader logic is derived from Nvidium and says
+so in the header of each file it applies to, which is why Meshelium carries the
+same LGPL-3.0 licence.
+
+MCRcortex has no involvement in Meshelium, has not endorsed it, and is not
+responsible for anything it does. Any bug you find here is ours. Go and star
+their project anyway.

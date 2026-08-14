@@ -1,5 +1,122 @@
 # Changelog
 
+## 1.2.0
+
+**Minecraft's duplicate copy of the terrain is now freed, by default.**
+
+Minecraft kept a complete second copy of the world in graphics memory even
+though Meshelium was the one drawing it. Nothing ever read that copy. It was
+measured at 1.3 to 2.6 times the size of Meshelium's own terrain memory: on
+a spinning test at 64 chunks it was 3264 MB, and freeing it took total
+graphics memory for that scene from 5723 MB to 1883 MB. At 120 chunks the
+owner went from hitting a 15 GB wall to a comfortable 8.7 GB with everything
+loaded.
+
+The two renderers now hand over one at a time rather than overlapping, so
+switching Meshelium on or off reloads the terrain instead of briefly holding
+both copies at once. You will see chunks rebuild for a few seconds when you
+flip it. That is the trade, and it is what keeps an 8 GB card from being
+asked to hold two worlds.
+
+The setting is **Duplicate Terrain Memory** on the new Advanced screen, and
+it reads Freed or Kept rather than On or Off, because "Free Duplicate Terrain
+Memory: OFF" is not a sentence anyone can parse. Choose Kept only if another
+mod needs Minecraft's own terrain buffers.
+
+**Fixed: a graphics memory leak on every world exit.**
+
+If your terrain memory had grown past its first block, which it does at any
+long render distance, every block after the first was never handed back when
+you left the world. A session at 120 chunks leaked most of its terrain memory
+each time you quit to the menu, and it accumulated until you restarted the
+game. One line, three call sites, and the method that caused it is gone.
+
+**Fog now keeps up with how far you can see.**
+
+Minecraft fades distant terrain to fog at a fixed 1024 blocks, and that
+number ignores your render distance entirely. It was never a problem in
+vanilla, where the maximum is 32 chunks and the fog sits far beyond the
+horizon. Past 64 chunks it starts eating the world: at 120 chunks the
+furthest 56 chunks are loaded, meshed, culled, rasterised, and then painted
+flat fog colour.
+
+**Distance Fog** in the settings has three choices, and it now ships on
+**Off**, which turned out to look the best of the three at long range. Off
+removes the distance haze and keeps only the short fade right at the edge,
+which is the part that hides chunks appearing, so the horizon still softens
+instead of ending in a wall. Match View Distance keeps a haze but moves it
+out with your render distance, and never makes fog thicker than Minecraft
+would, so below 64 chunks it changes nothing at all; a slider sets where it
+finishes as a share of your view, labelled in blocks as well as percent.
+Minecraft Default leaves everything alone.
+
+Water, lava, the Nether, and boss fights are deliberately untouched. Reduced
+visibility is the point in all four.
+
+**Your render distance comes back when you switch Meshelium on again.**
+
+Turning Meshelium off pulls the distance down to 32, because Minecraft cannot
+draw further than that on its own. It now remembers what you had and puts it
+back when you turn Meshelium on. It will not overwrite a distance you chose
+yourself while it was off, and it still never restores after a memory backoff,
+which is a different situation and a deliberate one.
+
+**A settings screen you can read.**
+
+The rows that almost nobody should touch moved behind an **Advanced** button:
+duplicate terrain memory, debug logging, and the backend prompt. The main
+screen keeps what you actually reach for.
+
+**Problems now say so in chat.**
+
+Errors went to a toast in the corner that fades in a few seconds, and the
+most useful ones had no player-facing surface at all. They are mirrored into
+chat now, where they persist and can be screenshotted into a bug report.
+
+**Fixed: terrain turning invisible at very high render distances.**
+
+At render distance 96 and above, chunks could go see-through once enough
+world had loaded, and placing a block could make more of them vanish. It
+looked like the mod losing your terrain. It was not: the terrain was there
+the whole time, in memory, uploaded and intact. The graphics card just
+could not reach it.
+
+Meshelium keeps all terrain in one big block of graphics memory, and it
+sized that block from how much memory your card has. There is a second,
+smaller limit that matters more, which is how much of a single block a
+shader is allowed to read at once. On most cards that is 4 GB no matter how
+much memory you have. Past that line, reads come back empty, and an empty
+read looks exactly like an empty chunk, so those chunks were quietly
+skipped.
+
+The limit is now measured at startup and respected. If a world genuinely
+does not fit, Meshelium goes passive and tells you, which is the behaviour
+it always should have had. Nothing quietly disappears.
+
+Thanks to Ded811 for the report and the log, which had the answer in it.
+
+**Running out of room now pulls the render distance in instead of
+breaking.**
+
+Respecting the limit is not much use if reaching it still ruins the
+session. When terrain memory passes 92 percent, Meshelium now lowers the
+render distance a step and tells you it did. The far chunks are released
+through Minecraft's own path, so the game knows to rebuild them when you
+go back. Hitting the ceiling should feel like the render distance being
+limited, because that is what it is.
+
+It only ever goes down. The slider in Video Settings shows the new number
+and you can drag it back up whenever you want, but Meshelium will not do
+it for you. An automatic restore was built and measured first, and it
+turned out to be worth nothing: the distance it wanted to restore to was
+by definition the one that had just failed to fit, so it walked straight
+back into the same wall. Each change also rebuilds all your terrain, so a
+restore that re-trips costs you two stutters and buys nothing.
+
+Under heavy pressure it steps faster, because a world streaming in was
+measured filling terrain memory from 78 to 176 MB in three seconds, and a
+polite one-step-every-three-seconds could not keep up with that.
+
 ## 1.1.0
 
 **Occlusion culling is back, and this time it pays for itself.**

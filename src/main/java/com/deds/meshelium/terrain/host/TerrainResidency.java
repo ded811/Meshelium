@@ -497,7 +497,21 @@ public final class TerrainResidency {
             long orphanedSections, long retainedSuperseded,
             long evictedByAge, long evictedByPressure, long evictedByDisable,
             long retainedBackpressure,
-            long arenaGrowths, long arenaGrowthFailures) {
+            long arenaGrowths, long arenaGrowthFailures,
+            // The two numbers that decide whether reclaiming arena memory is
+            // worth building, and which kind is worth building.
+            //
+            // arenaExtentBytes is the allocator's high-water mark. Committed
+            // minus extent is untouched tail that costs nothing to give back;
+            // extent minus USED is the holes, and holes are the only thing
+            // compaction could ever recover. Live-versus-committed, which is
+            // what the mod printed before, cannot tell those two apart, so it
+            // could not answer the question at all.
+            //
+            // emptyTopBlocks is the zero-copy alternative: blocks that are
+            // already completely free and could be handed straight back with
+            // no moving of anything.
+            long arenaExtentBytes, int arenaBlocks, int emptyTopBlocks) {
 
         /** True iff nothing wave-3b ever happened — the GL dormancy proof. */
         public boolean isCompletelyIdle() {
@@ -514,7 +528,8 @@ public final class TerrainResidency {
                     && orphanedSections == 0 && retainedSuperseded == 0
                     && evictedByAge == 0 && evictedByPressure == 0 && evictedByDisable == 0
                     && retainedBackpressure == 0
-                    && arenaGrowths == 0 && arenaGrowthFailures == 0;
+                    && arenaGrowths == 0 && arenaGrowthFailures == 0
+                    && arenaExtentBytes == 0 && arenaBlocks == 0 && emptyTopBlocks == 0;
         }
     }
 
@@ -602,7 +617,18 @@ public final class TerrainResidency {
                     + " MiB mesh exceeded the " + trip.limit() + " MiB staging ring";
             case "region" -> "region budget: " + trip.value() + " of " + trip.limit()
                     + " region ids in use";
-            default -> "a section failed to encode (see the residency error latch)";
+            case "vram" -> "the graphics card is out of room: growing terrain memory to "
+                    + trip.value() + " MiB needs more than the " + trip.limit()
+                    + " MiB actually free, so the allocation was refused rather than risk "
+                    + "crashing the game";
+            case "encoding" -> "a section failed to encode (see the residency error latch)";
+            // Every cause must be NAMED above. This used to be the encoding
+            // arm's default, which meant a new cause code silently reported
+            // itself as an encode failure - exactly what "vram" did, sending
+            // the owner and me after a bug that was not there while the log
+            // right beside it read encoding=0.
+            default -> "unknown cause '" + trip.kind() + "' (this is a Meshelium bug; the "
+                    + "drop counters in the same line say which one really fired)";
         };
     }
 
@@ -650,8 +676,20 @@ public final class TerrainResidency {
      * pumps). The parity harness quiesces before its screenshots, which
      * closes the window there.</p>
      */
+    /*
+     * arenaBlockHandles: every arena block's buffer, index == block. The
+     * drawer MUST bind all of them, not just arenaBackingHandle. A quad
+     * address carries its block in its high bits, so a section living in
+     * block 1 but read through block 0's buffer fetches whatever geometry
+     * happens to sit at that offset - plausible, wrong, and drawn. Snapshot
+     * takes its own array because the arena keeps mutating its list under
+     * the residency lock while the drawer reads outside it.
+     */
     public record DrawSnapshot(long epoch, int sectionCount, int[] data, long arenaBackingHandle,
+            long[] arenaBlockHandles,
             int regionCount, int[] regionData, long sectionRecordsHandle, int[] retainedMasks) {
+
+
         /**
          * Ints per section in {@link #data}: {@code [sx, sy, sz,
          * arenaQuadAddr, bucketStartRel[0..6], bucketCount[0..6],
@@ -725,11 +763,12 @@ public final class TerrainResidency {
                 o = writeSnapshotEntryLocked(data, o, r, 1);
             }
             long handle = arena == null ? 0L : arena.backingHandle();
+            long[] blockHandles = arena == null ? new long[0] : arena.blockHandles();
             // Both snapshots inside ONE lock hold, no mutation between —
             // identical region iteration order (RegionStore javadoc).
             int[] regionData = regionStore.snapshotRegions();
             int[] retainedMasks = regionStore.snapshotRetainedMasks();
-            return new DrawSnapshot(drawEpoch, n, data, handle,
+            return new DrawSnapshot(drawEpoch, n, data, handle, blockHandles,
                     regionData.length / DrawSnapshot.REGION_STRIDE, regionData,
                     sectionRecordsHandle, retainedMasks);
         }
@@ -1016,6 +1055,30 @@ public final class TerrainResidency {
      * which calls this). Returns the pre-clear snapshot for the log line.
      */
     public static Counters disposeAndReset() {
+        return disposeAndReset(true);
+    }
+
+    /**
+     * Drop the store WITHOUT touching the upload seam, for the mid-world
+     * renderer swap.
+     *
+     * <p>The seam must survive this. {@code resetForWorld()} sets
+     * {@code suppressedThisWorld=false, vanillaHasGeometry=true}, and every
+     * section the seam cancelled is one vanilla believes it already
+     * uploaded. Wiping that state mid-world means nothing ever re-requests
+     * those sections: a permanently empty world, not a transient gap. This
+     * is the single sharpest edge in the whole swap.</p>
+     */
+    public static Counters disposeAndResetKeepingSeam() {
+        return disposeAndReset(false);
+    }
+
+    private static Counters disposeAndReset(boolean resetSeam) {
+        // The seam is per-world: a new world starts with vanilla whole
+        // again, and must not inherit the last one's suppression state.
+        if (resetSeam) {
+            VanillaUploadSeam.resetForWorld();
+        }
         synchronized (LOCK) {
             Counters snapshot = countersLocked();
             disposeSnapshot = snapshot;
@@ -1259,7 +1322,7 @@ public final class TerrainResidency {
             Resident r = it.next();
             byte[] prefix = r.translucent.prefix;
             if (!gpu.stageArenaCopyLate(java.nio.ByteBuffer.wrap(prefix),
-                    arena.byteOffset(r.arenaAddr))) {
+                    arena.blockOf(r.arenaAddr), arena.byteOffsetInBlock(r.arenaAddr))) {
                 break; // ring full — the rest is next pump's backlog
             }
             it.remove();
@@ -1351,7 +1414,8 @@ public final class TerrainResidency {
                     droppedArenaFull++; // trips the wave-8 coverage guard
                     continue;
                 }
-                if (!gpu.stageArenaCopy(p.encoded().geometry(), arena.byteOffset(addr))) {
+                if (!gpu.stageArenaCopy(p.encoded().geometry(), arena.blockOf(addr),
+                        arena.byteOffsetInBlock(addr))) {
                     // Staging full: nothing was recorded, the GPU never saw
                     // this range — undo is an immediate park-and-release
                     // (only this address is parked right now; epoch frees
@@ -1454,18 +1518,67 @@ public final class TerrainResidency {
             return false; // growth exhausted — the ceiling is the honest limit
         }
         long needed = (long) quadCount * 4L * TerrainVertexCodec.VERTEX_STRIDE;
-        long target = Math.max(current + (current >> 1), current + needed);
-        target = (target + (1L << 20) - 1) >> 20 << 20; // whole MiB
-        target = Math.min(ceiling, target);
-        if (target <= current) {
+        long blockBytes = arena.blockBytes();
+        long lastBlock = arena.lastBlockBytes();
+
+        // GROW THE LAST BLOCK while it has room, THEN APPEND a new one.
+        //
+        // The split's real payoff for a player is here, not in the ceiling.
+        // Growing means allocating a second buffer, copying every live byte
+        // into it, and holding both until the fence clears - at multi-
+        // gigabyte sizes that is a visible hitch precisely when flying into
+        // new terrain, and it doubles peak VRAM at the worst moment.
+        // Appending copies nothing and holds nothing extra. Keeping the
+        // grow path for the first block matters just as much: a player who
+        // needs 300 MiB must not be handed a 2 GiB allocation, so small
+        // arenas behave exactly as before and only the tail becomes free.
+        if (lastBlock < blockBytes) {
+            long target = Math.max(lastBlock + (lastBlock >> 1), lastBlock + needed);
+            target = (target + (1L << 20) - 1) >> 20 << 20; // whole MiB
+            target = Math.min(target, blockBytes);
+            target = Math.min(target, lastBlock + (ceiling - current)); // respect the ceiling
+            if (target > lastBlock) {
+                long newHandle = gpu.growArena(target);
+                if (newHandle != 0L) {
+                    arena.grow(target, newHandle);
+                    arenaGrowths++;
+                    drawEpoch++;
+                    return true;
+                }
+                arenaGrowthFailures++;
+                // Fall through: appending a fresh block asks the driver for
+                // a DIFFERENT and possibly easier allocation - no copy, no
+                // transient double-residency - so a refused grow is not
+                // proof that a append will also fail.
+            }
+        }
+
+        long appendBytes = Math.min(blockBytes, ceiling - current);
+        appendBytes = appendBytes >> 20 << 20; // whole MiB
+        if (appendBytes < needed || appendBytes <= 0) {
+            return false; // no room under the ceiling for a useful block
+        }
+        // Will the CARD take it? Not "is Meshelium being greedy" - it is
+        // supposed to be greedy, that is what buys the frames - but "is
+        // there actually memory left". The static ceiling is a fraction of
+        // a heap SIZE and knows nothing about what vanilla, the compositor
+        // or another process already hold. If Meshelium takes the last of
+        // it, the thing that dies is usually VANILLA, whose OOM path is a
+        // bare IllegalStateException, and the crash report names a vanilla
+        // texture upload. Unknown budget returns MAX_VALUE and this is a
+        // no-op, which is exactly the behaviour before the probe existed.
+        long headroom = com.deds.meshelium.MesheliumVramState.headroomBytes();
+        if (headroom < appendBytes) {
+            arenaGrowthFailures++;
+            noteGuardTripLocked("vram", (current + appendBytes) >> 20,
+                    (current + Math.max(0L, headroom)) >> 20);
             return false;
         }
-        long newHandle = gpu.growArena(target);
-        if (newHandle == 0L) {
+        if (!arena.appendBlock(appendBytes)) {
             arenaGrowthFailures++;
-            return false; // treated as exhausted for this attempt
+            return false;
         }
-        arena.grow(target, newHandle);
+        gpu.onArenaBlockAppended(appendBytes);
         arenaGrowths++;
         // The drawer binds the arena from the snapshot's opaque handle —
         // a new backing is a new era; the epoch bump republishes it (the
@@ -1486,6 +1599,9 @@ public final class TerrainResidency {
             lastError = message;
             MesheliumClient.LOGGER.error(
                     "Meshelium terrain residency error (first and only report): {}", message);
+            // Called from chunk build WORKERS as well as the render thread;
+            // MesheliumNotify marshals, so this is safe from either.
+            com.deds.meshelium.MesheliumNotify.chat("meshelium.chat.error.residency");
         }
     }
 
@@ -1500,11 +1616,19 @@ public final class TerrainResidency {
         }
         long arenaUsed = 0;
         long arenaCapacity = 0;
+        long arenaExtent = 0;
+        int arenaBlocks = 0;
+        int emptyTopBlocks = 0;
         if (arena != null) {
             // liveQuads includes the reserved quad 0; report without it so
             // an empty arena reads 0 (the teardown assertion's baseline).
             arenaUsed = (arena.liveQuads() - 1) * 4L * TerrainVertexCodec.VERTEX_STRIDE;
             arenaCapacity = arena.memoryBytes();
+            // Same reserved-quad baseline, so extent and used are comparable
+            // and a fully churned arena reads 0 rather than one quad.
+            arenaExtent = (arena.quadExtent() - 1) * 4L * TerrainVertexCodec.VERTEX_STRIDE;
+            arenaBlocks = arena.blockCount();
+            emptyTopBlocks = arena.emptyTopBlocks();
         }
         return new Counters(
                 frameCounter,
@@ -1523,7 +1647,8 @@ public final class TerrainResidency {
                 orphanedSections, retainedSuperseded,
                 evictedByAge, evictedByPressure, evictedByDisable,
                 retainedBackpressure,
-                arenaGrowths, arenaGrowthFailures);
+                arenaGrowths, arenaGrowthFailures,
+                arenaExtent, arenaBlocks, emptyTopBlocks);
     }
 
     /**
@@ -1543,6 +1668,7 @@ public final class TerrainResidency {
         MesheliumClient.LOGGER.info(
                 "meshelium residency: sections={} quads={} retained={}/{} quads arena={}/{} MiB "
                         + "(ceiling {} MiB, growths={}, growthFailures={}) "
+                        + "holes={} MiB tail={} MiB emptyTopBlocks={}/{} "
                         + "regions={} (dirty {}) stagingBacklog={} entries/{} KiB ringUsed={} KiB "
                         + "freesPending={} encoded={} uploaded={} "
                         + "drops[oversize={},arena={},region={},encode={}] "
@@ -1553,6 +1679,13 @@ public final class TerrainResidency {
                 c.arenaUsedBytes() >> 20, c.arenaCapacityBytes() >> 20,
                 MesheliumScaling.arenaCeilingBytes() >> 20,
                 c.arenaGrowths(), c.arenaGrowthFailures(),
+                // holes = what compaction could recover; tail = what is
+                // already free above the high-water mark and needs no
+                // compaction at all. Keeping them apart is the whole point:
+                // used-vs-committed conflates them and answers neither.
+                Math.max(0, c.arenaExtentBytes() - c.arenaUsedBytes()) >> 20,
+                Math.max(0, c.arenaCapacityBytes() - c.arenaExtentBytes()) >> 20,
+                c.emptyTopBlocks(), c.arenaBlocks(),
                 c.regionsLive(), c.regionsDirty(),
                 c.stagingBacklogEntries(), c.stagingBacklogBytes() >> 10,
                 gpu.stagingUsedBytes() >> 10, c.pendingFreeRanges(),
@@ -1561,5 +1694,27 @@ public final class TerrainResidency {
                 c.droppedEncoding(),
                 c.orphanedSections(), c.retainedSuperseded(), c.evictedByAge(),
                 c.evictedByPressure(), c.evictedByDisable(), c.retainedBackpressure());
+        // The other half of the terrain bill: vanilla's own copy, which
+        // nothing draws while Meshelium owns the frame. Measured, not
+        // derived - see VanillaTerrainCensus.
+        long vanillaBytes = com.deds.meshelium.VanillaTerrainCensus.committedBytes();
+        long arenaBytes = c.arenaCapacityBytes();
+        MesheliumClient.LOGGER.info(
+                "meshelium terrain bill: meshelium {} MiB, VANILLA {} MiB{} (vanilla keeps a full "
+                        + "second copy that nothing draws while Meshelium owns the frame)",
+                arenaBytes >> 20,
+                vanillaBytes < 0 ? -1 : vanillaBytes >> 20,
+                vanillaBytes > 0 && arenaBytes > 0
+                        ? String.format(" = %.2fx ours", (double) vanillaBytes / arenaBytes) : "");
+        long budget = com.deds.meshelium.MesheliumVramState.budgetBytes();
+        MesheliumClient.LOGGER.info(
+                "meshelium vram: budget={} MiB used={} MiB ({}%) headroom={} MiB{}",
+                budget >> 20,
+                com.deds.meshelium.MesheliumVramState.usageBytes() >> 20,
+                com.deds.meshelium.MesheliumVramState.pressurePct(),
+                budget <= 0 ? -1
+                        : com.deds.meshelium.MesheliumVramState.headroomBytes() >> 20,
+                budget <= 0 ? " (UNKNOWN - no VK_EXT_memory_budget; the static ceiling is the "
+                        + "only bound, exactly as before this probe existed)" : "");
     }
 }

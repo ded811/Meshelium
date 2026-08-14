@@ -1382,10 +1382,57 @@ alpha comes from the TEXTURE), so `out.a = tex.a × 1.0` matches; modded
 blocks emitting vertex alpha < 255 on the TRANSLUCENT layer would shade
 differently — the 60/61 pair is the detector; (c) `ChunkVisibility`
 fade ≡ 1.0 (wave-4 deviation (a), quiesced away); (d) fabulous graphics
-untested: the drawer uses `ChunkSectionLayerGroup.TRANSLUCENT
-.outputTarget()` generically (same target vanilla would draw into), but
-the harness runs the default graphics mode, so the separate-translucent-
-target path has never executed — wave 8's torture harness owns it.
+**RESOLVED 2026-08-13, no deviation** — see the addendum below.
+
+### Wave-16: improved transparency ("fabulous") is tested and correct
+
+Deviation (d) said the separate-translucent-target path had never
+executed. It has now, and it works: shots `62_meshelium_translucent
+_fabulous` / `63_vanilla_translucent_fabulous_reference` in
+`MesheliumTerrainDrawTest.assertFabulousTransparency`.
+
+Naming first, because the old note is written against a version that no
+longer exists: **26.2 has no `GraphicsStatus`**. `FABULOUS` survives only
+as a `GraphicsPreset`, and the preset is a bundle. The single toggle that
+actually moves terrain to another render target is
+`Options.improvedTransparency()`. The chain, all javap-verified:
+`GameRenderer` copies the option per frame into
+`OptionsRenderState.improvedTransparency`; `GameRenderState
+.useShaderTransparency()` is `!isPanoramicMode && improvedTransparency`;
+that alone gates `LevelRenderer.getTransparencyChain()`; and a non-null
+chain is what makes the frame graph `createInternal("translucent", …)`
+so `translucentTarget()` returns non-null. No restart is required.
+
+**The trap, which cost a run.** The obvious way to assert the path is
+live — wait for `LevelRenderer.translucentTarget() != null` — can never
+succeed. `LevelTargetBundle.clear()` runs at the end of every frame
+(`renderLevel`, offset 586), so from a test thread between frames that
+getter reads null on *every* graphics setting. The first version of the
+test timed out there and looked exactly like the feature failing. The
+drawer therefore counts it from inside the frame, at the point it picks
+its target: `TerrainDrawer.translucentSeparateTargetFrames()`. The test
+waits on that counter, so shot 62 cannot be a default-path frame
+mislabelled as fabulous.
+
+**Verdict, RX 9070 XT, 854×480.** Meshelium agrees with vanilla on the
+fabulous path exactly as well as it does on the default one:
+
+| threshold | 62 vs 63 (fabulous) | 60 vs 61 (default) |
+|---|---|---|
+| any diff | 3,572 (0.87%) | 111,555 (27.2%) |
+| >4 | 657 | 647 |
+| >8 | 359 | 327 |
+| >16 | 51 | 53 |
+| >32 | 5 | 5 |
+
+Read the columns, not the first row. The substantive profiles are the
+same to within noise; 49 of the 51 pixels above 16 sit in the nether
+portal, the animated-sprite class wave 7 already documented as benign.
+The first row differs only because the two paths dither differently at
+±1–2, which is why "any diff" is a useless threshold for grading a
+compositing change and the 27% must not be read as a regression.
+
+No gate was added, because there is nothing to gate.
 
 ### Wave-7 verification addendum (coordinator, 2026-08-09)
 

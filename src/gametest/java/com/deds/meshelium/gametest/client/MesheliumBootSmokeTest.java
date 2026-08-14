@@ -564,11 +564,110 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
                         + "the wave-14 memory probe did not run at device creation");
             }
             long ceiling = com.deds.meshelium.MesheliumScaling.arenaCeilingBytes();
-            if (ceiling < com.deds.meshelium.MesheliumScaling.ARENA_CEILING_FLOOR_BYTES) {
-                throw new AssertionError("arena ceiling " + ceiling
-                        + " below the 256 MiB floor (heap " + heap + ")");
+            long range = com.deds.meshelium.MesheliumVulkanState.maxStorageBufferRangeBytes();
+            // THE INVARIANT IS PER BLOCK, NOT PER TOTAL, and this assertion
+            // has now been wrong in both directions, which is worth keeping
+            // as a record. It first demanded the ceiling be at least the
+            // 256 MiB floor, which forced an unreadable arena on a device
+            // with a small maxStorageBufferRange. Corrected to "ceiling must
+            // not exceed maxStorageBufferRange", it was right for exactly as
+            // long as the arena was one buffer - and then the split made it
+            // fire on a perfectly healthy 8151 MiB ceiling across 4 blocks.
+            //
+            // What actually has to hold is that no single BINDING exceeds
+            // what a shader can read. Each block is separately bound, so the
+            // total may exceed it and must, or the split bought nothing.
+            long blockBytes = com.deds.meshelium.MesheliumScaling.arenaBlockBytes();
+            int blocks = com.deds.meshelium.MesheliumScaling.arenaBlockCount();
+            if (range > 0 && blockBytes > range) {
+                throw new AssertionError("arena BLOCK " + blockBytes
+                        + " exceeds maxStorageBufferRange " + range
+                        + " - reads past the limit return zero, which is the"
+                        + " empty-section tombstone (the wave-14 failure)");
             }
+            if (blocks > 0 && ceiling > blockBytes * (long) blocks) {
+                throw new AssertionError("arena ceiling " + ceiling
+                        + " exceeds what " + blocks + " blocks of " + blockBytes
+                        + " can hold - addresses past the last block name a"
+                        + " buffer that does not exist");
+            }
+            long expectedFloor = range > 0
+                    ? Math.min(com.deds.meshelium.MesheliumScaling.ARENA_CEILING_FLOOR_BYTES, range)
+                    : com.deds.meshelium.MesheliumScaling.ARENA_CEILING_FLOOR_BYTES;
+            if (ceiling < expectedFloor) {
+                throw new AssertionError("arena ceiling " + ceiling + " below the floor "
+                        + expectedFloor + " (heap " + heap + ", range " + range + ")");
+            }
+            assertAddressableArithmetic();
         });
         context.takeScreenshot(TestScreenshotOptions.of("10_meshelium_title_vulkan_no_popup"));
+    }
+
+    /**
+     * The clamp arithmetic, against limits no GPU on this desk reports.
+     *
+     * <p>This exists because the bug it catches was invisible on the only
+     * hardware available: the dev card reports maxStorageBufferRange of
+     * 4095 MiB, and the failure needs a limit below the 256 MiB ceiling
+     * floor. The original code applied the floor AFTER the clamp
+     * ({@code Math.max(FLOOR, Math.min(bytes, limit))}), so a device at
+     * Vulkan's required minimum of 128 MiB was handed a 256 MiB ceiling and
+     * an arena twice as large as its shaders could read - terrain uploaded,
+     * counted resident, and read back as zero, which is the empty-section
+     * tombstone. That is the wave-14 invisible-terrain failure, rebuilt.
+     *
+     * <p>Pure arithmetic, so it runs anywhere the harness runs, and it is
+     * the only check here that does not depend on which card is installed.
+     */
+    private static void assertAddressableArithmetic() {
+        long mib = 1L << 20;
+        // {requested, limit, expected}
+        long[][] cases = {
+                // Never probed: pass the request through untouched.
+                {4096 * mib, 0, 4096 * mib},
+                // The dev card. Nothing to clamp, floor irrelevant.
+                {2048 * mib, 4095 * mib, 2048 * mib},
+                // Request above the limit: clamped down to it.
+                {8192 * mib, 4095 * mib, 4095 * mib},
+                // THE REGRESSION. Vulkan's required minimum is 128 MiB,
+                // which is below the 256 MiB floor. The answer must be the
+                // limit, never the floor.
+                {4096 * mib, 128 * mib, 128 * mib},
+                {64 * mib, 128 * mib, 128 * mib},
+                // Floor still applies where the device can afford it.
+                {16 * mib, 4095 * mib, 256 * mib},
+                // Sub-MiB limit must not round down to a zero-byte arena.
+                {4096 * mib, 1000, 1000},
+        };
+        for (long[] c : cases) {
+            long got = com.deds.meshelium.MesheliumScaling.addressableFor(c[0], c[1]);
+            if (got != c[2]) {
+                throw new AssertionError("addressableFor(" + c[0] + ", limit " + c[1]
+                        + ") = " + got + ", expected " + c[2]);
+            }
+            if (c[1] > 0 && got > c[1]) {
+                throw new AssertionError("addressableFor returned " + got
+                        + " above the device limit " + c[1] + " - unreadable arena");
+            }
+        }
+
+        // The override path: clamped, never floored. The two 192/352 MiB
+        // cases are the torture knob the guard legs actually run at - if
+        // the floor ever leaks into this path they silently become 256 MiB
+        // runs and stop testing what they claim to.
+        long[][] overrides = {
+                {192 * mib, 4095 * mib, 192 * mib},
+                {352 * mib, 4095 * mib, 352 * mib},
+                {8192 * mib, 4095 * mib, 4095 * mib},
+                {64 * mib, 128 * mib, 64 * mib},
+                {4096 * mib, 0, 4096 * mib},
+        };
+        for (long[] c : overrides) {
+            long got = com.deds.meshelium.MesheliumScaling.clampToAddressableFor(c[0], c[1]);
+            if (got != c[2]) {
+                throw new AssertionError("clampToAddressableFor(" + c[0] + ", limit " + c[1]
+                        + ") = " + got + ", expected " + c[2]);
+            }
+        }
     }
 }

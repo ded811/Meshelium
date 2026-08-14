@@ -43,6 +43,8 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
+import static java.util.Map.entry;
+
 /**
  * The wave-9 measurement protocol, per docs/PERFORMANCE.md:
  *
@@ -148,38 +150,66 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
      * not of the feature. Scenes named {@code ground-rdN} use it.
      */
     private static final String GROUND_CAMERA_TP = "tp @p 0.5 74.0 0.5 45 2";
+
+    /**
+     * Enclosed scenes: the camera is UNDERGROUND, in a small carved chamber
+     * with solid stone in every direction.
+     *
+     * <p>Every other scene in this harness looks at open terrain, and that
+     * is the one shape where occlusion culling has the least to do - almost
+     * nothing is hidden, so the test costs what it saves. The owner
+     * measured occlusion winning heavily in their own world while it lost
+     * in every scene here, and the ground-rdN cameras were the first half
+     * of the answer. This is the other half and the extreme case: indoors
+     * and underground, where nearly the whole loaded world is behind
+     * something and a renderer that can prove it should draw almost none of
+     * it.</p>
+     *
+     * <p>y=30 is solid stone in this seed's plains, well below the surface
+     * and above the deepslate transition. The chamber is carved after
+     * worldgen settles, so the surrounding rock is real generated terrain
+     * rather than a box floating in air.</p>
+     */
+    private static final String CAVE_CAMERA_TP = "tp @p 0.5 30.0 0.5 45 0";
+    /** Carves the chamber around whatever CAVE_CAMERA_TP just pinned. */
+    private static final String CAVE_CARVE =
+            "execute as @p at @s run fill ~-4 ~-3 ~-4 ~4 ~3 ~4 minecraft:air";
     private static final int WARMUP_FRAMES = 120;
     private static final int MEASURED_FRAMES = 600;
     private static final int READY_TIMEOUT_TICKS = 1200;
     private static final int CAPTURE_TIMEOUT_TICKS = 3600;
 
-    private static final Map<String, Integer> SCENES = Map.of(
+    private static final Map<String, Integer> SCENES = Map.ofEntries(
             // The release curve (owner directive 2026-08-11: "make sure we
             // focus on the fps improvements ... use different render
             // distances too. and give real numbers"). rd 8 and 24 exist so
             // the published table shows the SHAPE of the win, not just its
             // peak: the advantage grows with scene weight, and a reader on
             // a modest machine cares about the low end.
-            "plains-rd8", 8,
+            entry("plains-rd8", 8),
             // 12 is VANILLA'S OWN DEFAULT render distance, so it is the
             // single most important cell on the published curve: it is
             // what a player who never touches the slider actually gets.
-            "plains-rd12", 12,
-            "plains-rd16", 16,
-            "plains-rd24", 24,
-            "plains-rd32", 32,
+            entry("plains-rd12", 12),
+            entry("plains-rd16", 16),
+            entry("plains-rd24", 24),
+            entry("plains-rd32", 32),
             // Wave-10 extended scenes: REQUIRE -Pmeshelium.rd=<value> too
             // (widens the option range at boot; the bench sets the option
             // BEFORE world creation, so the login ClientInformation carries
             // it - the mid-world save() lesson does not bite here, and
             // save() is called anyway for symmetry below).
-            "plains-rd48", 48,
-            "plains-rd64", 64,
+            entry("plains-rd48", 48),
+            entry("plains-rd64", 64),
             // Ground level variants, same seed and same spot, looking
             // along the terrain instead of down at it.
-            "ground-rd8", 8,
-            "ground-rd32", 32,
-            "ground-rd64", 64);
+            entry("ground-rd8", 8),
+            entry("ground-rd32", 32),
+            entry("ground-rd64", 64),
+            // Enclosed/underground, the occlusion-culling extreme. See
+            // CAVE_CAMERA_TP for why these exist.
+            entry("cave-rd32", 32),
+            entry("cave-rd64", 64));
 
     /**
      * Waits for a capture to fill, sweeping the camera if the spin knob is
@@ -246,6 +276,9 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
     private static String cameraFor(String scene) {
         if (scene.startsWith("ground-")) {
             return GROUND_CAMERA_TP;
+        }
+        if (scene.startsWith("cave-")) {
+            return CAVE_CAMERA_TP;
         }
         return CAMERA_TP;
     }
@@ -330,6 +363,12 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             server.runCommand("gamerule randomTickSpeed 0");
             server.runCommand("gamemode spectator @p");
             server.runCommand(cameraFor(scene));
+            if (scene.startsWith("cave-")) {
+                // Carve AFTER the camera is pinned and worldgen has settled,
+                // so the chamber is cut out of real generated stone rather
+                // than being a box floating in ungenerated space.
+                server.runCommand(CAVE_CARVE);
+            }
             server.runCommand("kill @e[type=!minecraft:player]");
             settleWorldgen(context);
 

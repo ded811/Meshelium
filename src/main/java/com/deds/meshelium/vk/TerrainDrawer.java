@@ -648,6 +648,8 @@ public final class TerrainDrawer {
     private static volatile int lastTranslucentSections;
     private static volatile int lastTranslucentDraws;
     private static volatile long cancelledTranslucentGroups;
+    /** Wave-16: owned translucent frames that drew into the SEPARATE target. */
+    private static volatile long translucentSeparateTargetFrames;
     private static volatile long translucentGatedSections;
     // Wave-9: frames whose translucent pass used the multi-WG experiment.
     private static volatile long translucentMultiWGFrames;
@@ -881,6 +883,18 @@ public final class TerrainDrawer {
         return translucentFrames;
     }
 
+    /**
+     * Owned translucent frames whose output target was NOT the main one,
+     * i.e. frames that really ran the improved-transparency path. The
+     * harness cannot determine this from outside: the frame graph's
+     * LevelTargetBundle is cleared at end of frame, so
+     * LevelRenderer.translucentTarget() reads null between frames whatever
+     * the setting is.
+     */
+    public static long translucentSeparateTargetFrames() {
+        return translucentSeparateTargetFrames;
+    }
+
     /** Translucent sections recorded last owned translucent frame. */
     public static int lastTranslucentSections() {
         return lastTranslucentSections;
@@ -1041,13 +1055,47 @@ public final class TerrainDrawer {
     }
 
     /**
-     * The live gate the mixins consult — since wave 8 the config matrix:
-     * {@code meshelium.terrainDraw} property ?? {@code
-     * config.enableTerrainRendering} (re-read every call, both halves).
+     * Latch the session error and tell the player once.
+     *
+     * <p>Four throw sites shared one assignment; the chat line belongs with
+     * the LATCH, not with the throw, so a storm of failures is one message.
+     * Until now this state was invisible outside the log and a line on the
+     * options screen that only exists while that screen is open, which is
+     * the least likely place to be looking when the terrain stops.</p>
      */
-    public static boolean enabled() {
-        return MesheliumConfig.terrainRenderingEnabled();
+    private static void latchError(Throwable t) {
+        boolean first = lastError == null;
+        lastError = t.toString();
+        if (first) {
+            com.deds.meshelium.MesheliumNotify.chat("meshelium.chat.error.renderer");
+        }
     }
+
+    // NOTE: there is deliberately no enabled() here any more.
+    //
+    // One used to exist, documented as "the live gate the mixins consult",
+    // and it carried the whole ownership rule: return true even when the
+    // config says off, for as long as the upload seam had suppressed vanilla
+    // and vanilla had not been rebuilt, so Meshelium kept the frame instead of
+    // handing over an empty world. It also called demote() on the way past.
+    //
+    // NOTHING CALLED IT. Not one caller in the entire repository. Both real
+    // consumers of the master switch - the draw-cancel hook at
+    // ChunkSectionsToRenderMixin and the frame-state capture at
+    // LevelRendererMixin - read MesheliumConfig.terrainRenderingEnabled()
+    // straight out of the config and never referenced this class. So the
+    // ownership rule never executed once, the seam was never demoted by the
+    // kill switch, and turning Meshelium off with suppression on produced a
+    // permanently see-through world.
+    //
+    // It is not restored here, because the owner chose the other resolution:
+    // the swap is SEQUENCED (dump one, then load the other) rather than
+    // overlapped, so that the two copies are never resident at the same time
+    // and an 8 GB card is not asked to hold both. Meshelium stopping the
+    // instant the switch flips is therefore correct. What was missing is the
+    // demotion, and that now runs from the client tick in
+    // MesheliumExtendedRd.driveVanillaUploadSeamRecovery, which executes
+    // unconditionally and also catches the harness flipping the property.
 
     // ------------------------------------------------------------------
     // Wave-12 probes + the skipVanillaPrep prediction
@@ -1171,20 +1219,61 @@ public final class TerrainDrawer {
             return false;
         }
         coveragePassive = true;
+        reportCoverageTripOnce();
+        // THE OWNERSHIP RULE. The guard exists to avoid showing a holey
+        // world, and it does that by handing the frame to vanilla - which
+        // is only an improvement while vanilla's copy is WHOLE. Once the
+        // upload seam has suppressed anything this world, vanilla's picture
+        // is not holey, it is EMPTY, and handing over turns a bad frame
+        // into a black one. So while a rebuild is putting vanilla back,
+        // Meshelium keeps drawing whatever it has.
+        if (com.deds.meshelium.terrain.host.VanillaUploadSeam.suppressedThisWorld()
+                && !com.deds.meshelium.terrain.host.VanillaUploadSeam.vanillaHasGeometry()) {
+            com.deds.meshelium.terrain.host.VanillaUploadSeam.demote("coverage guard tripped");
+            return false; // keep drawing; holes beat nothing
+        }
+        return true;
+    }
+
+    /**
+     * Say once, at the moment of the trip, that sections were dropped.
+     *
+     * <p>This used to sit after the ownership rule's early return, so while
+     * the upload seam had suppressed anything the guard tripped SILENTLY:
+     * no warning, no counter, nothing on the options screen, until a rebuild
+     * had finished putting vanilla back tens of frames later. With duplicate
+     * freeing now on by default that is the common case, not the corner one,
+     * and it hid the single most useful diagnostic the renderer has behind
+     * the setting most likely to be involved.</p>
+     *
+     * <p>The trip is a fact about the residency counters at this instant.
+     * Who ends up drawing the frame is a separate decision, taken below, and
+     * it should not decide whether the player is told.</p>
+     */
+    private static void reportCoverageTripOnce() {
         if (!coverageWarned) {
             coverageWarned = true;
+            com.deds.meshelium.MesheliumNotify.chat("meshelium.chat.error.coverage");
             coverageTrips++;
             TerrainResidency.Counters c = TerrainResidency.counters();
             MesheliumClient.LOGGER.warn(
                     "Meshelium coverage guard: sections were dropped this world — {} — "
                             + "(arenaFull={}, oversize={}, regionBudget={}, encoding={} — lifetime "
-                            + "counts) so a Meshelium frame would have holes; vanilla draws everything "
+                            + "counts) [latched error: {}] "
+                            + "so a Meshelium frame would have holes; vanilla draws everything "
                             + "until a world load with clean counters (once-only report)",
                     TerrainResidency.guardTripDescription(),
                     c.droppedArenaFull(), c.droppedOversize(),
-                    c.droppedRegionBudget(), c.droppedEncoding());
+                    c.droppedRegionBudget(), c.droppedEncoding(),
+                    // The exception text, INLINE. It was always latched and
+                    // always reachable, but only from a separate line the
+                    // owner's log kept truncating before - so twice now a
+                    // report has arrived naming a cause with no way to tell
+                    // which throw produced it. A diagnosis that needs a
+                    // second lookup is a diagnosis nobody gets.
+                    TerrainResidency.lastError() == null
+                            ? "none" : TerrainResidency.lastError());
         }
-        return true;
     }
 
     /**
@@ -1398,14 +1487,14 @@ public final class TerrainDrawer {
             // jar-verified) — never harder because of Meshelium.
             deviceLost = true;
             broken = true;
-            lastError = t.toString();
+            latchError(t);
             MesheliumClient.LOGGER.error(
                     "GPU device lost during Meshelium's terrain pass; Meshelium goes passive "
                             + "(vanilla will report the loss on its own next call)", t);
             return notePrepOutcome(false);
         } catch (Throwable t) {
             broken = true;
-            lastError = t.toString();
+            latchError(t);
             MesheliumClient.LOGGER.error(
                     "Meshelium terrain draw failed; vanilla terrain resumes for this session "
                             + "(first and only report)", t);
@@ -1435,10 +1524,31 @@ public final class TerrainDrawer {
             rebuildRegionMap(fresh);
         }
         TerrainResidency.DrawSnapshot snap = snapshot;
-        if (snap == null || snap.sectionCount() == 0 || snap.arenaBackingHandle() == 0L) {
-            // Nothing resident yet (world still streaming in): Meshelium owns
-            // the opaque group anyway — an empty pass is skipped entirely,
-            // and vanilla stays cancelled so frames are never double-drawn.
+        // EMPTY and ABSENT are different, and treating them alike was a hole.
+        //
+        // EMPTY (sectionCount == 0) means the world is still streaming in.
+        // Meshelium owns the group anyway: an empty pass is skipped, vanilla
+        // stays cancelled, and no frame is double-drawn. Vanilla has nothing
+        // to draw either, so owning nothing costs nothing.
+        //
+        // ABSENT (no snapshot, or no arena backing) means Meshelium CANNOT
+        // draw this world - standup was refused, or the pump latched broken.
+        // Claiming ownership there cancels the only renderer that still
+        // works and the player gets an empty world instead of a slow one.
+        // Hand the frame back to vanilla.
+        if (snap == null || snap.arenaBackingHandle() == 0L) {
+            lastDrawnSections = 0;
+            // Hand the frame back to vanilla ONLY if vanilla can still draw
+            // it. wouldOwnFrame() does not model the arena being absent, so
+            // when it predicted true the mixin already skipped vanilla's
+            // prep and vanilla's lists are EMPTY: refusing there does not
+            // rescue the frame, it blanks it, and the bench legs caught
+            // exactly that as 10 prepSkipHoleFrames at world standup.
+            // Owning an empty frame costs nothing, because with no arena
+            // there is nothing to draw either way.
+            return prepSkippedSerial == frameSerial;
+        }
+        if (snap.sectionCount() == 0) {
             lastDrawnSections = 0;
             return true;
         }
@@ -1713,7 +1823,7 @@ public final class TerrainDrawer {
             // Binding 8 (mask list) is never read in stamp modes — the occ
             // list slice doubles as a type-correct dummy in BOTH variants
             // (UBO slice standard, SSBO slot extended).
-            pushDescriptors(cb, p, snap.arenaBackingHandle(), sceneSlice,
+            pushDescriptors(cb, p, snap.arenaBlockHandles(), sceneSlice,
                     atlasView, atlasSampler, lightmapView,
                     snap.sectionRecordsHandle(), occListSlice,
                     prevStamps, curStamps, occlusion.statsBuffer());
@@ -1752,7 +1862,7 @@ public final class TerrainDrawer {
             // Push-descriptor state does not survive the foreign layouts
             // bound in passes 2/3 — push again (frame-path Q3.2's
             // compatibility rule).
-            pushDescriptors(cb, p, snap.arenaBackingHandle(), sceneSlice,
+            pushDescriptors(cb, p, snap.arenaBlockHandles(), sceneSlice,
                     atlasView, atlasSampler, lightmapView,
                     snap.sectionRecordsHandle(), occListSlice,
                     prevStamps, curStamps, occlusion.statsBuffer());
@@ -2032,7 +2142,7 @@ public final class TerrainDrawer {
             TerrainDrawPipeline p = pipelineFor(vkPass, colorView, depthView, true, extLists);
 
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline());
-            pushDescriptors(cb, p, snap.arenaBackingHandle(), sceneSlice,
+            pushDescriptors(cb, p, snap.arenaBlockHandles(), sceneSlice,
                     atlasView, atlasSampler, lightmapView,
                     snap.sectionRecordsHandle(), visList,
                     stats ? occlusion.prevStampsBuffer(occFrameStamp) : 0L,
@@ -2212,7 +2322,7 @@ public final class TerrainDrawer {
             TerrainDrawPipeline p = pipelineFor(vkPass, colorView, depthView, false);
 
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline());
-            pushDescriptors(cb, p, snap.arenaBackingHandle(), sceneSlice,
+            pushDescriptors(cb, p, snap.arenaBlockHandles(), sceneSlice,
                     atlasView, atlasSampler, lightmapView, 0L, null, 0L, 0L, 0L);
 
             try (MemoryStack stack = MemoryStack.stackPush()) {
@@ -2326,7 +2436,7 @@ public final class TerrainDrawer {
         } catch (GpuDeviceLossException t) {
             deviceLost = true;
             broken = true;
-            lastError = t.toString();
+            latchError(t);
             MesheliumClient.LOGGER.error(
                     "GPU device lost during Meshelium's translucent pass; Meshelium goes passive "
                             + "(vanilla will report the loss on its own next call)", t);
@@ -2336,7 +2446,7 @@ public final class TerrainDrawer {
             return false;
         } catch (Throwable t) {
             broken = true;
-            lastError = t.toString();
+            latchError(t);
             MesheliumClient.LOGGER.error(
                     "Meshelium translucent draw failed; vanilla terrain resumes for this session "
                             + "(first and only report)", t);
@@ -2356,6 +2466,19 @@ public final class TerrainDrawer {
             return false; // vanilla drew opaque this frame — it draws translucent too
         }
         RenderTarget target = ChunkSectionLayerGroup.TRANSLUCENT.outputTarget();
+        // Wave-16 harness probe: is this the SEPARATE translucent target
+        // (improved transparency, what used to be called fabulous) or the
+        // main one? The drawer needs no branch here - outputTarget() hands
+        // back whatever vanilla would have drawn into either way - but the
+        // harness cannot see the difference from outside. LevelTargetBundle
+        // is cleared at the end of every frame, so a test thread reading
+        // LevelRenderer.translucentTarget() between frames ALWAYS sees null
+        // and can never tell the two paths apart. Counting it here, inside
+        // the frame, is the only honest way to prove the fabulous leg
+        // actually exercised the fabulous path.
+        if (target != Minecraft.getInstance().gameRenderer.mainRenderTarget()) {
+            translucentSeparateTargetFrames++;
+        }
         GpuTextureView colorView = target.getColorTextureView();
         GpuTextureView depthView = target.getDepthTextureView();
         GpuTextureView atlasView = sections.textureView();
@@ -2574,7 +2697,7 @@ public final class TerrainDrawer {
             TerrainDrawPipeline p = translucentPipelineFor(vkPass, colorView, depthView);
 
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline());
-            pushTranslucentDescriptors(cb, p, snap.arenaBackingHandle(), sceneSlice,
+            pushTranslucentDescriptors(cb, p, snap.arenaBlockHandles(), sceneSlice,
                     atlasView, atlasSampler, lightmapView,
                     snap.sectionRecordsHandle(), occGate ? occCurStampsHandle : 0L);
 
@@ -2658,7 +2781,7 @@ public final class TerrainDrawer {
      * dynamic access, same discipline as the wave-6 dummies).
      */
     private static void pushTranslucentDescriptors(VkCommandBuffer cb, TerrainDrawPipeline p,
-            long arenaVkBuffer, GpuBufferSlice sceneSlice, GpuTextureView atlasView,
+            long[] arenaBlocks, GpuBufferSlice sceneSlice, GpuTextureView atlasView,
             GpuSampler atlasSampler, GpuTextureView lightmapView,
             long sectionRecordsBuffer, long curStamps) {
         GpuBufferSlice projection = RenderSystem.getProjectionMatrixBuffer();
@@ -2667,7 +2790,8 @@ public final class TerrainDrawer {
         GpuSampler lightmapSampler = RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR);
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkDescriptorBufferInfo.Buffer arenaInfo = bufferInfo(stack, arenaVkBuffer, 0, VK10.VK_WHOLE_SIZE);
+            VkDescriptorBufferInfo.Buffer arenaInfo = arenaBlockInfos(stack, arenaBlocks,
+                    com.deds.meshelium.MesheliumScaling.arenaBlockCount());
             VkDescriptorBufferInfo.Buffer sceneInfo = bufferInfo(stack,
                     ((VulkanGpuBuffer) sceneSlice.buffer()).vkBuffer(), sceneSlice.offset(), sceneSlice.length());
             VkDescriptorBufferInfo.Buffer projectionInfo = bufferInfo(stack,
@@ -2688,10 +2812,10 @@ public final class TerrainDrawer {
             imageWrite(writes.get(5), 5, atlasInfo);
             imageWrite(writes.get(6), 6, lightmapInfo);
             bufferWrite(writes.get(7), 7, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    bufferInfo(stack, sectionRecordsBuffer != 0L ? sectionRecordsBuffer : arenaVkBuffer,
+                    bufferInfo(stack, sectionRecordsBuffer != 0L ? sectionRecordsBuffer : arenaBlocks[0],
                             0, VK10.VK_WHOLE_SIZE));
             bufferWrite(writes.get(8), 8, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                    bufferInfo(stack, curStamps != 0L ? curStamps : arenaVkBuffer,
+                    bufferInfo(stack, curStamps != 0L ? curStamps : arenaBlocks[0],
                             0, VK10.VK_WHOLE_SIZE));
 
             KHRPushDescriptor.vkCmdPushDescriptorSetKHR(cb,
@@ -2763,8 +2887,66 @@ public final class TerrainDrawer {
      * the standard 512-cap UBO path is the documented fallback and its
      * overflow fails open).
      */
+    /**
+     * Whether the TASK stage can afford the extended list path's fifth
+     * storage buffer.
+     *
+     * <p>The standard path binds four storage buffers to the task stage,
+     * which is exactly {@code maxPerStageDescriptorStorageBuffers}' Vulkan
+     * spec minimum with nothing to spare. Past render distance 32 the
+     * extended path flips one binding from a uniform buffer to a storage
+     * buffer and the count becomes five. Exceeding the limit is a VUID
+     * violation, so the failure mode is undefined behaviour rather than a
+     * clean error return: no exception to catch, possibly no validation
+     * message, just wrong pixels or a hang.</p>
+     *
+     * <p>The existing clamp does NOT cover this. {@code MesheliumScaling}
+     * feeds the same limit into the arena block count, but the arena lives
+     * on the MESH stage; no value of N can bring the task stage's own count
+     * down, because the arena never appears there.</p>
+     *
+     * <p>Almost certainly theoretical. The dev card reports 0xFFFFFFFF, and
+     * LUNARG's desktop_baseline profile, which is generated as the
+     * intersection of real gpuinfo.org device reports, requires 31 in every
+     * one of its 2022 through 2026 blocks; 4 appears only in the synthetic
+     * minimum-requirements profile. Every mesh-shader-capable part is inside
+     * that population. So this guards rather than merges: folding the two
+     * stamp buffers into one would take the task stage to four, but those
+     * stamps ARE the wave-6 parity guard and a base-index slip reintroduces
+     * the cross-stage race that design fought. Not a risk worth taking for a
+     * device nobody has ever seen.</p>
+     *
+     * <p>Zero still means NOT REPORTED, matching the convention at
+     * {@code MesheliumScaling.arenaBlockCount}: a driver that leaves a
+     * chained struct zeroed must not be punished for it.</p>
+     */
+    private static boolean taskStageHasRoom() {
+        long limit = com.deds.meshelium.MesheliumVulkanState.arenaLimits()
+                .maxPerStageDescriptorStorageBuffers();
+        if (limit <= 0 || limit >= EXTENDED_TASK_STAGE_STORAGE) {
+            return true;
+        }
+        if (!taskStageWarned) {
+            taskStageWarned = true;
+            MesheliumClient.LOGGER.warn(
+                    "Meshelium: this device reports {} per-stage storage buffers and the extended "
+                            + "render distance path needs {}, so the standard per-frame list path "
+                            + "is used instead. Culling degrades at long render distance; "
+                            + "rendering does not change", limit, EXTENDED_TASK_STAGE_STORAGE);
+        }
+        return false;
+    }
+
+    /** Storage buffers the task stage binds on the extended list path. */
+    private static final int EXTENDED_TASK_STAGE_STORAGE = 5;
+
+    private static boolean taskStageWarned;
+
     private static boolean ensureFrameLists() {
         if (!com.deds.meshelium.MesheliumScaling.current().extended() || frameListsFailed) {
+            return false;
+        }
+        if (!taskStageHasRoom()) {
             return false;
         }
         if (frameLists != null) {
@@ -2875,7 +3057,7 @@ public final class TerrainDrawer {
      * slice as the dummy on occlusion frames, which is type-correct in
      * both variants by construction.</p>
      */
-    private static void pushDescriptors(VkCommandBuffer cb, TerrainDrawPipeline p, long arenaVkBuffer,
+    private static void pushDescriptors(VkCommandBuffer cb, TerrainDrawPipeline p, long[] arenaBlocks,
             GpuBufferSlice sceneSlice, GpuTextureView atlasView, GpuSampler atlasSampler,
             GpuTextureView lightmapView, long sectionRecordsBuffer, TerrainOcclusion.ListSlice visList,
             long prevStamps, long curStamps, long statsBuf) {
@@ -2886,7 +3068,8 @@ public final class TerrainDrawer {
         boolean taskMode = p.taskCull();
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkDescriptorBufferInfo.Buffer arenaInfo = bufferInfo(stack, arenaVkBuffer, 0, VK10.VK_WHOLE_SIZE);
+            VkDescriptorBufferInfo.Buffer arenaInfo = arenaBlockInfos(stack, arenaBlocks,
+                    com.deds.meshelium.MesheliumScaling.arenaBlockCount());
             VkDescriptorBufferInfo.Buffer sceneInfo = bufferInfo(stack,
                     ((VulkanGpuBuffer) sceneSlice.buffer()).vkBuffer(), sceneSlice.offset(), sceneSlice.length());
             VkDescriptorBufferInfo.Buffer projectionInfo = bufferInfo(stack,
@@ -2967,9 +3150,40 @@ public final class TerrainDrawer {
             VkDescriptorBufferInfo.Buffer info) {
         write.sType$Default()
                 .dstBinding(binding)
-                .descriptorCount(1)
+                .descriptorCount(info.remaining())
                 .descriptorType(type)
                 .pBufferInfo(info);
+    }
+
+    /**
+     * One VkDescriptorBufferInfo per arena block, for the binding-0
+     * descriptor array.
+     *
+     * <p>EVERY element must be a valid descriptor, not just the committed
+     * ones: the shader was compiled with an arm for all N, the layout
+     * declares N, and a push descriptor write must fill the array it
+     * declares. Slots for blocks that do not exist yet are filled with block
+     * 0's handle.</p>
+     *
+     * <p>Block 0 rather than a small zero-filled sentinel, and the reason is
+     * robustBufferAccess. It is NOT among vanilla's required device features
+     * (javap-verified), so an out-of-bounds read is not guaranteed to return
+     * zero, it is undefined. A tiny sentinel bound at VK_WHOLE_SIZE would
+     * turn a host bug into undefined behaviour, while a full-sized valid
+     * buffer turns the same bug into a wrong-but-defined read. Those arms
+     * are dead code while the host keeps its invariant that no address names
+     * an uncommitted block, and the shader's own default arm returns zero
+     * for anything past the last one.</p>
+     */
+    private static VkDescriptorBufferInfo.Buffer arenaBlockInfos(MemoryStack stack,
+            long[] handles, int declaredBlocks) {
+        VkDescriptorBufferInfo.Buffer info = VkDescriptorBufferInfo.calloc(declaredBlocks, stack);
+        long fallback = handles.length > 0 ? handles[0] : 0L;
+        for (int i = 0; i < declaredBlocks; i++) {
+            long h = i < handles.length && handles[i] != 0L ? handles[i] : fallback;
+            info.get(i).buffer(h).offset(0).range(VK10.VK_WHOLE_SIZE);
+        }
+        return info;
     }
 
     private static void imageWrite(VkWriteDescriptorSet write, int binding,

@@ -11,7 +11,9 @@ package com.deds.meshelium.gametest.client;
 
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.gui.MesheliumOptionsScreen;
+import com.deds.meshelium.VanillaTerrainCensus;
 import com.deds.meshelium.terrain.host.TerrainResidency;
+import com.deds.meshelium.terrain.host.VanillaUploadSeam;
 import com.deds.meshelium.vk.TerrainDrawer;
 
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
@@ -108,6 +110,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             return;
         }
 
+        assertSeamHandover();
         optionsScreenSmoke(context);
 
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
@@ -117,6 +120,8 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             assertResourceReloadSurvives(context);
         }
 
+        assertRendererSwap(context);
+        assertRenderDistanceRestored(context);
         assertWorldHops(context);
         assertArenaGrowth(context);
         assertCoverageGuard(context);
@@ -355,6 +360,21 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
     // ------------------------------------------------------------------
 
     private static void assertResourceReloadSurvives(ClientGameTestContext context) {
+        // A BEFORE shot, because counters cannot see this failure. A reload
+        // destroys and recreates the block atlas, and a renderer holding a
+        // stale texture view would carry on drawing frames perfectly
+        // happily - the counters below would all pass - while sampling a
+        // dead or reused texture. The only witness is the picture.
+        //
+        // Structurally this should be safe and the shots are here to prove
+        // it rather than to assume it: the atlas view is fetched per frame
+        // (LevelRendererMixin:265, vanilla's own TextureManager lookup) and
+        // every descriptor is a PUSH descriptor written per draw
+        // (vkCmdPushDescriptorSetKHR, TerrainDrawer:1730,1769), so there is
+        // no descriptor set and no cached handle anywhere to go stale.
+        // That is an argument, not evidence.
+        context.takeScreenshot(TestScreenshotOptions.of("82_meshelium_before_resource_reload"));
+
         context.runOnClient(client -> client.reloadResourcePacks());
         // The reload overlay may or may not be caught mid-flight; what
         // matters is that it is GONE and the drawer then records real
@@ -364,6 +384,12 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         context.waitFor(client -> TerrainDrawer.framesDrawn() > frames + 20
                 && TerrainDrawer.lastDrawnSections() > 0, TIMEOUT);
         assertNoErrors();
+
+        // Same camera, same world, same settings, after the atlas was torn
+        // down and rebuilt. The coordinator diffs 82 against 83; anything
+        // beyond animated-sprite noise means the terrain path is sampling
+        // something it should have re-fetched.
+        context.takeScreenshot(TestScreenshotOptions.of("83_meshelium_after_resource_reload"));
     }
 
     // ------------------------------------------------------------------
@@ -431,6 +457,26 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             // Passive means the kill switch stops cancelling: vanilla draws
             // EVERY group (no holes possible), so the drawer's frame and
             // cancel counters freeze while the world keeps rendering.
+            //
+            // NOT INSTANTLY, though, and the difference is the ownership
+            // rule. If the upload seam suppressed anything this world then
+            // vanilla's buffers are EMPTY, so handing it the frame the
+            // instant the guard trips would show a blank world rather than a
+            // holey one. Meshelium keeps drawing until a rebuild has put
+            // vanilla back. Waiting for that is a stronger assertion than
+            // the freeze alone: it proves the handover actually completes,
+            // which is precisely what was broken when the ownership rule
+            // turned out to live in a method with no callers.
+            if (VanillaUploadSeam.suppressedThisWorld()) {
+                try {
+                    context.waitFor(client -> VanillaUploadSeam.vanillaHasGeometry(), TIMEOUT);
+                } catch (Throwable t) {
+                    throw new AssertionError("the coverage guard tripped with the upload seam "
+                            + "armed and vanilla never came back, so nothing would be drawing "
+                            + "(armed=" + VanillaUploadSeam.armed()
+                            + ", demoteReason=" + VanillaUploadSeam.demoteReason() + ")", t);
+                }
+            }
             long frames = TerrainDrawer.framesDrawn();
             long cancels = TerrainDrawer.cancelledGroups();
             long transCancels = TerrainDrawer.cancelledTranslucentGroups();
@@ -438,8 +484,8 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             if (TerrainDrawer.framesDrawn() != frames
                     || TerrainDrawer.cancelledGroups() != cancels
                     || TerrainDrawer.cancelledTranslucentGroups() != transCancels) {
-                throw new AssertionError("drawer kept owning groups while the coverage guard "
-                        + "was passive - holes were possible");
+                throw new AssertionError("drawer kept owning groups after the coverage guard "
+                        + "went passive and vanilla was whole again - holes were possible");
             }
             if (TerrainDrawer.coverageTrips() != tripsBefore + 1) {
                 throw new AssertionError("coverage guard WARNed more than once for one world");
@@ -461,6 +507,283 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
                 throw new AssertionError("coverage guard still passive in a clean world - "
                         + "the world-load re-arm is broken");
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Leg 10 - WITHDRAWN: freeing the arena on world exit
+    // ------------------------------------------------------------------
+    //
+    // A leg was written here to prove that quitting to the menu hands the
+    // terrain arena straight back, rather than parking it until the next
+    // world. The observation behind it is correct: vanilla's dispose only
+    // fires from LevelExtractor.extract(), which does not run without a
+    // level, so the teardown genuinely waits for the next world load.
+    //
+    // The change it was written for is wrong, and the existing retention leg
+    // said so on the first run: "vanilla keeps its meshes at the title
+    // screen but Meshelium's store went to zero - frees are firing from a
+    // path vanilla does not free on". Vanilla holds its terrain at the menu
+    // deliberately, so rejoining the world you just left is instant, and
+    // Meshelium's residency mirrors vanilla's. Free early and vanilla still
+    // believes its meshes are uploaded while ours are gone, so a rejoin
+    // finds no reason to rebuild and the world comes back empty.
+    //
+    // Recorded rather than deleted because the idea is an obvious one to
+    // have twice.
+
+    // ------------------------------------------------------------------
+    // Leg 11 - switching Meshelium back on gives the distance back
+    // ------------------------------------------------------------------
+
+    /**
+     * Turning Meshelium off pulls the render distance to vanilla's 32, and
+     * turning it back on must put the player's distance back.
+     *
+     * <p>Asserts the OPTION, which is the thing that was actually broken and
+     * the thing a screenshot cannot settle. The first version of this feature
+     * logged and toasted "put the render distance back to 120" and the owner
+     * saw 32 on the slider, which reads as the restore silently failing. The
+     * value was fine; Video Settings had been handed back as a cached screen
+     * whose slider widget was built while the range still ended at 32. Two
+     * bug reports, one cause, and only a real assertion on the number tells
+     * them apart.</p>
+     *
+     * <p>40 rather than 120 on purpose: it is past vanilla's ceiling, so it
+     * exercises the widened range and the clamp, without asking the harness
+     * to generate a 120-chunk world.</p>
+     */
+    private static void assertRenderDistanceRestored(ClientGameTestContext context) {
+        final int raised = 40;
+        final int rdBefore = context.computeOnClient(client -> client.options.renderDistance().get());
+        try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
+            singleplayer.getClientLevel().waitForChunksRender();
+            context.runOnClient(client -> {
+                // The property outranks the config, and the harness always
+                // sets it, so the master switch is unreachable until it goes.
+                System.clearProperty("meshelium.terrainDraw");
+                MesheliumConfig.get().enableTerrainRendering = true;
+                client.options.renderDistance().set(raised);
+                client.options.save();
+            });
+            int start = context.computeOnClient(client -> client.options.renderDistance().get());
+            if (start != raised) {
+                throw new AssertionError("could not raise the render distance to " + raised
+                        + " past vanilla's ceiling, so this leg proves nothing (got " + start
+                        + "); the option range is not widened");
+            }
+
+            context.runOnClient(client -> MesheliumConfig.get().enableTerrainRendering = false);
+            try {
+                context.waitFor(client -> client.options.renderDistance().get() <= 32, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("Meshelium was switched off and the extended render "
+                        + "distance was not clamped back to vanilla's maximum", t);
+            }
+
+            context.runOnClient(client -> MesheliumConfig.get().enableTerrainRendering = true);
+            try {
+                context.waitFor(client -> client.options.renderDistance().get() == raised, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("Meshelium came back on and the render distance stayed at "
+                        + context.computeOnClient(c -> c.options.renderDistance().get())
+                        + " instead of the " + raised + " it was clamped from", t);
+            }
+        } finally {
+            context.runOnClient(client -> {
+                MesheliumConfig.get().enableTerrainRendering = true;
+                System.setProperty("meshelium.terrainDraw", "true");
+                // Put the distance back too. Leaving it at 40 made the NEXT
+                // leg's waitForChunksRender time out, which reads as that leg
+                // failing; a test that raises the render distance has to hand
+                // it back or it breaks whatever runs after it.
+                client.options.renderDistance().set(rdBefore);
+                client.options.save();
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Leg 9 - the mid-world renderer swap, with suppression armed
+    // ------------------------------------------------------------------
+
+    /**
+     * Turn Meshelium off and on again in a live world with vanilla's uploads
+     * suppressed, and require that SOMEBODY is drawing terrain at the end of
+     * each half.
+     *
+     * <p>This is the test the owner had to be the first to run. The mod
+     * shipped with the master switch reading the config directly at
+     * ChunkSectionsToRenderMixin and LevelRendererMixin, while the ownership
+     * rule and its demote() sat in TerrainDrawer.enabled() with ZERO callers
+     * anywhere in the repository. So flipping the switch off stopped
+     * Meshelium drawing that same frame, never told the seam, and left
+     * vanilla's uploads cancelled forever. Nobody drew, and not for a few
+     * frames: permanently. The world was see-through.</p>
+     *
+     * <p>The assertion that catches it is the census. Screenshots would not
+     * have: the seam was cancelling uploads, so vanilla's own draw calls ran
+     * against empty buffers and the frame was structurally valid and utterly
+     * empty. {@code VanillaTerrainCensus.committedBytes()} asks the only
+     * question that matters after a handover to vanilla, which is whether
+     * vanilla actually has anything to draw.</p>
+     */
+    private static void assertRendererSwap(ClientGameTestContext context) {
+        boolean suppressWas = MesheliumConfig.get().suppressVanillaUploads;
+        try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
+            context.runOnClient(client -> {
+                MesheliumConfig.get().suppressVanillaUploads = true;
+                VanillaUploadSeam.onSettingChanged();
+            });
+            singleplayer.getClientLevel().waitForChunksRender();
+            waitForDrawing(context, "swap leg, suppression armed");
+
+            // --- Meshelium -> vanilla -------------------------------------
+            // The property has to go first. terrainRenderingEnabled() is
+            // `meshelium.terrainDraw` ?? config, the harness always sets that
+            // property, and a set property WINS - so writing the config field
+            // alone would leave the draw hook happily enabled and this test
+            // would pass without ever switching anything off.
+            context.runOnClient(client -> {
+                System.clearProperty("meshelium.terrainDraw");
+                MesheliumConfig.get().enableTerrainRendering = false;
+            });
+            try {
+                // Vanilla must end up holding real terrain buffers. -1 means
+                // the census could not read the dispatcher, which is not a
+                // pass.
+                context.waitFor(client -> VanillaTerrainCensus.committedBytes() > 0, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("Meshelium was switched off with the upload seam armed "
+                        + "and vanilla never got its terrain back (census="
+                        + VanillaTerrainCensus.committedBytes()
+                        + ", suppressedThisWorld=" + VanillaUploadSeam.suppressedThisWorld()
+                        + ", armed=" + VanillaUploadSeam.armed()
+                        + ", vanillaHasGeometry=" + VanillaUploadSeam.vanillaHasGeometry()
+                        + ", demoteReason=" + VanillaUploadSeam.demoteReason()
+                        + ") - this is the see-through world", t);
+            }
+            assertNoErrors();
+
+            // And the other half of "dump one, then load the other": with
+            // Meshelium off, its arena must go back to the driver rather
+            // than sit there holding a copy of a world it is not drawing.
+            // Without this the two renderers are resident at once, which on
+            // an 8 GB card is the difference between working and not.
+            try {
+                context.waitFor(client ->
+                        TerrainResidency.counters().arenaCapacityBytes() == 0, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("Meshelium was switched off but kept its "
+                        + (TerrainResidency.counters().arenaCapacityBytes() >> 20)
+                        + " MiB arena (sectionsResident="
+                        + TerrainResidency.counters().sectionsResident()
+                        + ", pendingFrees=" + TerrainResidency.counters().pendingFreeRanges()
+                        + ", stagingBacklog="
+                        + TerrainResidency.counters().stagingBacklogEntries()
+                        + ") - both renderers are resident at once", t);
+            }
+
+            // --- vanilla -> Meshelium -------------------------------------
+            context.runOnClient(client -> MesheliumConfig.get().enableTerrainRendering = true);
+            singleplayer.getClientLevel().waitForChunksRender();
+            waitForDrawing(context, "swap leg, Meshelium switched back on");
+        } finally {
+            context.runOnClient(client -> {
+                MesheliumConfig.get().enableTerrainRendering = true;
+                MesheliumConfig.get().suppressVanillaUploads = suppressWas;
+                System.setProperty("meshelium.terrainDraw", "true");
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Leg 8 - the upload seam handover, the empty-ground regression
+    // ------------------------------------------------------------------
+
+    /**
+     * The seam must never hand the frame back to vanilla before vanilla has
+     * actually rebuilt.
+     *
+     * <p>Pure static state, so no world and no GPU: this drives the machine
+     * by hand and puts it back. It exists because the first version shipped
+     * with a hole that a GPU test could not have found. The completion
+     * signal is {@code LevelRenderer.hasRenderedAllSections()}, which is
+     * only {@code isQueueEmpty()}, and a settled world has an empty queue
+     * ALREADY - so "complete" read true from the first frame after
+     * demotion, the handover fired before the rebuild was issued, and the
+     * owner's ground went blank. Every assertion below is that bug seen
+     * from a different angle.</p>
+     */
+    private static void assertSeamHandover() {
+        VanillaUploadSeam.resetForWorld();
+        try {
+            if (!VanillaUploadSeam.vanillaHasGeometry()) {
+                throw new AssertionError("a world where nothing was suppressed must trust vanilla");
+            }
+
+            VanillaUploadSeam.noteSuppressed();
+            if (VanillaUploadSeam.vanillaHasGeometry()) {
+                throw new AssertionError(
+                        "a suppressed section must mark vanilla's copy incomplete");
+            }
+
+            VanillaUploadSeam.demote("lifecycle torture");
+
+            // The regression itself: settled world, empty queue, "complete"
+            // true every frame, rebuild not even issued yet.
+            for (int i = 0; i < 200; i++) {
+                VanillaUploadSeam.noteRebuildProgress(true);
+            }
+            if (VanillaUploadSeam.vanillaHasGeometry()) {
+                throw new AssertionError("handed the frame to vanilla before the rebuild was "
+                        + "issued - this is the blank-ground bug");
+            }
+
+            if (!VanillaUploadSeam.consumeRebuildRequest()) {
+                throw new AssertionError("demote must ask for a rebuild, or vanilla never returns");
+            }
+
+            // Issued, and the queue has not been seen to fill. A short calm
+            // must NOT be read as finished: that is the blank-ground bug one
+            // step later.
+            for (int i = 0; i < 30; i++) {
+                VanillaUploadSeam.noteRebuildProgress(true);
+            }
+            if (VanillaUploadSeam.vanillaHasGeometry()) {
+                throw new AssertionError("handed over after a short calm on a queue that was "
+                        + "never seen busy - an empty queue only means finished after it "
+                        + "meant working");
+            }
+
+            // A LONG calm does hand over, and must. The busy frame is
+            // sampled at 20 Hz and a small world rebuilds inside one tick,
+            // so requiring it absolutely deadlocks the handover and
+            // Meshelium owns a holey frame forever.
+            for (int i = 0; i < 200; i++) {
+                VanillaUploadSeam.noteRebuildProgress(true);
+            }
+            if (!VanillaUploadSeam.vanillaHasGeometry()) {
+                throw new AssertionError("never handed back although the rebuild was issued and "
+                        + "the queue stayed calm - a rebuild too fast to catch would strand "
+                        + "Meshelium as owner for the rest of the world");
+            }
+
+            // And the fast path still works: seen busy, then done.
+            VanillaUploadSeam.resetForWorld();
+            VanillaUploadSeam.noteSuppressed();
+            VanillaUploadSeam.demote("lifecycle torture, fast path");
+            VanillaUploadSeam.consumeRebuildRequest();
+            VanillaUploadSeam.noteRebuildProgress(false);
+            for (int i = 0; i < 25; i++) {
+                VanillaUploadSeam.noteRebuildProgress(true);
+            }
+            if (!VanillaUploadSeam.vanillaHasGeometry()) {
+                throw new AssertionError("a rebuild seen to run and then finish did not hand "
+                        + "back within the short floor");
+            }
+        } finally {
+            VanillaUploadSeam.resetForWorld();
         }
     }
 

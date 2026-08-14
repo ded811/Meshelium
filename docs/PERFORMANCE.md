@@ -616,6 +616,118 @@ If you have NVIDIA or Intel hardware and a spare afternoon, running the bench
 above is the single most valuable thing anyone could contribute to this
 project.
 
+## Fully enclosed scenes, where Meshelium loses
+
+Added 2026-08-13 with the `cave-rdN` scenes. Every other scene on this page
+looks at open terrain, and "faster at every distance we measured" was true
+of exactly that. It is not true everywhere, and the boundary is worth
+publishing rather than discovering.
+
+`cave-rd64` pins the spectator camera underground at y=30 and carves a 9x7x9
+chamber out of real generated stone after worldgen settles, so solid rock
+surrounds it in every direction. Six sections get drawn. Both renderers are
+doing essentially nothing, and what remains is fixed per-frame cost.
+
+| leg | Meshelium mean | vanilla mean | vanilla / Meshelium |
+|---|---|---|---|
+| occlusion on (AUTO at rd 64) | 0.555 ms | 0.470 ms | **0.85** |
+| occlusion off (`bfsOnly`) | 0.467 ms | 0.405 ms | **0.87** |
+
+Vanilla is roughly 15 to 18 percent faster here. Read only the ratios: the
+two rows are separate harness sessions and vanilla's own number moved 16
+percent between them (0.470 against 0.405) for identical work, which is the
+same-session rule this page keeps relearning. Within each run the ratio is
+stable, and both runs agree.
+
+Three things follow.
+
+**The result is real but not practical.** Both renderers are above 1,800 FPS.
+Nobody is affected by losing 0.085 ms at 1,800 FPS, and no monitor can show
+it.
+
+**Meshelium's advantage requires visible geometry.** Its win comes from
+drawing a lot of terrain cheaply. Where there is nothing to draw, there is
+nothing to win, and the fixed cost of the mesh-shader path is what is left
+on the clock. Vanilla's own visibility graph already solves the sealed-room
+case for free.
+
+**Occlusion culling costs about 0.09 ms when there is nothing to occlude,**
+and turning it off recovers roughly half the deficit without closing it. The
+remainder is the fixed frame cost, not the occlusion passes. This does not
+argue for changing the AUTO threshold: AUTO keys on render distance, the
+scene here is the degenerate end of the curve, and at rd 64 in open terrain
+occlusion still pays. It does argue that a future visibility-aware AUTO has
+something real to key on.
+
+## Spin the camera, or the bench measures a third of the world
+
+Owner's observation, 2026-08-13, and it invalidates every memory number this
+page took before it: Minecraft only keeps sections resident that it has had
+reason to render, so a bench with a FIXED camera never forces the world behind
+the camera to load. `meshelium.bench.spin` exists and every published scene
+leaves it at 0.
+
+Same scene, same distance, spin 0 against spin 2 degrees per tick:
+
+| | static camera | spinning |
+|---|---|---|
+| resident sections | 9,464 | **26,990** |
+| terrain arena | 529 MB | **1650 MB** |
+| arena blocks | 1 (grown) | **1 grown + 3 appended** |
+| total GPU | 2651 MB | 5723 MB |
+| drops | 0 | 0 |
+
+Nearly three times the terrain. Any memory conclusion drawn from a static
+camera understates a real session by about that much, which is why the
+harness never got near the 4 GB the owner reached in play while this page was
+quoting 600 MB.
+
+It is also the first test of the block machinery at scale, and it is clean:
+two grow-and-copies capped at the 512 MB block size, then three appends that
+copy nothing, zero drops, no guard trip and no render-distance backoff needed.
+Before the block-size change the same climb took five copies rising to
+1944 MB, with draw-path spikes of 180 ms and 383 ms in the owner's log.
+
+Frame-rate rows on this page stay static-camera, because that is what makes
+them repeatable and comparable with every earlier row. Memory rows should use
+spin.
+
+## Spec-minimum simulation, the closest thing to cross-vendor coverage here
+
+Added 2026-08-13. NVIDIA and Intel are not on this desk, so the multi-buffer
+work could only ever be verified against one vendor's real limits. The
+`VK_LAYER_KHRONOS_profiles` layer closes part of that gap by forcing another
+device's limits onto this card.
+
+Run with `VP_LUNARG_minimum_requirements_1_2` and
+`SIMULATE_PROPERTIES_BIT` (properties only, so mesh shaders stay available
+and it is the LIMITS under test), the RX 9070 XT reports:
+
+| limit | real | simulated |
+|---|---|---|
+| maxStorageBufferRange | 4095 MB | **128 MB** |
+| maxPerStageDescriptorStorageBuffers | unlimited | **4** |
+| maxDescriptorSetStorageBuffers | unlimited | **24** |
+| maxMemoryAllocationSize | 2048 MB | 1024 MB |
+
+Meshelium degraded exactly as designed: blocks clamped from the preferred
+512 MB to **128 MB**, and the block count fell to **2**, driven by the
+per-stage descriptor limit of 4 minus the 2 the mesh stage already uses. Total
+addressable dropped from 8192 MB to 256 MB.
+
+The result that matters: **opaque terrain was pixel-identical to vanilla**,
+zero differing pixels above a delta of 4, rendering through two 128 MB blocks
+on a device pretending to be the weakest thing the spec allows. The whole
+clamping chain - probe, block size, block count, descriptor array, shader
+switch - works at the bottom of the range as well as the top.
+
+Two honest limits on what this proves. It simulates LIMITS, not driver
+behaviour, so it says nothing about whether NVIDIA's or Intel's compilers
+accept the module. And at high render distance the task stage declares 5
+storage buffers where this profile allows 4, which is an inherited exposure
+predating the split and would need addressing before claiming spec-minimum
+support outright.
+
 ## What this page does not cover
 
 **Visual precision.** The 16 byte packed vertex carries a known quantisation
