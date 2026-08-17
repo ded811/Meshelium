@@ -745,3 +745,367 @@ layer cannot solve it.
 
 **Anything rotation driven**, for the static camera reason given under
 [Method](#method).
+
+---
+
+## Greedy meshing, measured (2026-08-14)
+
+> **Every quad-count figure in this section and the next was corrected on
+> 2026-08-15 and the originals were WRONG.** They came from a model of the
+> sweep living a few hundred lines from the real one, and the two had
+> silently diverged: the model extended runs without bound while the mesher
+> clamps them to powers of two, so a run of 15 counted as one rectangle when
+> the encoder can only express 8 + 4 + 2 + 1. A separate bug let the model
+> merge randomly rotated block variants that the mesher must refuse. Both
+> errors flatter the merge, and both are worst exactly where the merge is
+> best, so the shader-lighting projection was inflated more than the baseline
+> it was compared against. The probe now reports the real mesher's own output
+> and says so when its model disagrees. The corrected table is
+> [below](#the-corrected-quad-counts-2026-08-15); the original is kept here
+> because a page that quietly edits its own numbers is not evidence of
+> anything.
+
+`GreedyMeshProbe` runs a real greedy rectangle merge over every decoded
+section and throws the merge away. `-Dmeshelium.probe.greedy=true`. It sits
+between `VanillaMeshDecoder` and `SectionMeshEncoder`, exactly where a real
+merge pass would go, so it measures the thing that would be built rather than
+a model of it.
+
+Render distance 64, 10,000 sections, 9,147,614 quads (**superseded, see the
+correction above**):
+
+| | quads after | reduction | eligible |
+|---|---|---|---|
+| As the renderer stands | 8,688,507 | **5.0%** | 940,042 (10%) |
+| With lighting in the shader | 5,903,928 | **35.5%** | 6,013,714 (66%) |
+
+Seed 7 gives 5.5% for the first row, so the low number is not a property of
+seed 4242's snow and ice.
+
+**Greedy meshing on its own is not worth building.** Five percent of quads,
+against an opaque pass that is 0.687 ms of a 1.842 ms frame, with fill rate
+unchanged because the same pixels are covered either way.
+
+**Why, and it is not what the design work predicted.** The reasoning had
+settled on vanilla's four position-hashed rotation variants for grass, dirt,
+sand and stone capping natural terrain near a third. That is not the binding
+constraint. **5,876,130 quads, 64 percent of all terrain, are disqualified
+because their four corners disagree**: vanilla bakes smooth lighting and
+ambient occlusion per vertex, so most faces are bilinear ramps and two ramps
+do not tile into one larger ramp. An adversarial review had argued AO was a
+per-edge cost rather than a blocker. The measurement refutes that.
+
+The merge algorithm is fine. It collapses what it is allowed to touch by 49
+percent, and by 54 percent in the shader-lighting case. There is simply
+almost nothing it is allowed to touch.
+
+**The consequence.** Moving lighting and biome tint off the vertex and into
+the shader is worth seven times what greedy meshing is worth, and greedy
+meshing is only worth anything as its second half. It also cuts arena size by
+the same 35.5 percent, roughly 390 MB of a 1093 MB working set at render
+distance 120, which is the constraint that has actually produced bug reports.
+
+**What these numbers do not claim.** Not 35.5 percent more frames. Merging
+covers the same pixels with fewer primitives, so it takes work off vertex and
+primitive processing and none off fill rate. Single digits to low teens
+percent, plus the memory, is the honest range.
+
+### Smooth Lighting off, measured the same way
+
+`-Dmeshelium.bench.flatLighting=true` turns vanilla's Smooth Lighting off, so
+vanilla itself takes `prepareQuadFlat` and gives every quad one colour and one
+light coordinate instead of four corners. Same scene, same 10,000 sections:
+
+| Smooth Lighting | quads after | reduction | corners disagree |
+|---|---|---|---|
+| On, the default | 8,688,507 | 5.0% | 5,876,130 |
+| **Off** | **6,791,472** | **25.6%** | **0** |
+| Lighting in the shader, predicted | 5,901,981 | 35.4% | n/a |
+
+The zero is the point. It confirms the mechanism exactly: per-vertex ambient
+occlusion is the entire reason the merge fails, and removing it removes the
+whole 5.9 million quad disqualification.
+
+**This reverses the conclusion above for one population.** Greedy meshing is
+not worth building for a player with Smooth Lighting on. It is worth 25.6
+percent for a player with it off, today, with no shader work, no light volume
+and no AO reproduction.
+
+The remaining gap to 35.4 percent is also explained: with flat lighting each
+quad still carries its own colour and light, so two adjacent quads at
+different light levels still refuse to merge. Striking colour and light from
+the key removes that last barrier, and only shader-side lighting can do it.
+
+One artifact to read past: "not a unit face" jumps from 329,118 to 1,134,128
+between the two rows. That is not a change in the geometry. The strict pass
+tests uniformity before unit-ness, so with Smooth Lighting on most non-unit
+quads were already counted in the non-uniform bucket and never reached the
+unit test.
+
+### The corrected quad counts (2026-08-15)
+
+Re-measured after the probe was made to clamp runs the way the encoder does,
+and after the mesher gained a UV-orientation key. Both changes make the merge
+look worse and both are right. Same scene as above: `plains-rd64`, 10,000
+sections, seed 4242.
+
+The probe now runs the **real `GreedyMesher`** over each section and reports
+that, rather than a second implementation of the sweep. Its model is kept
+alongside only for the breakdown the mesher cannot give, and the report line
+prints the disagreement when the two differ.
+
+| Smooth Lighting | Published 2026-08-14 | Actual | Model, for comparison |
+|---|---|---|---|
+| On, the default | 5.0% | **3.4%** | 4.3% |
+| Off | 25.6% | **17.9%** | 21.2% |
+| Lighting in the shader, predicted | 35.4% | **29.6%** | (this row is still the model) |
+
+Three separate things were wrong:
+
+- **No run clamp.** The model extended a run of 15 into one rectangle; the
+  encoder can only express 8 + 4 + 2 + 1. Worst where the merge is best.
+- **No UV-orientation key.** Vanilla hashes block position into a model
+  rotation for grass, dirt, sand and stone, which rotates the sprite's UVs
+  while leaving its atlas RECTANGLE identical. The rectangle was all the
+  model compared, so it counted merges between differently rotated faces. The
+  mesher now refuses them, which costs 0.9 points with Smooth Lighting on and
+  3.3 points with it off. That refusal is also a **bug fix**, not a
+  regression: before it, those merges were being made and drawn wrong.
+- **The shader-lighting row still has neither correction fully applied.** It
+  is clamped now but its key still has no orientation field, so 29.6% is an
+  upper bound and the real figure is likely 3 to 4 points lower.
+
+The old prediction that shader-side lighting was "worth seven times what
+greedy meshing is worth" was arithmetic on two numbers that were both wrong.
+Against a corrected 3.4% baseline the corrected ceiling is about 26 points of
+headroom, not 30.
+
+### What it is worth in FRAME TIME (2026-08-15)
+
+Quads are not frames, and the mod is judged on frames. Measured with the
+current mesher, 600 frames per run, `-Dmeshelium.greedyMeshing` flipped
+between runs, at two working points: the owner's own (render distance 64 at
+1440p) and the comparable published row (render distance 32 at 1080p).
+
+**Render distance 64, 2560x1440:**
+
+| Smooth Lighting | Greedy | Frame mean | Frame median | Opaque GPU pass | Translucent pass |
+|---|---|---|---|---|---|
+| On, the default | off | 2.791 ms | 2.734 ms | 1.155 ms | 0.579 ms |
+| On, the default | on | 2.709 ms (-2.9%) | 2.637 ms (-3.5%) | 1.086 ms (-6.0%) | 0.567 ms |
+| **Off** | off | 2.735 ms | 2.695 ms | 1.128 ms | 0.566 ms |
+| **Off** | **on** | **2.503 ms (-8.5%)** | **2.481 ms (-7.9%)** | **0.926 ms (-17.9%)** | 0.568 ms |
+
+**Render distance 32, 1920x1080:**
+
+| Smooth Lighting | Greedy | Frame mean | Frame median | Opaque GPU pass | Translucent pass |
+|---|---|---|---|---|---|
+| On, the default | off | 1.280 ms | 1.226 ms | 0.776 ms | 0.197 ms |
+| On, the default | on | 1.252 ms (-2.2%) | 1.205 ms (-1.7%) | 0.752 ms (-3.1%) | 0.197 ms |
+| **Off** | off | 1.277 ms | 1.230 ms | 0.779 ms | 0.195 ms |
+| **Off** | **on** | **1.159 ms (-9.2%)** | **1.109 ms (-9.8%)** | **0.647 ms (-16.9%)** | 0.197 ms |
+
+The translucent pass is the control. The merge excludes translucent geometry
+by construction, so that column should not move, and it does not: 0.195 to
+0.197 ms across all four rd 32 runs, 0.566 to 0.579 ms across all four rd 64
+runs. Drift large enough to fake an 18 percent move in the opaque pass would
+have moved it too.
+
+**The opaque pass tracks the quad count almost exactly.** 17.9 percent fewer
+quads with Smooth Lighting off, 17.9 percent off the pass at rd 64 and 16.9
+percent at rd 32. That is a stronger result than the earlier 0.785 ratio
+suggested, and it means the pass is close to purely primitive-bound here.
+
+**What it is worth to a player**, which is the only question that matters:
+
+- **Smooth Lighting on, the default: 2 to 3 percent.** Real, repeatable,
+  and small.
+- **Smooth Lighting off: 8 to 10 percent.**
+
+And the caveat that must travel with every one of these percentages: these
+frames are 1.2 to 2.8 ms because the bench camera is static in an empty
+plains world with no entities, no GUI and no particles. What the merge
+actually removes is an absolute **0.08 ms (default) or 0.23 ms (Smooth
+Lighting off) per frame at rd 64 / 1440p**. In a real 10 ms frame those are
+0.8 and 2.3 percent, not 3 and 9.
+
+#### One outlier, reported rather than dropped
+
+The first rd 64 / 1440p flat-lighting run with the merge on recorded a single
+220.9 ms frame, which dragged its mean to 2.912 ms while its median stayed at
+2.475 ms. A repeat under identical conditions came back clean (mean 2.503 ms,
+max 4.181 ms), so the table uses the repeat. The spike did not reproduce and
+is not attributed to the merge, but a mean that a single frame can move by 17
+percent is why the median column exists in these tables.
+
+### The 2026-08-16 review session, in numbers
+
+A model-driven audit and a performance scout ran over everything above, and
+the session's measurements belong on this page like any others.
+
+**Phase B's skip ceiling re-validated, then the skip lost anyway.** Skipping
+phase B outright (the deliberately incorrect measurement switch) is worth
+0.163 ms at rd 64 / 1440p, 7.3 percent of the frame, same-session pair. The
+correct conditional-rendering skip was then built, collapsed phase B from
+0.239 to 0.008 ms, and LOST on the frame: the driver services conditional
+rendering with a periodic 8 to 11 ms stall every 16 to 21 frames, p99 3.6 to
+10.6 ms. Default off; the whole story is in OCCLUSION-FILLRATE-DESIGN.md.
+
+**The rotation tax is not the frustum walk.** One spin run with the stage
+timers settled a standing suspicion: applyFrustum fires 26 times in 600
+rotating frames at 0.517 ms each, an amortized 0.022 ms per frame. The
+720-to-550 fps drop while turning lives in vanilla's extract and chunk
+rebuild churn plus legitimate GPU work, so the planned decoupled-translucent
+ordering fix is dead: it would have removed a fiftieth of the cost it was
+aimed at. One bench run, one 200-line feature not built.
+
+**The arena tail is real and persistent.** With debug stats on, an rd 64
+session holds tail at 492 to 496 MiB with emptyTopBlocks 0/2 throughout:
+half a gigabyte of committed VRAM inside the top 512 MiB block that nothing
+has ever touched, recoverable only by a shrink-copy of the block's used
+extent, not by releasing whole blocks (there are never empty ones). That is
+the measured case for the arena trim, which is specced but deliberately not
+built in the same session that measured it.
+
+### The idle memory trim, measured (2026-08-17)
+
+The tail measurement above became a feature the same night. After 30 seconds
+without meaningful arena traffic (staged volume, not mere activity - a live
+server random ticks blocks forever, so a policy that waited for perfect
+silence would never fire outside a void superflat, which is how the first
+draft failed its first real bench), the top block is shrink-copied to its
+extent and the remainder goes back to the driver.
+
+| rd 64 / 1440p session | committed | in use | occupancy |
+|---|---|---|---|
+| Before the trim | 1024 MiB | 528 MiB | 52% |
+| After | **536 MiB** | 528 MiB | **98.5%** |
+
+488 MiB returned, and the frame did not notice: median 2.236 ms against the
+session's 2.217 to 2.256 spread, worst frame 3.441 ms - the cleanest tail of
+the day, because the one copy the trim performs is bounded by the extent
+(about 20 MiB here), not the block size. The superflat torture world trims
+256 to 16 MiB. Regrowth through a trimmed arena is the ordinary growth
+ladder and the torture leg drives a rebuild storm through it without a drop.
+
+Default ON as the Advanced row "Idle Memory Trim"; off restores 1.2.0
+behavior exactly.
+
+### Why shader-side lighting was NOT built
+
+The corrected numbers above were the input to a design study for moving
+lighting off the vertex and into the fragment shader, which is what would let
+faces with different light merge. Three independent adversarial reviews
+refuted it, and the arithmetic is the reason:
+
+- The prize is the **residue**: about 26 points of quad reduction between the
+  3.4 percent baseline and the 29.6 percent ceiling, and the ceiling is
+  itself an overestimate.
+- The cost is per pixel and scales with resolution and overdraw, while the
+  prize is per quad and does not. Break-even lands near **17 points at 1080p,
+  31 at 1440p, and 69 at 4K**.
+- So at 1080p it is marginal, and **at 1440p and above it is a net loss** for
+  exactly the players with the biggest GPUs.
+
+There is a second, subtler reason it cannot simply be ported. Vanilla
+interpolates the **product** of colour and the lightmap sample, computed per
+vertex. A shader that interpolates the light COORDINATE and samples once is a
+different function, and it diverges visibly across a light gradient. Doing it
+correctly means three lightmap fetches per merged-quad pixel, which triples
+the texture cost the estimate above was built on.
+
+The idea is not dead in general, but the per-pixel lattice version is, and it
+was killed by arithmetic before anything was built.
+
+### The affine merge, which was built (2026-08-15)
+
+One idea survived the review, and it is free. A merged rectangle is one
+four-vertex quad, so the hardware interpolates its corners linearly across
+each triangle. That reproduces the original per-corner field exactly when the
+field is **affine** over the merged lattice, `v(i,j) == v00 + i*du + j*dv`, in
+exact integer arithmetic, on all five channels. Identical corners, which is
+what the merge used to demand, is just the constant case of that.
+
+An adversarial reviewer predicted this would collect very little, because
+vanilla truncates when it scales a colour by a face's shade factor, so a
+genuine ambient-occlusion ramp lands on unevenly spaced integers and is not
+exactly affine. That prediction was half right. It collects **2.5 points**,
+not the 20 the single-valued-lattice ceiling suggested, and what it collects
+is almost entirely the face whose shading is constant ALONG the run and varies
+only across it.
+
+| plains-rd64, 10,000 sections | Smooth Lighting on | Smooth Lighting off |
+|---|---|---|
+| Before | 3.4% | 18.0% |
+| **After** | **5.9%** | 18.0% |
+| Single-valued lattice, needs per-pixel work | 25.3% | 18.0% |
+| Full shader lighting | 29.5% | 29.5% |
+
+Nothing changes with Smooth Lighting off, and that is the expected answer
+rather than a disappointment: vanilla's flat path already gives every face one
+colour, so every mergeable face was already constant.
+
+The shipped mesher and `AffineMergeProbe`, two separate implementations, agree
+to the quad at 8,652,076. That cross-check is the reason the number is
+trusted, after a previous probe turned out to have drifted from the mesher it
+was modelling.
+
+**Frame time.** At `plains-rd32` / 1080p, where the translucent control holds
+to 0.196 to 0.197 ms across all four runs, the opaque GPU pass moves from
+**-3.1 percent to -6.5 percent** and the frame median from -1.7 to -4.7
+percent. It tracks the quad count almost exactly, again.
+
+At `plains-rd64` / 1440p an earlier edition of this section said it does not
+show, and **that conclusion was wrong in exactly the way this page's own
+same-session rule predicts**. The comparison was against the -6.0 percent
+figure measured before the change, which came from a DIFFERENT session, and
+the off-baselines had drifted 1.155 to 1.117 ms between those sessions, which
+is three times the effect being sought. Re-measured 2026-08-16 with seven
+runs pooled and MEDIANS used so the occasional one-frame spike cannot poison
+a mean:
+
+| rd 64, 1440p, Smooth Lighting on | Opaque pass median | n | sd |
+|---|---|---|---|
+| Greedy meshing off | 1.117 ms | 4 | 0.005 |
+| Greedy meshing on | **1.050 ms (-5.9%)** | 3 | 0.006 |
+
+The quad reduction at this distance is 5.9 percent and the pass reduction is
+5.9 percent: **the merge tracks the quad count at rd 64 exactly as it does
+everywhere else**, and the translucent control holds at 0.559 to 0.564 ms
+across all seven runs. There is no anomaly, and the weaker justification the
+earlier edition offered is withdrawn: the merge pays at both working points,
+proportionally to the quads it removes.
+
+#### What the merge costs the build threads
+
+Every number above is the win. The cost lives somewhere no frame-time
+benchmark can see it: the merge runs once per section build, on a ForkJoin
+worker, off the frame path entirely. Slower section builds are slower pop-in
+when a player flies or breaks blocks, so it is now reported in the debug stats
+line as `greedyMerge[...]`.
+
+At render distance 64 it is **268 microseconds per section**. Over the ~10,000
+sections of a full load that is about 2.7 CPU-seconds, spread across the build
+pool, so roughly a third of a second of extra wall time on a load that takes
+tens of seconds. On a single block placement it is 268 microseconds on one
+worker, which is nothing.
+
+The first reading was **430** microseconds. The affine test was materialising
+the whole (W+1)x(H+1) lattice and re-checking all of it at every step of the
+sweep's probing, and that turned out to be unnecessary: the seed cell alone
+pins the plane, so each cell can be tested against it exactly once. Removing
+the lattice took it to 268 and made the code shorter. Equivalence was measured
+rather than argued, since `AffineMergeProbe` still builds the lattice the old
+way: over 10,000 sections the two agree to the quad, 8,661,402 both.
+
+#### One more spike, and what the series says about it
+
+Two of the rd 64 / 1440p runs with the merge on recorded single frames of
+220.9 ms and 78.0 ms. Locating the second one in the raw series puts it at
+frame 17 of 600, right after warmup, and **no Meshelium stage timer accounts
+for it**: the largest stage anywhere near it is 1.36 ms. The vanilla leg of
+the same run has its own 9.5 ms spike at frame 105. Repeats of both pairs came
+back clean, with maxima of 4.18 and 4.27 ms. So the spikes are sporadic, they
+are not inside any measured stage, and they are not attributed to the merge.
+They are recorded here because a mean that one frame can move by 17 percent is
+why every table above carries a median column.

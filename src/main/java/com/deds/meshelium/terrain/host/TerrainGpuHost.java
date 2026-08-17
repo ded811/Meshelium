@@ -79,6 +79,23 @@ public interface TerrainGpuHost {
     long growArena(long newSizeBytes);
 
     /**
+     * The wave-16 inverse of {@link #growArena}: shrink the arena's LAST
+     * block onto a smaller backing, returning committed-but-untouched tail
+     * to the driver. Same atomicity contract, direction reversed - on
+     * success the implementation has allocated the smaller buffer,
+     * SUBMITTED a copy of {@code [0, copyBytes)} (the block's extent; the
+     * caller guarantees every live byte sits below it) plus a zero-fill of
+     * {@code [copyBytes, newSizeBytes)}, swapped the backing, and parked
+     * the old buffer for {@code FREE_FRAME_LAG}-fenced destruction. On
+     * failure nothing changed, and the caller simply keeps the tail - a
+     * refused trim costs memory, never correctness.
+     *
+     * @return the new opaque backing handle for
+     *         {@code TerrainArena.shrinkLastBlock}, or 0 on failure
+     */
+    long trimArena(long newSizeBytes, long copyBytes);
+
+    /**
      * A new arena block was just committed by the allocator: zero it.
      *
      * <p>The allocation itself happens through the {@code ArenaBacking}

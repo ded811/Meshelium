@@ -196,6 +196,50 @@ pipeline inherits it, including the occlusion box rasters, which are GEQUAL with
 depth writes off and colour writes masked. Nvidium was written against
 conventional depth.
 
+## The rebuild handover, and the hole that hid behind vanilla for three versions
+
+When a section is rebuilt, Meshelium must not stop being able to draw it for
+even one frame. That sounds obvious and it was broken from 1.2.0 to 1.3.0.
+
+Vanilla's order is: upload the new mesh, then promote it, then release the
+predecessor, all on the render thread within microseconds. Meshelium's upload
+seam cancels vanilla's upload and then, to keep vanilla's own bookkeeping
+honest, performs the promotion itself. But the seam runs on the **build
+worker**, and Meshelium's replacement is only *enqueued* at that point: it
+reaches the GPU a pump or more later. So the promotion released the
+predecessor before the successor existed, and for at least one frame that
+section had no old copy, no new copy, and no vanilla copy, because the seam
+had just cancelled that too.
+
+Every rebuild opened the hole. It was invisible for three versions because
+over land a missing section shows the terrain behind it and reads as nothing
+at all. The owner found it over an **ocean**, where the same hole shows unlit
+water and reads as a black chunk. The ocean was the detector, not the cause.
+
+The cure reuses the retention machinery: when a release finds a successor
+already queued for that position, the old copy is kept drawable and freed by
+the successor's own slot steal. It is deliberately **not** tied to the
+retained-horizon setting, because holding terrain past its render distance is
+a feature while holding it for one frame during a rebuild is correctness. The
+three ordinary eviction sweeps skip a copy whose successor is still queued;
+the force-evict path does not, because there the alternative is dropping a
+section and tripping the coverage guard, and a one-frame flash is the better
+of those two.
+
+`handoverHeld` in the debug stats counts it. In a minute of real flying with
+the seam armed it reached 3825, exactly matching `superseded` at every sample,
+with `retained` draining to zero throughout. Each of those is a black chunk
+that did not happen.
+
+**The testing lesson is the larger one.** Nothing caught this because no
+automated test in the project produced sustained rebuilds: the benchmark
+camera is a pinned spectator and every torture leg was static. A renderer
+whose bugs live in transitions cannot be tested only in steady states. The
+regression leg added with the fix forces block edits rather than a full
+`allChanged()` - the first attempt used `allChanged()` and passed vacuously,
+because that tears down the view area and takes an entirely different
+lifecycle that never opens the gap.
+
 ## The coverage guard: everything, or nothing
 
 This is the part worth stealing if you write renderers.
@@ -311,6 +355,91 @@ regression. Measurement beat the caps. The knobs stay in the shipped build
 precisely because NVIDIA's and Intel's optima are unknown and may well differ.
 The full sweep, including the rows that turned out to be noise, is in
 `docs/PERFORMANCE.md`.
+
+## Greedy meshing, and why it is off by default
+
+Adjacent block faces that would rasterise identically are merged into one
+larger quad before anything is packed. It runs on the chunk build worker,
+between vanilla's mesh decoder and Meshelium's encoder, and everything
+downstream (the arena, the culling, the shaders) sees nothing but a shorter
+list of ordinary quads.
+
+The merge predicate is deliberately conservative. Two faces merge only if the
+result draws exactly the pixels the originals did: same facing, same plane,
+same material, same sprite, same sprite ORIENTATION, and corner values that
+form an **affine** field over the merged lattice. That last condition is the
+exact one, not an approximation of it: a merged rectangle is one four-vertex
+quad, so the hardware interpolates its corners linearly, and linear
+interpolation reproduces an affine field exactly, whatever diagonal each
+original quad was split along. Translucent geometry is excluded outright, because Meshelium keeps
+vanilla's back to front sort and has a resort path keyed to it. Crosses like
+grass tufts and flowers are excluded too: they sit at 45 degrees and have no
+plane to merge within. Nothing merges across a section boundary, by
+construction.
+
+**Vanilla's per-vertex lighting is the whole story.** With Smooth Lighting on,
+ambient occlusion is baked per VERTEX, so most faces are shaded ramps, and two
+ramps only merge when the combined ramp is still a straight line. Measured over
+ten thousand real sections at render distance 64: **5.9 percent** fewer quads
+with Smooth Lighting on, **18.0 percent with it off**, at which point nothing
+is disqualified for its corners at all.
+
+The frame time follows the quad count almost exactly, because the opaque pass
+here is close to purely primitive bound: 18.0 percent off that pass at render
+distance 64 and 16.9 percent at 32, with Smooth Lighting off. The whole frame
+moves 8 to 10 percent. With Smooth Lighting on it is 2 to 5 percent.
+
+So it ships **off by default**, as an Advanced row rather than a headline. A
+setting that does almost nothing for a player on default settings should not
+be presented as a free win, and the honest way to describe its real effect is
+in milliseconds: it removes about 0.23 ms per frame at render distance 64 and
+1440p, which is 8 percent of a 2.7 ms bench frame and rather less of a real
+one. The numbers, including the ones that argue against it and the ones this
+project got wrong first, are in `docs/PERFORMANCE.md`.
+
+### Making a stretched quad tile its sprite
+
+The interesting engineering problem is texturing. Meshelium's UV field holds
+**absolute atlas coordinates**, and vanilla's block atlas sampler is
+`CLAMP_TO_EDGE` on both axes, so simply stretching a quad would smear one row
+of texels across sixteen blocks instead of repeating the sprite.
+
+So the merged quad keeps one tile's UVs and carries a **tile count** instead.
+Runs are powers of two up to 16, which is a section's width, and the pair rides
+in the five spare bits of the material byte as a single joint index,
+`log2(u) * 5 + log2(v)`. Two independent 2-bit fields could not hold five
+values per axis, and three bits each would need nine bits of an eight bit byte.
+The mesh stage unpacks that index once per quad and passes the sprite rectangle
+and the repeat count down as flat varyings; the fragment stage folds the
+interpolated coordinate back inside the rectangle.
+
+One subtlety is worth stating because getting it wrong is invisible in a
+screenshot and obvious in play: `fract()` is discontinuous at every tile
+boundary, so a hardware derived gradient spikes there, the sampler picks the
+smallest mip, and the seams appear as a sharp grid at distance. The gradient is
+therefore taken from the **unwrapped** coordinate and fed to `textureGrad`,
+which keeps it continuous across the fold.
+
+Quads the mesher did not touch encode to a pair index of zero, which is a
+repeat of one by one and a bit identical material byte, and take the
+vanilla verbatim sampling path untouched.
+
+## Idle memory trim
+
+Terrain memory grows in large blocks so that growth is rare, which means the
+top block is mostly headroom: at render distance 64 the measured shape was
+528 MiB in use inside 1024 MiB committed. When the world has been settled
+for half a minute, Meshelium copies the top block's used extent onto a
+right-sized buffer and returns the rest to the graphics card - 488 MiB in
+that shape - leaving the arena at 98 percent occupancy. Flying somewhere new
+simply grows the arena again through the ordinary ladder.
+
+The copy is bounded by what is actually used, runs on the same fence-gated
+retirement path growth has always used, and never fires in a pump that has
+upload work in flight. The quiet detector deliberately measures staged
+VOLUME rather than perfect silence, because a live server ticks blocks
+forever and perfect silence never comes. Advanced row "Idle Memory Trim",
+default on; off restores the old keep-everything behavior byte for byte.
 
 ## A known precision trade, inherited deliberately
 

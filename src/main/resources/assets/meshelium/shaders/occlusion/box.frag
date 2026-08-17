@@ -77,6 +77,22 @@ layout(set = 0, binding = 3, std430) buffer StampOut {
     uint stampOut[];
 };
 
+#if MESHELIUM_MARK_NEW
+// SECTION pipeline only: the newly-visible mark that lets conditional
+// rendering skip phase B on frames with nothing to reveal. A section is
+// newly visible when its stamp TRANSITIONS to FrameStamp (the exchange's
+// return value identifies exactly the transitioning invocation) and it was
+// not marked last frame. The region pipeline compiles without this: regions
+// have no prev buffer, and a region transition does not imply a phase-B
+// draw.
+layout(set = 0, binding = 6, std430) readonly buffer PrevStamps {
+    uint prevStamps[];
+};
+layout(set = 0, binding = 7, std430) buffer PhaseBPredicate {
+    uint phaseBPredicate;
+};
+#endif
+
 layout(push_constant) uniform OccPush {
     uint FrameStamp;
 };
@@ -117,6 +133,18 @@ void main() {
     // for it is the per-fragment L2 round trip this exists to delete.
     uint id = vBoxId;
     if (stampOut[id] != FrameStamp) {
+#if MESHELIUM_MARK_NEW
+        // The return value makes the mark exact: of all fragments that pass
+        // the stale-read guard, exactly one exchange returns the
+        // pre-transition value. The guard read being stale only ADDS
+        // exchanges that return FrameStamp and mark nothing - fail-open in
+        // the direction of running phase B, never of skipping it.
+        uint old = atomicExchange(stampOut[id], FrameStamp);
+        if (old != FrameStamp && prevStamps[id] != FrameStamp - 1u) {
+            phaseBPredicate = 1u;
+        }
+#else
         atomicExchange(stampOut[id], FrameStamp);
+#endif
     }
 }

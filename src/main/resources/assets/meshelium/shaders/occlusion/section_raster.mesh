@@ -76,6 +76,20 @@ layout(set = 0, binding = 5, std430) readonly buffer SectionRecords {
     ivec4 sectionRecords[];
 };
 
+#if MESHELIUM_MARK_NEW
+// The phase-B predicate mark, mirrored from box.frag: the camera-inside
+// force below is a stamp WRITER too, and a writer that does not mark would
+// be the one hole in the at-least-once argument (a section the camera just
+// entered is newly visible and phase B is exactly what draws it that
+// frame).
+layout(set = 0, binding = 6, std430) readonly buffer PrevStamps {
+    uint prevStamps[];
+};
+layout(set = 0, binding = 7, std430) buffer PhaseBPredicate {
+    uint phaseBPredicate;
+};
+#endif
+
 layout(push_constant) uniform OccPush {
     uint FrameStamp;
 };
@@ -142,7 +156,14 @@ void main() {
         // Camera inside the inflated section box → forced visible (the
         // near-plane story: see region_raster.mesh header).
         if (all(lessThanEqual(lo, vec3(0.0))) && all(greaterThanEqual(hi, vec3(0.0)))) {
+#if MESHELIUM_MARK_NEW
+            uint old = atomicExchange(stampOut[globalIdx], FrameStamp);
+            if (old != FrameStamp && prevStamps[globalIdx] != FrameStamp - 1u) {
+                phaseBPredicate = 1u;
+            }
+#else
             atomicExchange(stampOut[globalIdx], FrameStamp);
+#endif
         }
     }
 }

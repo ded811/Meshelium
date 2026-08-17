@@ -109,6 +109,24 @@ loom {
 			if (project.hasProperty('meshelium.terrain')) {
 				vmArg '-Dmeshelium.terrainDraw=true'
 			}
+			// `-Pmeshelium.probe.greedy=true` arms GreedyMeshProbe: every
+			// decoded section is run through a real greedy merge, the result
+			// counted, and the merge thrown away. Measurement only, nothing
+			// rendered changes. It costs CPU on every build worker, so it is
+			// a property and never a setting.
+			if (project.hasProperty('meshelium.probe.greedy')) {
+				vmArg '-Dmeshelium.probe.greedy=true'
+			}
+			// `-Pmeshelium.seed=<seed>` picks a different world for the bench.
+			// The default 4242 is fixed for comparability, which is right for
+			// frame timings and wrong for anything that depends on what the
+			// terrain is MADE of: the owner pointed out 4242's spawn is heavy
+			// on snow and ice, and ice is a single-variant block that merges
+			// far better than grass. A biome-sensitive measurement has to be
+			// taken on more than one world.
+			if (project.hasProperty('meshelium.seed')) {
+				vmArg "-Dmeshelium.bench.seed=${project.property('meshelium.seed')}"
+			}
 			// Wave-9 harness support.
 			// `-Pmeshelium.bench=<scene>` turns the run into a BENCHMARK run:
 			// the gametest entrypoint list is swapped to exactly

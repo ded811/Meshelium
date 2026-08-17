@@ -508,6 +508,65 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
         return grown.vkBuffer();
     }
 
+    /**
+     * Wave-16 trim: {@link #growArena} reversed. The copy is bounded by the
+     * block's EXTENT rather than its capacity, which is the entire point -
+     * at rd 64 the measured shape was a 512 MiB top block whose extent was
+     * ~20 MiB, so the trim's one GPU copy moves twenty megabytes to give
+     * five hundred back. The zero-fill of {@code [copyBytes, newSizeBytes)}
+     * keeps the standup invariant that bytes below capacity are defined.
+     * Failure is caught here and leaves every field untouched, exactly like
+     * growth: the caller keeps the tail, nothing breaks.
+     */
+    @Override
+    public long trimArena(long newSizeBytes, long copyBytes) {
+        long oldSize = arenaBacking.lastBlockBytes();
+        if (newSizeBytes >= oldSize || copyBytes > newSizeBytes || newSizeBytes <= 0) {
+            return 0L;
+        }
+        MesheliumVkBuffers.DeviceBuffer shrunk = null;
+        try {
+            shrunk = MesheliumVkBuffers.createDeviceLocal(vma, newSizeBytes,
+                    VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                            | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    "vmaCreateBuffer(meshelium terrain arena trim)");
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkCommandBuffer cb = encoder.allocateAndBeginTransientCommandBuffer();
+                if (copyBytes < newSizeBytes) {
+                    VK10.vkCmdFillBuffer(cb, shrunk.vkBuffer(), copyBytes,
+                            newSizeBytes - copyBytes, 0);
+                }
+                if (copyBytes > 0) {
+                    VkBufferCopy.Buffer region = VkBufferCopy.calloc(1, stack);
+                    region.get(0).srcOffset(0).dstOffset(0).size(copyBytes);
+                    VK10.vkCmdCopyBuffer(cb, arenaBacking.lastBlockBuffer(), shrunk.vkBuffer(),
+                            region);
+                }
+                VulkanCommandEncoder.memoryBarrier(cb, stack);
+                checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(meshelium arena trim)");
+                encoder.execute(cb);
+            }
+        } catch (Throwable t) {
+            if (shrunk != null) {
+                MesheliumVkBuffers.destroy(vma, shrunk.vkBuffer(), shrunk.allocation());
+            }
+            MesheliumClient.LOGGER.warn(
+                    "Meshelium terrain arena trim to {} MiB failed (the tail stays committed; "
+                            + "nothing else changes): {}",
+                    newSizeBytes >> 20, t.toString());
+            return 0L;
+        }
+        long[] old = arenaBacking.swapForGrowth(shrunk, newSizeBytes);
+        retiredBackings.addLast(new long[] {currentFrame, old[0], old[1]});
+        MesheliumClient.LOGGER.info(
+                "Meshelium terrain arena trimmed {} -> {} MiB ({} MiB returned to the driver; "
+                        + "one {} MiB copy; old buffer retires after {} frames; regrowth is the "
+                        + "ordinary wave-14 ladder)",
+                oldSize >> 20, newSizeBytes >> 20, (oldSize - newSizeBytes) >> 20,
+                copyBytes >> 20, FREE_FRAME_LAG);
+        return shrunk.vkBuffer();
+    }
+
     /** Wave-14 probe: outgrown arena backings destroyed after their fence lag. */
     public static long arenaBuffersRetired() {
         return arenaBuffersRetired;

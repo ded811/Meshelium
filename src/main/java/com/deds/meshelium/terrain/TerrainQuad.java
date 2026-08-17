@@ -27,11 +27,26 @@ import java.util.Objects;
  * @param translucent true = goes into the translucent prefix
  * @param alphaCutoffIndex 0..2 into {@code float[]{0.0, 0.1, 0.5}}
  * @param mip whether the fragment shader samples with mipping
+ * @param repeatU how many times the sprite tiles along the quad's U axis
+ * @param repeatV how many times the sprite tiles along the quad's V axis
  */
 public record TerrainQuad(QuadFacing facing, boolean translucent,
                           int alphaCutoffIndex, boolean mip,
                           TerrainVertex v0, TerrainVertex v1,
-                          TerrainVertex v2, TerrainVertex v3) {
+                          TerrainVertex v2, TerrainVertex v3,
+                          int repeatU, int repeatV) {
+
+    /**
+     * A plain unmerged quad: one tile, no repeat.
+     *
+     * <p>Every producer except {@link GreedyMesher} uses this, which keeps
+     * the merge opt-in at the type level rather than by convention.</p>
+     */
+    public TerrainQuad(QuadFacing facing, boolean translucent,
+            int alphaCutoffIndex, boolean mip,
+            TerrainVertex v0, TerrainVertex v1, TerrainVertex v2, TerrainVertex v3) {
+        this(facing, translucent, alphaCutoffIndex, mip, v0, v1, v2, v3, 1, 1);
+    }
 
     public TerrainQuad {
         Objects.requireNonNull(facing, "facing");
@@ -42,6 +57,11 @@ public record TerrainQuad(QuadFacing facing, boolean translucent,
         if (alphaCutoffIndex < 0 || alphaCutoffIndex > 2) {
             throw new IllegalArgumentException("alphaCutoffIndex must be 0..2, got " + alphaCutoffIndex);
         }
+    }
+
+    /** True when this quad tiles its sprite, i.e. the mesher merged it. */
+    public boolean merged() {
+        return repeatU != 1 || repeatV != 1;
     }
 
     public TerrainVertex vertex(int i) {

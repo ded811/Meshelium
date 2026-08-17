@@ -227,6 +227,18 @@ public final class TerrainResidency {
 
     /** Encoded, waiting for the render-thread pump. Insertion-ordered. */
     private static final LinkedHashMap<Object, PendingUpload> pendingUploads = new LinkedHashMap<>();
+    /**
+     * How many queued uploads each section POSITION has, so a release can
+     * ask "is a successor already on its way here?" without scanning.
+     *
+     * <p>{@link #pendingUploads} is keyed by mesh identity, which is the
+     * right key for its own lifecycle and the wrong one for that question:
+     * a rebuild's successor is a DIFFERENT mesh object at the SAME position.
+     * Every mutation of {@code pendingUploads} goes through
+     * {@link #pendingPosAdd} / {@link #pendingPosDrop} so the two cannot
+     * drift.</p>
+     */
+    private static final java.util.HashMap<Long, Integer> pendingByPos = new java.util.HashMap<>();
     /** Mesh identity → its arena/region residency. */
     private static final IdentityHashMap<Object, Resident> resident = new IdentityHashMap<>();
     /**
@@ -276,6 +288,25 @@ public final class TerrainResidency {
     private static long evictedByDisable;
     /** Times an alloc/budget failure was answered by eviction+requeue. */
     private static long retainedBackpressure;
+    /**
+     * Old copies held across a rebuild because their successor's upload was
+     * still queued. Every one of these is a black chunk that did not happen.
+     */
+    private static long handoverRetained;
+    /** Wave-16: quiet-time trims of the arena's committed-but-untouched tail. */
+    private static long arenaTrims;
+    /**
+     * Last pump that had arena work in flight, in monotonic millis. The
+     * trim fires only after {@code meshelium.tune.arenaTrimQuietSec} of
+     * silence, so its one GPU copy can never land inside load-in or a
+     * rebuild storm - the exact moments the grow-and-copy spikes taught
+     * this codebase to fear.
+     */
+    private static long lastBusyMillis;
+    /** Arena bytes staged THIS pump; the trim's hard no-swap condition. */
+    private static long stagedBytesThisPump;
+    /** Arena bytes staged since the quiet timer last reset (trickle meter). */
+    private static long stagedBytesSinceQuiet;
 
     /**
      * Wave-11 arena high-water mark: past this fraction of the arena's
@@ -536,6 +567,18 @@ public final class TerrainResidency {
     // ------------------------------------------------------------------
     // Probes (tests, debug line)
     // ------------------------------------------------------------------
+
+    /**
+     * Old copies held across a rebuild until their successor's upload
+     * landed. Each one is a section that would otherwise have had NO
+     * drawable copy for a frame or more, which with the upload seam armed
+     * means nobody drew it at all. The harness asserts this rises.
+     */
+    public static long handoverRetained() {
+        synchronized (LOCK) {
+            return handoverRetained;
+        }
+    }
 
     public static Counters counters() {
         synchronized (LOCK) {
@@ -820,8 +863,23 @@ public final class TerrainResidency {
                     pendingUploads.put(mesh, new PendingUpload(sx, sy, sz, encoded, translucent));
             if (previous != null) {
                 staleParks++; // one mesh, two encodings — should be impossible
+                pendingPosDrop(previous.sx(), previous.sy(), previous.sz());
             }
+            pendingPosAdd(sx, sy, sz);
         }
+    }
+
+    private static void pendingPosAdd(int sx, int sy, int sz) {
+        pendingByPos.merge(posPack(sx, sy, sz), 1, Integer::sum);
+    }
+
+    private static void pendingPosDrop(int sx, int sy, int sz) {
+        pendingByPos.compute(posPack(sx, sy, sz), (k, n) -> n == null || n <= 1 ? null : n - 1);
+    }
+
+    /** Is another encoding for this position already queued for the GPU? */
+    private static boolean successorQueued(int sx, int sy, int sz) {
+        return pendingByPos.containsKey(posPack(sx, sy, sz));
     }
 
     /**
@@ -970,11 +1028,48 @@ public final class TerrainResidency {
             PendingUpload pending = pendingUploads.remove(mesh);
             if (pending != null) {
                 discardedBeforeUpload++;
+                pendingPosDrop(pending.sx(), pending.sy(), pending.sz());
                 return;
             }
             Resident r = resident.remove(mesh);
             if (r == null) {
                 return;
+            }
+            // THE HANDOVER GAP (fixed 2026-08-15; the owner's "ocean flashes
+            // black" report).
+            //
+            // A rebuild releases the OLD mesh while its successor's upload is
+            // still queued. Freeing here leaves the position with no drawable
+            // copy until the pump catches up - and with the upload seam armed
+            // vanilla has no copy either, because the seam cancelled it and
+            // then, faithfully emulating vanilla's bookkeeping, called
+            // checkSectionMesh, which is the very call that lands here. So
+            // the seam was freeing Meshelium's only copy of a section a frame
+            // or more before its replacement existed.
+            //
+            // Over land the hole shows the terrain behind it and nobody
+            // notices. Over an ocean it shows straight down into unlit water
+            // and reads as a black chunk, which is how it was finally seen,
+            // three versions after it shipped.
+            //
+            // The cure is the wave-11 retention path, which already exists
+            // for exactly this shape of problem: keep the old copy drawing,
+            // and let the successor's upload supersede it through the slot
+            // steal. Deliberately NOT gated on retainTerrainEnabled - that
+            // setting is about holding terrain past its render distance,
+            // which is a feature. Holding it for the frame between a rebuild
+            // and its upload is correctness, and a player who turned the
+            // feature off did not ask for holes.
+            if (r.ownsSlot && arena != null && successorQueued(r.sx, r.sy, r.sz)) {
+                if (regionStore.markRetained(r.regionKey, r.posKey, r)) {
+                    r.orphanedAtMillis = monotonicMillis();
+                    retained.put(posPack(r.sx, r.sy, r.sz), r);
+                    quadsResident -= r.quadCount;
+                    retainedQuads += r.quadCount;
+                    handoverRetained++;
+                    drawEpoch++;
+                    return;
+                }
             }
             if (r.ownsSlot && inSlotReset() && MesheliumConfig.retainTerrainEnabled()
                     && arena != null) {
@@ -1026,6 +1121,24 @@ public final class TerrainResidency {
             retainedSuperseded++;
             drawEpoch++;
         }
+    }
+
+    /**
+     * A retained copy that must NOT be evicted, whatever the pressure.
+     *
+     * <p>An entry whose position still has a queued upload is not horizon
+     * decoration, it is the only drawable copy of a section that is being
+     * rebuilt right now. Evicting it is precisely the hole this retention
+     * exists to prevent, so every eviction sweep skips it. It stops being
+     * protected the moment its successor lands, and the slot steal in the
+     * upload path removes it then anyway.</p>
+     *
+     * <p>Cheap by construction: the sweeps walk retained in age order and a
+     * handover entry is always among the youngest, so this test is reached
+     * rarely and answers false almost always.</p>
+     */
+    private static boolean awaitingSuccessor(Resident r) {
+        return successorQueued(r.sx, r.sy, r.sz);
     }
 
     /** Common tail of every retained-copy release path. Caller bumps counters/epoch. */
@@ -1097,6 +1210,7 @@ public final class TerrainResidency {
             retained.clear();
             parkedQuads = 0;
             pendingUploads.clear();
+            pendingByPos.clear();
             resident.clear();
             freeEpochs.clear();
             pendingPrefixUploads.clear();
@@ -1139,6 +1253,10 @@ public final class TerrainResidency {
         synchronized (LOCK) {
             arena = attached;
             sectionRecordsHandle = recordsHandle;
+            // A fresh world starts busy by definition: the entire load-in
+            // is about to happen, and a trim before it would only be
+            // regrown through.
+            lastBusyMillis = monotonicMillis();
         }
     }
 
@@ -1159,6 +1277,7 @@ public final class TerrainResidency {
             // direction is over-retention, which pressure eviction bounds;
             // this makes even that transient.
             RESET_DEPTH.get()[0] = 0;
+            stagedBytesThisPump = 0;
             if (!gpu.beginFrame(frame)) {
                 return;
             }
@@ -1171,6 +1290,7 @@ public final class TerrainResidency {
                 evictRetainedLocked();
                 drainPendingUploadsLocked(gpu);
                 drainPendingPrefixUploadsLocked(gpu);
+                maybeTrimArenaLocked(gpu);
             }
             regionStore.commitDirty(gpu);
             gpu.endFrame();
@@ -1217,6 +1337,9 @@ public final class TerrainResidency {
             Iterator<Resident> it = retained.values().iterator();
             while (it.hasNext() && budget-- > 0) {
                 Resident r = it.next();
+                if (awaitingSuccessor(r)) {
+                    continue;
+                }
                 it.remove();
                 freeRetainedLocked(r);
                 evictedByDisable++;
@@ -1232,6 +1355,9 @@ public final class TerrainResidency {
                 Resident r = it.next();
                 if (r.orphanedAtMillis > cutoff) {
                     break; // insertion order == age order: the rest is younger
+                }
+                if (awaitingSuccessor(r)) {
+                    continue;
                 }
                 it.remove();
                 freeRetainedLocked(r);
@@ -1261,6 +1387,9 @@ public final class TerrainResidency {
         while (it.hasNext() && budget > 0
                 && (usedQuads > arenaHighWater || regionStore.regionCount() > regionHighWater)) {
             Resident r = it.next();
+            if (awaitingSuccessor(r)) {
+                continue;
+            }
             it.remove();
             usedQuads -= r.quadCount;
             freeRetainedLocked(r);
@@ -1282,6 +1411,15 @@ public final class TerrainResidency {
      * {@value #FREE_FRAME_LAG} entries in the worst case — the correct
      * bias (retained horizon is decoration; live coverage is the
      * guard's contract).
+     *
+     * <p><b>This one does NOT skip handover copies</b>, unlike the three
+     * ordinary sweeps. Those skip them because evicting a section's only
+     * drawable copy while its replacement is in flight is the whole bug
+     * this retention prevents. Here the alternative is dropping the
+     * incoming section outright, which trips the coverage guard and makes
+     * Meshelium passive for the rest of the world. A one-frame flash beats
+     * that, and this method's own bias statement above already says so:
+     * live coverage is the guard's contract.</p>
      *
      * @return true when at least one retained entry was evicted
      */
@@ -1321,7 +1459,7 @@ public final class TerrainResidency {
         while (it.hasNext()) {
             Resident r = it.next();
             byte[] prefix = r.translucent.prefix;
-            if (!gpu.stageArenaCopyLate(java.nio.ByteBuffer.wrap(prefix),
+            if (!gpu.stageArenaCopyLate(meterPrefixStage(prefix),
                     arena.blockOf(r.arenaAddr), arena.byteOffsetInBlock(r.arenaAddr))) {
                 break; // ring full — the rest is next pump's backlog
             }
@@ -1352,6 +1490,11 @@ public final class TerrainResidency {
         while (it.hasNext() && budget > 0) {
             Map.Entry<Object, PendingUpload> entry = it.next();
             PendingUpload p = entry.getValue();
+            // The position index is reconciled once, in the finally below,
+            // rather than beside each of this loop's five removal sites.
+            // Patching them individually is how one gets missed, and a
+            // pendingByPos that over-counts would retain a copy forever.
+            Object key = entry.getKey();
             boolean removed = false;
             try {
                 int bytes = p.encoded().geometryBytes();
@@ -1484,6 +1627,7 @@ public final class TerrainResidency {
                 uploadedSections++;
                 quadsResident += r.quadCount;
                 budget -= bytes;
+                stagedBytesThisPump += bytes;
             } catch (Throwable t) {
                 // One bad section (e.g. a modded world outside the 9-bit
                 // chunkY budget) must not kill the pump for the session.
@@ -1493,6 +1637,10 @@ public final class TerrainResidency {
                 noteGuardTripLocked("encoding", 0, 0);
                 droppedEncoding++;
                 recordError("upload: " + t);
+            } finally {
+                if (!pendingUploads.containsKey(key)) {
+                    pendingPosDrop(p.sx(), p.sy(), p.sz());
+                }
             }
         }
     }
@@ -1511,6 +1659,96 @@ public final class TerrainResidency {
      * counted separately); the caller then falls through to the wave-11
      * retained eviction and, last, the honest wave-8 drop.
      */
+    /**
+     * Wave-16 quiet-time trim: hand the arena's committed-but-untouched
+     * tail back to the driver.
+     *
+     * <p>Measured before built (PERFORMANCE.md 2026-08-16): an rd 64
+     * session holds 492 to 496 MiB of tail with zero empty blocks, so
+     * whole-block release recovers nothing and a shrink-copy of the last
+     * block's extent recovers nearly all of it. The copy is bounded by the
+     * EXTENT, roughly 20 MiB in that shape, and fires only after
+     * {@code meshelium.tune.arenaTrimQuietSec} (default 30) of no arena
+     * work, so it can never land inside load-in or a rebuild storm.
+     * Regrowth after a trim is the ordinary wave-14 ladder; the quiet
+     * window is what keeps the two from oscillating.</p>
+     *
+     * <p>Skipped unless the saving clears
+     * {@code meshelium.tune.arenaTrimMinMiB} (default 64): a trim that
+     * returns pennies still costs a copy and a retired buffer, and the
+     * point is the half gigabyte, not the pennies.</p>
+     */
+    private static void maybeTrimArenaLocked(TerrainGpuHost gpu) {
+        long now = monotonicMillis();
+        // TWO conditions, deliberately different, because the first build
+        // conflated them and could never fire in a real world.
+        //
+        // The TIMER measures "is the world settled". A live server random
+        // ticks blocks forever - grass spreads, fluids flow - so a real
+        // world recompiles a section every few seconds and is never
+        // perfectly idle; a timer that reset on every trickle rebuild made
+        // the trim fire only in a void superflat, which is exactly the
+        // world the test used and exactly the world no player is in. So
+        // the timer resets only when staged VOLUME says real streaming is
+        // happening (load-in moves hundreds of MiB; the tick trickle moves
+        // kilobytes), or when growth is queued.
+        stagedBytesSinceQuiet += stagedBytesThisPump;
+        if (stagedBytesSinceQuiet > (8L << 20) || pendingGrowOption > 0) {
+            lastBusyMillis = now;
+            stagedBytesSinceQuiet = 0;
+        }
+        // The HARD condition is "is THIS pump safe to swap in". Any arena
+        // bytes staged this pump would be recorded at endFrame against
+        // whichever backing is current by then, so swapping mid-pump under
+        // them is forbidden absolutely - but it only skips THIS pump, it
+        // does not reset the timer. The trickle keeps its own rebuilds
+        // safe the same way: on their pump the trim yields, on the next
+        // quiet pump it fires.
+        if (stagedBytesThisPump > 0 || !pendingUploads.isEmpty()
+                || !pendingPrefixUploads.isEmpty()) {
+            return;
+        }
+        if (!MesheliumConfig.arenaTrimEnabled()
+                || now - lastBusyMillis < Long.getLong("meshelium.tune.arenaTrimQuietSec", 30L) * 1000L) {
+            return;
+        }
+        long capacity = arena.lastBlockBytes();
+        long extent = arena.lastBlockExtentBytes();
+        // Round the target up to whole MiB, floored so a nearly-empty top
+        // block cannot shrink to a sliver the next join would immediately
+        // regrow through.
+        long target = Math.max(extent, 16L << 20);
+        target = (target + (1L << 20) - 1) >> 20 << 20;
+        long minSave = Long.getLong("meshelium.tune.arenaTrimMinMiB", 64L) << 20;
+        if (capacity - target < minSave) {
+            return;
+        }
+        long newHandle = gpu.trimArena(target, extent);
+        if (newHandle == 0L) {
+            // Refused (allocation failed mid-pressure, say). Re-arm the
+            // quiet timer rather than retrying every pump: a driver that
+            // just said no does not want to be asked 700 times a second.
+            lastBusyMillis = now;
+            return;
+        }
+        arena.shrinkLastBlock(target, newHandle);
+        arenaTrims++;
+        drawEpoch++;
+    }
+
+    /** Wave-16 probe: quiet-time tail trims this session. */
+    public static long arenaTrims() {
+        synchronized (LOCK) {
+            return arenaTrims;
+        }
+    }
+
+    /** Meter a resort-prefix restage for the trim's trickle accounting. */
+    private static java.nio.ByteBuffer meterPrefixStage(byte[] prefix) {
+        stagedBytesThisPump += prefix.length;
+        return java.nio.ByteBuffer.wrap(prefix);
+    }
+
     private static boolean growArenaLocked(TerrainGpuHost gpu, int quadCount) {
         long ceiling = MesheliumScaling.arenaCeilingBytes();
         long current = arena.memoryBytes();
@@ -1667,18 +1905,19 @@ public final class TerrainResidency {
         Counters c = countersLocked();
         MesheliumClient.LOGGER.info(
                 "meshelium residency: sections={} quads={} retained={}/{} quads arena={}/{} MiB "
-                        + "(ceiling {} MiB, growths={}, growthFailures={}) "
+                        + "(ceiling {} MiB, growths={}, trims={}, growthFailures={}) "
                         + "holes={} MiB tail={} MiB emptyTopBlocks={}/{} "
                         + "regions={} (dirty {}) stagingBacklog={} entries/{} KiB ringUsed={} KiB "
                         + "freesPending={} encoded={} uploaded={} "
                         + "drops[oversize={},arena={},region={},encode={}] "
                         + "retention[orphaned={},superseded={},evictAge={},evictPressure={},"
-                        + "evictOff={},backpressure={}]",
+                        + "evictOff={},backpressure={}] handoverHeld={} discarded={} staleParks={} "
+                        + "greedyMerge[{}]",
                 c.sectionsResident(), c.quadsResident(),
                 c.retainedSections(), c.retainedQuads(),
                 c.arenaUsedBytes() >> 20, c.arenaCapacityBytes() >> 20,
                 MesheliumScaling.arenaCeilingBytes() >> 20,
-                c.arenaGrowths(), c.arenaGrowthFailures(),
+                c.arenaGrowths(), arenaTrims, c.arenaGrowthFailures(),
                 // holes = what compaction could recover; tail = what is
                 // already free above the high-water mark and needs no
                 // compaction at all. Keeping them apart is the whole point:
@@ -1693,7 +1932,18 @@ public final class TerrainResidency {
                 c.droppedOversize(), c.droppedArenaFull(), c.droppedRegionBudget(),
                 c.droppedEncoding(),
                 c.orphanedSections(), c.retainedSuperseded(), c.evictedByAge(),
-                c.evictedByPressure(), c.evictedByDisable(), c.retainedBackpressure());
+                c.evictedByPressure(), c.evictedByDisable(), c.retainedBackpressure(),
+                // handoverHeld: old copies kept alive across a rebuild until
+                // their successor landed. Each one is a black chunk that did
+                // not happen, so this rising while the picture stays clean IS
+                // the fix working. discarded/staleParks are the two ways an
+                // encoded section can vanish before reaching the GPU, and
+                // both were invisible in this line while the bug was hunted.
+                handoverRetained, c.discardedBeforeUpload(), c.staleParks(),
+                // The other side of the merge's ledger: what it costs the
+                // build workers. Off the frame path, so no bench frame time
+                // can show it, but slower section builds are slower pop-in.
+                com.deds.meshelium.terrain.GreedyMesher.costSummary());
         // The other half of the terrain bill: vanilla's own copy, which
         // nothing draws while Meshelium owns the frame. Measured, not
         // derived - see VanillaTerrainCensus.

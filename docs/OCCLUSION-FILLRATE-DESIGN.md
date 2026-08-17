@@ -1029,6 +1029,40 @@ be data-driven per frame rather than a blanket disable.
 percent, it is not worth shipping terrain holes for, and the bigger lever is
 still simply enabling occlusion where it already wins.
 
+#### Attempt 2: the conditional-rendering predicate (2026-08-16), and why it is default-off
+
+Attempt 2 built the exact skip attempt 1's post-mortem prescribed. The
+section raster's stamp writers detect the newly-visible transition from the
+atomicExchange return value, check prevStamps, and set a 4-byte predicate;
+vkCmdBeginConditionalRenderingEXT wraps the phase-B dispatches; the stats CB
+zeroes the predicate after each consume. No CPU readback, no lag, no reveal
+artifact - the camera-cut leg passes, and a same-session pair at
+plains-rd64 / 1440p shows the mechanism doing precisely what it promised:
+
+| | phase B GPU | frame p50 | frame p99 | worst |
+|---|---|---|---|---|
+| direct draws | 0.239 ms | 2.256 ms | 3.62 ms | 4.2 ms |
+| predicate | **0.008 ms** | 2.223 ms | **10.62 ms** | 67.8 ms |
+
+The dispatches vanish and the frame does not care: a 0.033 ms median win
+against the 0.163 ms ceiling re-measured the same day, and a TAIL that fails
+this document's own worst-frame-within-2x gate by a factor of eight. The
+slow frames are periodic - roughly every 16 to 21 frames, 8 to 11 ms each -
+which reads as the driver servicing conditional rendering on a slow path at
+a fixed cadence, not as anything this codebase does at that rhythm.
+
+So the feature ships DEFAULT OFF everywhere, machinery intact, behind
+`meshelium.occlusion.phaseBPredicate`. The multiWG lesson applies inverted:
+that knob is default-on only for the vendor where it was measured to win,
+and this one is default-off because the only vendor ever measured LOSES.
+NVIDIA has shipped native command-processor predication since well before
+Turing, so the property exists precisely so that silicon can be measured
+without a rebuild. Any default flip must be per-vendor, per-measurement.
+
+The 8 to 12 percent remains real and unclaimed. The remaining paths to it
+are a CPU-side skip fed by the stats readback (one-frame-late, the reveal
+artifact attempt 1 rejected) or waiting out the driver.
+
 Both scenes, not one. The ground-level scene is the hard one and it is the
 one that exposed the bug, so a win at `plains-rd32` alone would prove
 nothing. `plains-rd64` should be reported alongside but is not the gate,

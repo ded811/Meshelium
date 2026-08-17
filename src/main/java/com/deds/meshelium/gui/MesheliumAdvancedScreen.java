@@ -80,10 +80,11 @@ public class MesheliumAdvancedScreen extends Screen {
 
         // The dev-override census is per screen, following the precedent on
         // the main screen: a -D flag must not raise a banner over rows the
-        // screen it appears on cannot show. Only the two properties that
-        // lock a row HERE count.
+        // screen it appears on cannot show. Only properties that lock a row
+        // HERE count.
         boolean statsOverridden = System.getProperty("meshelium.debugStats") != null;
-        if (statsOverridden) {
+        boolean greedyOverridden = System.getProperty("meshelium.greedyMeshing") != null;
+        if (statsOverridden || greedyOverridden) {
             MultiLineTextWidget banner = new MultiLineTextWidget(
                     Component.translatable("meshelium.options.dev_override"), this.font);
             banner.setMaxWidth(BANNER_WIDTH);
@@ -99,6 +100,37 @@ public class MesheliumAdvancedScreen extends Screen {
             locked.setCentered(true);
             this.layout.addChild(locked, s -> s.paddingTop(2).paddingBottom(2));
         }
+
+        // First row, because it is the only one here that changes frame rate.
+        // The tick watches this field for the edge and reloads the terrain, so
+        // nothing needs doing beyond writing it: sections already compiled are
+        // never recompiled on their own, and a setting that appears to do
+        // nothing until the player walks away and back is a bug report.
+        CycleButton<Boolean> greedy = CycleButton.onOffBuilder(config.greedyMeshing)
+                .create(Component.translatable("meshelium.options.greedy_meshing"), (b, value) -> {
+                    config.greedyMeshing = value;
+                    config.save();
+                });
+        greedy.setWidth(WIDGET_WIDTH);
+        greedy.active = !this.gateLocked && !greedyOverridden;
+        greedy.setTooltip(tip("meshelium.options.tooltip.greedy_meshing",
+                "meshelium.options.applies.rebuild"));
+        this.layout.addChild(greedy, s -> s.paddingTop(4));
+
+        // Wave-16: the quiet-time tail trim. Lives here rather than the
+        // main screen for the same reason Duplicate Terrain Memory does -
+        // the default is right for effectively everyone, and the one reason
+        // to touch it is diagnosing a mod conflict around VRAM.
+        CycleButton<Boolean> trim = CycleButton.onOffBuilder(config.arenaTrim)
+                .create(Component.translatable("meshelium.options.arena_trim"), (b, value) -> {
+                    config.arenaTrim = value;
+                    config.save();
+                });
+        trim.setWidth(WIDGET_WIDTH);
+        trim.active = !this.gateLocked;
+        trim.setTooltip(tip("meshelium.options.tooltip.arena_trim",
+                "meshelium.options.applies.now"));
+        this.layout.addChild(trim);
 
         // Named states rather than On/Off, matching the master switch:
         // "Duplicate Terrain Memory: OFF" is unreadable, because OFF could
@@ -122,7 +154,7 @@ public class MesheliumAdvancedScreen extends Screen {
         suppress.active = !this.gateLocked;
         suppress.setTooltip(tip("meshelium.options.tooltip.suppress_vanilla",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(suppress, s -> s.paddingTop(4));
+        this.layout.addChild(suppress);
 
         CycleButton<Boolean> stats = CycleButton.onOffBuilder(config.debugStats)
                 .create(Component.translatable("meshelium.options.debug_stats"), (b, value) -> {

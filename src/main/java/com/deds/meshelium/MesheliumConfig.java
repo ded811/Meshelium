@@ -355,6 +355,38 @@ public final class MesheliumConfig {
     public static final int MAX_FOG_END_PERCENT = 200;
     public static final int DEFAULT_FOG_END_PERCENT = 100;
 
+    /**
+     * Merge adjacent identical block faces into larger quads.
+     *
+     * <p>DEFAULT OFF while it is being tested. Measured over 10,000 real
+     * sections at render distance 64: 5.0 percent fewer quads with vanilla's
+     * Smooth Lighting on, 25.6 percent with it off. The gap is not a quirk
+     * of the algorithm, it is that vanilla bakes ambient occlusion per
+     * vertex, so most faces are bilinear ramps that cannot tile; with Smooth
+     * Lighting off the disqualified count is exactly zero.</p>
+     *
+     * <p>Fewer quads is fewer primitives AND a smaller arena, so this is a
+     * frame-rate change and a memory change at once. It is not a fill-rate
+     * change: the same pixels are covered either way.</p>
+     */
+    public boolean greedyMeshing = false;
+
+    /**
+     * Wave-16: quiet-time trim of the terrain arena's committed-but-unused
+     * tail. <b>Default ON.</b>
+     *
+     * <p>The arena grows in half-gigabyte blocks and never gave the unused
+     * remainder of the top block back, which at render distance 64 is a
+     * measured 492 to 496 MiB of committed VRAM that nothing has ever
+     * touched (PERFORMANCE.md 2026-08-16). The trim copies the block's
+     * small used extent onto a right-sized buffer after 30 seconds of no
+     * arena work and returns the rest to the driver; flying into new
+     * terrain simply regrows through the ordinary ladder. Off, behavior is
+     * byte-identical to 1.2.0: the tail stays committed until the world
+     * closes.</p>
+     */
+    public boolean arenaTrim = true;
+
     /** How occlusion culling decides whether to run. */
     public enum OcclusionMode {
         /** On at or above {@link #occlusionAutoMinRenderDistance}. */
@@ -683,6 +715,16 @@ public final class MesheliumConfig {
         };
     }
 
+    /** {@code meshelium.greedyMeshing} ?? {@link #greedyMeshing}. */
+    public static boolean greedyMeshingEnabled() {
+        return propertyOr("meshelium.greedyMeshing", get().greedyMeshing);
+    }
+
+    /** {@code meshelium.tune.arenaTrim} ?? {@link #arenaTrim}. */
+    public static boolean arenaTrimEnabled() {
+        return propertyOr("meshelium.tune.arenaTrim", get().arenaTrim);
+    }
+
     /** {@code meshelium.fogMode} ?? {@link #fogMode}. */
     public static FogMode fogMode() {
         String property = System.getProperty("meshelium.fogMode");
@@ -864,6 +906,11 @@ public final class MesheliumConfig {
         // quietly left it wherever the player had put it. Every field with a
         // row has to be listed or the button does not do what it says.
         this.suppressVanillaUploads = d.suppressVanillaUploads;
+        // And then greedyMeshing was missing here too, found by the same
+        // review rule this comment states. The lesson refuses to stay
+        // learned, so the torture test now walks every row-backed field.
+        this.greedyMeshing = d.greedyMeshing;
+        this.arenaTrim = d.arenaTrim;
         // Retention has no rows any more (Bobby owns that job since
         // 2026-08-11) but the fields are still live behind the config, so a
         // reset must cover them or "reset to defaults" would quietly leave

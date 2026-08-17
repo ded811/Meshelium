@@ -201,6 +201,13 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             // save() is called anyway for symmetry below).
             entry("plains-rd48", 48),
             entry("plains-rd64", 64),
+            // The distance the owner actually plays at, and the reason this
+            // entry exists: every published figure and every optimisation
+            // decision so far was taken at 64 or below, while the sessions
+            // that produced the bug reports were at 120. A frame at 120 has
+            // roughly 3.5 times the section count of one at 64, so its
+            // composition is not a scaled copy and cannot be extrapolated.
+            entry("plains-rd120", 120),
             // Ground level variants, same seed and same spot, looking
             // along the terrain instead of down at it.
             entry("ground-rd8", 8),
@@ -305,6 +312,7 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             throw new AssertionError("unknown bench scene '" + scene + "' (known: "
                     + SCENES.keySet() + ")");
         }
+        benchRenderDistance = renderDistance;
 
         // What the VANILLA leg actually held. Written into the report so a
         // reader can tell a real extended baseline from a clamped one.
@@ -326,6 +334,28 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             client.options.inactivityFpsLimit().set(InactivityFpsLimit.MINIMIZED);
             client.options.enableVsync().set(false);
             client.options.framerateLimit().set(260);
+            // -Dmeshelium.bench.flatLighting=true turns vanilla's Smooth
+            // Lighting OFF, and it is the cheapest possible test of the
+            // whole greedy-meshing thesis.
+            //
+            // The measurement says 64 percent of terrain cannot merge
+            // because each quad's four corners disagree, which is vanilla
+            // baking ambient occlusion per vertex. With smooth lighting off
+            // vanilla takes prepareQuadFlat instead: one colour and one light
+            // coord for the whole quad. That is exactly the uniform case the
+            // merge needs, produced by vanilla itself, with no shader work,
+            // no light volume on the GPU and no AO reproduction.
+            //
+            // So this leg answers "if lighting were not per-vertex, would the
+            // merge actually pay" using real decoded geometry rather than a
+            // model of it. If it lands near the 35.5 percent the struck-key
+            // probe predicts, the thesis is confirmed and the shader work is
+            // worth starting. If it does not, the prediction was wrong and
+            // weeks have been saved.
+            if (Boolean.getBoolean("meshelium.bench.flatLighting")) {
+                client.options.ambientOcclusion().set(false);
+                client.options.save();
+            }
         });
 
         try (TestSingleplayerContext singleplayer = context.worldBuilder()
@@ -552,8 +582,14 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         knobs.put("meshWorkgroupQuads", TerrainDrawer.meshWorkgroupQuads());
         knobs.put("taskWorkgroupSections", TerrainDrawer.taskWorkgroupSections());
         knobs.put("frontToBack", System.getProperty(TerrainDrawer.PROPERTY_FRONT_TO_BACK, "true"));
-        knobs.put("translucentMultiWG",
-                System.getProperty(TerrainDrawer.PROPERTY_TRANSLUCENT_MULTI_WG, "false"));
+        // The EFFECTIVE value, not the property. This line used to report
+        // System.getProperty(..., "false"), which is wrong on every AMD
+        // device: the property is normally absent and the default comes from
+        // isMeasuredAmdDevice(). Every bench JSON taken on the dev card
+        // therefore claimed multiWG was off while the renderer logged it as
+        // active and ran it. The knob block exists precisely so a leg cannot
+        // be misfiled, and this entry was misfiling all of them.
+        knobs.put("translucentMultiWG", TerrainDrawer.translucentMultiWGFrames() > 0);
         // Wave-12 knobs + arm state — the JSON must say which candidates
         // were live so no leg can be misfiled during the sweep.
         knobs.put("skipVanillaPrep", MesheliumConfig.skipVanillaPrepEnabled());
@@ -899,12 +935,32 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
      * bench render distances is minutes, not the seconds the framework's
      * waitForChunksRender allows.
      */
+    /**
+     * Settle iterations, scaled by the AREA the scene has to generate.
+     *
+     * <p>This was a flat 240 (an eight-minute budget, whatever its error
+     * message claimed) tuned when the deepest scene was render distance 64.
+     * Worldgen cost grows with the square of the distance: rd 64 is about
+     * 16k columns and rd 120 is about 58k, three and a half times as many,
+     * so a budget that fits one cannot fit the other and rd 120 failed on
+     * the timeout rather than on anything real.</p>
+     */
+    private static int settleIterations() {
+        int rd = Math.max(1, benchRenderDistance);
+        double area = (rd / 64.0) * (rd / 64.0);
+        return (int) Math.max(240, Math.ceil(240 * area));
+    }
+
+    /** The scene's render distance, for sizing the settle budget. */
+    private static volatile int benchRenderDistance = 64;
+
     private static void settleWorldgen(ClientGameTestContext context) {
         if (VANILLA_ONLY) {
             settleWorldgenVanilla(context);
             return;
         }
-        for (int i = 0; i < 240; i++) { // 8 min budget: rd64 noise gen is ~16k chunks
+        int budget = settleIterations();
+        for (int i = 0; i < budget; i++) {
             long before = TerrainResidency.counters().uploadedSections();
             context.waitTicks(40);
             TerrainResidency.Counters c = TerrainResidency.counters();
@@ -913,8 +969,9 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
                 return;
             }
         }
-        throw new AssertionError("bench world never settled (worldgen still "
-                + "streaming after ~3 minutes): " + TerrainResidency.counters());
+        throw new AssertionError("bench world never settled: worldgen still streaming after "
+                + (budget * 2) + "s at render distance " + benchRenderDistance + ". "
+                + TerrainResidency.counters());
     }
 
     /**
