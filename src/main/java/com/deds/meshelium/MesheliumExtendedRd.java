@@ -295,6 +295,28 @@ public final class MesheliumExtendedRd {
      */
     private static boolean masterSwitchWas = true;
 
+    /**
+     * Last seen value of the greedy-meshing switch, watched here for the
+     * same reason as the master switch above: the harness and the benchmark
+     * flip {@code meshelium.greedyMeshing} as a property, which no screen
+     * handler ever sees.
+     *
+     * <p>Null until the first tick sees it, and that first sight is never an
+     * edge. A plain {@code false} default would read the first world of a
+     * session with the setting ON as a switch-on and rebuild the terrain the
+     * player just watched load, for nothing.</p>
+     */
+    private static Boolean greedyMeshingWas;
+
+    /**
+     * A re-encode is owed to the world. Deliberately NOT the seam's rebuild
+     * request: that one carries handover semantics (it tells the player the
+     * renderers are swapping and starts the ownership dance). Greedy meshing
+     * changes what the sections CONTAIN, not who draws them, so it wants the
+     * same {@code allChanged()} and none of the rest.
+     */
+    private static boolean pendingReencode;
+
     /** Arena-pressure backoff has already written one chat line this world. */
     private static boolean pressureChatted;
 
@@ -532,6 +554,10 @@ public final class MesheliumExtendedRd {
         // entered with the switch already off, and a stale `true` here would
         // fire a spurious swap on the first tick.
         masterSwitchWas = MesheliumConfig.terrainRenderingConfigured();
+        // Same re-sync, same reason: a world entered with the setting already
+        // flipped must not spend its first tick rebuilding everything.
+        greedyMeshingWas = MesheliumConfig.greedyMeshingEnabled();
+        pendingReencode = false;
     }
 
     // ------------------------------------------------------------------
@@ -876,13 +902,41 @@ public final class MesheliumExtendedRd {
                         .requestVanillaRebuild("Meshelium terrain rendering switched off");
             }
         }
-        if (com.deds.meshelium.terrain.host.VanillaUploadSeam.consumeRebuildRequest()) {
+        // Greedy meshing decides what a section's geometry IS, so a flip only
+        // reaches the world through a rebuild. Sections already compiled are
+        // never recompiled on their own, so without this the setting would
+        // appear to do nothing until the player walked away and back.
+        boolean greedyNow = MesheliumConfig.greedyMeshingEnabled();
+        if (greedyMeshingWas == null) {
+            greedyMeshingWas = greedyNow;
+        } else if (greedyNow != greedyMeshingWas) {
+            greedyMeshingWas = greedyNow;
+            // Only while Meshelium is the one encoding. Switched off, the
+            // master-switch edge above already rebuilds on the way back in;
+            // on OpenGL there is nothing of ours in the sections at all, and
+            // rebuilding somebody else's terrain is not "disable itself
+            // completely".
+            if (nowEnabled
+                    && MesheliumGate.state() == MesheliumGate.State.VULKAN_MESH_SHADERS) {
+                pendingReencode = true;
+                MesheliumClient.LOGGER.info(
+                        "Meshelium greedy meshing switched {}; re-encoding the loaded terrain",
+                        greedyNow ? "on" : "off");
+            }
+        }
+        boolean seamRebuild =
+                com.deds.meshelium.terrain.host.VanillaUploadSeam.consumeRebuildRequest();
+        if (seamRebuild || pendingReencode) {
             try {
                 // allChanged lives on LevelExtractor in 26.2, NOT on
                 // LevelRenderer where the plan placed it. Verified by javap;
                 // Minecraft.levelExtractor is a public final field.
                 minecraft.levelExtractor.allChanged();
-                if (com.deds.meshelium.terrain.host.VanillaUploadSeam.armed()) {
+                pendingReencode = false;
+                if (!seamRebuild) {
+                    // A plain re-encode: the seam said nothing, so neither of
+                    // the two handover messages below applies.
+                } else if (com.deds.meshelium.terrain.host.VanillaUploadSeam.armed()) {
                     // Armed: the same call, used the other way round. Every
                     // section is dropped, which empties vanilla's heaps, and
                     // the seam stops them refilling.
@@ -897,7 +951,9 @@ public final class MesheliumExtendedRd {
                                     + "stood down; Meshelium keeps drawing until it looks complete");
                 }
             } catch (Throwable t) {
-                com.deds.meshelium.terrain.host.VanillaUploadSeam.reinstateRebuildRequest();
+                if (seamRebuild) {
+                    com.deds.meshelium.terrain.host.VanillaUploadSeam.reinstateRebuildRequest();
+                }
                 MesheliumClient.LOGGER.error(
                         "Meshelium could not ask vanilla to rebuild; retrying next tick", t);
                 return;

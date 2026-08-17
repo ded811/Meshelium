@@ -1,5 +1,78 @@
 # Changelog
 
+## 1.3.0
+
+**Fixed: chunks could flash invisible for a split second while moving.**
+
+Easiest to see over oceans, where the missing chunk showed the dark water
+underneath and read as a black square blinking in and out. It could happen
+anywhere terrain was rebuilding: for one frame, a rebuilding chunk had no
+copy anywhere, because ours was still queued for upload and Minecraft's had
+already been freed by the duplicate-memory saver. Over land the hole showed
+whatever terrain was behind it, which is why it went unseen for a full
+version. It settled down when you stood still and got worse the faster you
+flew.
+
+The old copy of a rebuilding chunk now stays on screen until its replacement
+has actually landed on the graphics card. In a one-minute test flight that
+handover fired about 3,800 times, and every one of them was a black flash
+that did not happen. A new stress test rebuilds terrain in place and fails
+the build if the gap ever comes back, and it was written the honest way: we
+broke the fix on purpose and watched the test catch it before trusting
+either.
+
+**New: Idle Memory Trim, on by default.**
+
+Meshelium grows its terrain memory in big steps so that growing stays rare,
+and until now it kept all the spare room it had ever taken. After half a
+minute of no terrain streaming, it now hands the unused part back to your
+graphics card. Measured at render distance 64, that returned 488 MB and left
+terrain memory 98 percent full instead of 52 percent, with no measurable
+cost to frame times. Flying somewhere new simply takes the memory again.
+Combined with 1.2.0's duplicate-memory saver, terrain that used to cost
+around 1.7 GB of graphics memory now sits at about 540 MB.
+
+The switch is in Advanced. Off restores the old keep-everything behaviour
+exactly.
+
+**New: Greedy Meshing, in Advanced. Off while it proves itself.**
+
+Where several neighbouring block faces would look identical on screen, this
+merges them into one bigger face so there is less geometry to draw. The
+picture does not change, and a built-in checker we run in testing verifies
+the merged result covers exactly the same ground as the originals.
+
+How much it helps depends on your Smooth Lighting setting. With Smooth
+Lighting off it removes about one face in six and was measured at 8 to 10
+percent more frames. With it on, Minecraft shades every corner separately,
+so far fewer faces match and the gain is 2 to 5 percent. Flipping the
+setting reloads the terrain, so chunks rebuild for a few seconds and you can
+compare live.
+
+**NVIDIA and Intel now get the water-drawing speedup AMD already had.**
+
+Transparent terrain like water has to blend back to front, so Meshelium
+drew it in many small batches to keep the order safe, except on AMD cards,
+where a one-draw-per-section fast path had been verified pixel-identical
+and measured at about 1.3 ms per frame at render distance 64. The caution
+existed because we believed the ordering rule the fast path relies on was
+unclear in the Vulkan specification. We finally read the text closely: the
+specification guarantees it outright, so the fast path is now on for every
+card. A launch flag can force the old path in the unlikely event a driver
+does not honour its own specification. The log line that still called this
+an experiment is gone too.
+
+**For NVIDIA and Intel testers.**
+
+Two things in this release exist for cards we do not own. The graphics
+card's mesh output limits are now measured at startup and respected rather
+than assumed, so cards that only offer the specification minimum are safe by
+construction. And there is an experimental GPU-side skip for one of the
+occlusion passes behind a system property; it works, but on our AMD card the
+driver charges more for the mechanism than the skip saves, so it ships off.
+If you run this on NVIDIA or Intel and want to help, the properties are
+documented in the source.
+
 ## 1.2.0
 
 **Minecraft's duplicate copy of the terrain is now freed, by default.**
@@ -50,9 +123,6 @@ would, so below 64 chunks it changes nothing at all; a slider sets where it
 finishes as a share of your view, labelled in blocks as well as percent.
 Minecraft Default leaves everything alone.
 
-Water, lava, the Nether, and boss fights are deliberately untouched. Reduced
-visibility is the point in all four.
-
 **Your render distance comes back when you switch Meshelium on again.**
 
 Turning Meshelium off pulls the distance down to 32, because Minecraft cannot
@@ -92,8 +162,6 @@ skipped.
 The limit is now measured at startup and respected. If a world genuinely
 does not fit, Meshelium goes passive and tells you, which is the behaviour
 it always should have had. Nothing quietly disappears.
-
-Thanks to Ded811 for the report and the log, which had the answer in it.
 
 **Running out of room now pulls the render distance in instead of
 breaking.**

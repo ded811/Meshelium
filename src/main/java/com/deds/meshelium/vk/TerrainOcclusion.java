@@ -17,6 +17,7 @@
  */
 package com.deds.meshelium.vk;
 
+import com.deds.meshelium.MesheliumVulkanState;
 import com.deds.meshelium.fabric.MesheliumClient;
 import com.deds.meshelium.fabric.mixin.GpuDeviceAccessor;
 import com.deds.meshelium.terrain.host.TerrainResidency;
@@ -30,6 +31,7 @@ import com.mojang.blaze3d.vulkan.VulkanGpuBuffer;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.EXTConditionalRendering;
 import org.lwjgl.vulkan.EXTMeshShader;
 import org.lwjgl.vulkan.KHRPushDescriptor;
 import org.lwjgl.vulkan.VK10;
@@ -221,12 +223,25 @@ final class TerrainOcclusion {
     private final MesheliumVkBuffers.DeviceBuffer regionStamps;
     private final MesheliumVkBuffers.DeviceBuffer stats;
     private final MesheliumVkBuffers.MappedBuffer statsRing;
+    /**
+     * The phase-B predicate: 4 bytes the section raster sets to 1 when any
+     * section transitions to newly-visible, consumed by conditional
+     * rendering around the phase-B dispatches, zeroed by the stats CB after
+     * phase B each frame. Null when the predicate path is off (extension
+     * absent or -Dmeshelium.occlusion.phaseBPredicate=false), in which case
+     * phase B records directly, exactly the pre-predicate behavior.
+     */
+    private final MesheliumVkBuffers.DeviceBuffer predicate;
+
+    /** Tri-state: unset = on when the device supports it; true/false force. */
+    static final String PROPERTY_PHASE_B_PREDICATE = "meshelium.occlusion.phaseBPredicate";
 
     private TerrainOcclusion(VulkanDevice device, VulkanCommandEncoder encoder,
             int regionStampSlots,
             MesheliumVkBuffers.DeviceBuffer sectionStampsA, MesheliumVkBuffers.DeviceBuffer sectionStampsB,
             MesheliumVkBuffers.DeviceBuffer regionStamps, MesheliumVkBuffers.DeviceBuffer stats,
-            MesheliumVkBuffers.MappedBuffer statsRing) {
+            MesheliumVkBuffers.MappedBuffer statsRing,
+            MesheliumVkBuffers.DeviceBuffer predicate) {
         this.device = device;
         this.encoder = encoder;
         this.vma = device.vma();
@@ -236,6 +251,7 @@ final class TerrainOcclusion {
         this.regionStamps = regionStamps;
         this.stats = stats;
         this.statsRing = statsRing;
+        this.predicate = predicate;
     }
 
     /**
@@ -275,15 +291,45 @@ final class TerrainOcclusion {
                 (long) STATS_RING * STATS_BYTES, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 "vmaCreateBuffer(meshelium occlusion stats ring)");
 
+        // Phase-B predicate: DEFAULT OFF EVERYWHERE, measured 2026-08-16.
+        // The mechanism works exactly as designed - phase B's GPU time
+        // collapses 0.239 to 0.008 ms at rd 64 and the camera-cut gate
+        // still passes - but on RDNA4 (driver 26.7.1, LLPC) conditional
+        // rendering itself costs a periodic ~9 ms stall every ~20 frames:
+        // frame p99 went 3.6 to 10.6 ms against a median win of 0.03 ms.
+        // The 0.163 ms ceiling is real and stays measured in
+        // docs/OCCLUSION-FILLRATE-DESIGN.md; the property exists so silicon
+        // with cheap conditional rendering can be measured without a
+        // rebuild, and any future default flip must be per-vendor and
+        // per-measurement, the multiWG pattern inverted.
+        String predProp = System.getProperty(PROPERTY_PHASE_B_PREDICATE);
+        boolean wantPredicate = predProp != null && Boolean.parseBoolean(predProp);
+        MesheliumVkBuffers.DeviceBuffer predicate = null;
+        if (wantPredicate && MesheliumVulkanState.conditionalRenderingSupported()) {
+            predicate = MesheliumVkBuffers.createDeviceLocal(vma, 4L,
+                    VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                            | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                            | EXTConditionalRendering.VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT,
+                    "vmaCreateBuffer(meshelium phase-B predicate)");
+        } else if (wantPredicate && predProp != null) {
+            MesheliumClient.LOGGER.warn(
+                    "Meshelium: {}=true but the device did not offer "
+                            + "VK_EXT_conditional_rendering; phase B records directly",
+                    PROPERTY_PHASE_B_PREDICATE);
+        }
+
         TerrainOcclusion occ = new TerrainOcclusion(device, encoder, regionStampSlots,
-                a, b, region, stats, ring);
+                a, b, region, stats, ring, predicate);
         occ.zeroInitialize(stampBytes);
         MesheliumClient.LOGGER.info(
                 "Meshelium occlusion GPU state up: 2×{} KiB section stamps + {} B region stamps "
-                        + "({} slots) + {} B stats (+{} B host ring), device '{}'",
+                        + "({} slots) + {} B stats (+{} B host ring), device '{}'; phase-B "
+                        + "predicate {} (VK_EXT_conditional_rendering: the GPU skips the phase-B "
+                        + "dispatches on frames where no section became newly visible)",
                 stampBytes >> 10, regionStampSlots * 4, regionStampSlots,
                 STATS_BYTES, STATS_RING * STATS_BYTES,
-                device.getDeviceInfo().name());
+                device.getDeviceInfo().name(),
+                predicate != null ? "ON" : "off");
         return occ;
     }
 
@@ -294,6 +340,11 @@ final class TerrainOcclusion {
             VK10.vkCmdFillBuffer(cb, sectionStampsB.vkBuffer(), 0, stampBytes, 0);
             VK10.vkCmdFillBuffer(cb, regionStamps.vkBuffer(), 0, (long) regionStampSlots * 4L, 0);
             VK10.vkCmdFillBuffer(cb, stats.vkBuffer(), 0, STATS_BYTES, 0);
+            if (predicate != null) {
+                // 1, not 0: until the raster passes have voted once, phase B
+                // must run. Skipping is only ever earned by evidence.
+                VK10.vkCmdFillBuffer(cb, predicate.vkBuffer(), 0, 4L, 1);
+            }
             VulkanCommandEncoder.memoryBarrier(cb, stack);
             checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(occlusion zero-init)");
             encoder.execute(cb);
@@ -305,9 +356,25 @@ final class TerrainOcclusion {
     // Frame-parity stamp selection
     // ------------------------------------------------------------------
 
+    /** Phase-B predicate is live: wrap the phase-B draws in conditional rendering. */
+    boolean phaseBPredicateActive() {
+        return predicate != null;
+    }
+
+    /** The predicate's VkBuffer; only meaningful when {@link #phaseBPredicateActive()}. */
+    long predicateVkBuffer() {
+        return predicate.vkBuffer();
+    }
+
     /** The buffer THIS frame's raster writes (and phase B reads). */
     long curStampsBuffer(long frameStamp) {
         return ((frameStamp & 1L) == 0L ? sectionStampsA : sectionStampsB).vkBuffer();
+    }
+
+    /** The OTHER ping-pong buffer: parity-proof prev for a given cur handle. */
+    long otherStampsBuffer(long curBuffer) {
+        return curBuffer == sectionStampsA.vkBuffer()
+                ? sectionStampsB.vkBuffer() : sectionStampsA.vkBuffer();
     }
 
     /** The buffer LAST frame's raster wrote (phase A/B read). */
@@ -357,23 +424,36 @@ final class TerrainOcclusion {
         Map<String, String> macros = Map.of(
                 "MESHELIUM_OCC_REGIONS", Integer.toString(MAX_OCC_REGIONS),
                 "MESHELIUM_LISTS_SSBO", extendedLists ? "1" : "0");
+        // The SECTION pipeline's modules additionally learn to mark the
+        // phase-B predicate on newly-visible transitions. The region
+        // pipeline never marks (regions have no prev buffer, and a region
+        // transition does not imply a phase-B draw), so it compiles the
+        // plain variant - which is also why box.frag is compiled twice.
+        Map<String, String> sectionMacros = Map.of(
+                "MESHELIUM_OCC_REGIONS", Integer.toString(MAX_OCC_REGIONS),
+                "MESHELIUM_LISTS_SSBO", extendedLists ? "1" : "0",
+                "MESHELIUM_MARK_NEW", phaseBPredicateActive() ? "1" : "0");
         long regionMesh = 0L;
         long sectionTask = 0L;
         long sectionMesh = 0L;
         long boxFrag = 0L;
+        long boxFragSection = 0L;
         try {
             regionMesh = MesheliumShaderCompiler.compileResourceToModule(vk,
                     "/assets/meshelium/shaders/occlusion/region_raster.mesh",
                     MesheliumShaderCompiler.KIND_MESH, macros);
             sectionTask = MesheliumShaderCompiler.compileResourceToModule(vk,
                     "/assets/meshelium/shaders/occlusion/section_raster.task",
-                    MesheliumShaderCompiler.KIND_TASK, macros);
+                    MesheliumShaderCompiler.KIND_TASK, sectionMacros);
             sectionMesh = MesheliumShaderCompiler.compileResourceToModule(vk,
                     "/assets/meshelium/shaders/occlusion/section_raster.mesh",
-                    MesheliumShaderCompiler.KIND_MESH, macros);
+                    MesheliumShaderCompiler.KIND_MESH, sectionMacros);
             boxFrag = MesheliumShaderCompiler.compileResourceToModule(vk,
                     "/assets/meshelium/shaders/occlusion/box.frag",
                     MesheliumShaderCompiler.KIND_FRAGMENT, macros);
+            boxFragSection = MesheliumShaderCompiler.compileResourceToModule(vk,
+                    "/assets/meshelium/shaders/occlusion/box.frag",
+                    MesheliumShaderCompiler.KIND_FRAGMENT, sectionMacros);
 
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 int taskStage = EXTMeshShader.VK_SHADER_STAGE_TASK_BIT_EXT;
@@ -400,19 +480,30 @@ final class TerrainOcclusion {
 
                 // Section raster: b0 occList UBO|SSBO(T), b1 scene UBO(M),
                 // b2 projection UBO(M), b3 curStamps SSBO(M|F),
-                // b4 regionStamps SSBO(T), b5 sectionRecords SSBO(M).
-                VkDescriptorSetLayoutBinding.Buffer sb = VkDescriptorSetLayoutBinding.calloc(6, stack);
+                // b4 regionStamps SSBO(T), b5 sectionRecords SSBO(M),
+                // and when the phase-B predicate is live: b6 prevStamps
+                // SSBO(M|F), b7 predicate SSBO(M|F).
+                boolean mark = phaseBPredicateActive();
+                VkDescriptorSetLayoutBinding.Buffer sb =
+                        VkDescriptorSetLayoutBinding.calloc(mark ? 8 : 6, stack);
                 binding(sb.get(0), 0, listType, taskStage);
                 binding(sb.get(1), 1, VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, meshStage);
                 binding(sb.get(2), 2, VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, meshStage);
                 binding(sb.get(3), 3, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, meshStage | fragStage);
                 binding(sb.get(4), 4, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, taskStage);
                 binding(sb.get(5), 5, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, meshStage);
+                if (mark) {
+                    binding(sb.get(6), 6, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            meshStage | fragStage);
+                    binding(sb.get(7), 7, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                            meshStage | fragStage);
+                }
                 long sSet = createSetLayout(vk, stack, sb, "section raster" + tag);
                 long sLayout = createPipelineLayout(vk, stack, sSet,
                         taskStage | meshStage | fragStage, "section raster" + tag);
                 long sPipe = buildBoxPipeline(vk, stack, vkColorFormat, vkDepthFormat,
-                        sLayout, sectionTask, sectionMesh, boxFrag, "section raster" + tag);
+                        sLayout, sectionTask, sectionMesh,
+                        mark ? boxFragSection : boxFrag, "section raster" + tag);
 
                 if (extendedLists) {
                     regionSetLayoutExt = rSet;
@@ -449,6 +540,9 @@ final class TerrainOcclusion {
             }
             if (boxFrag != 0L) {
                 VK10.vkDestroyShaderModule(dev, boxFrag, null);
+            }
+            if (boxFragSection != 0L) {
+                VK10.vkDestroyShaderModule(dev, boxFragSection, null);
             }
         }
     }
@@ -502,7 +596,8 @@ final class TerrainOcclusion {
                 : VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VK10.vkCmdBindPipeline(cb, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(6, stack);
+            boolean mark = phaseBPredicateActive();
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(mark ? 8 : 6, stack);
             bufferWrite(writes.get(0), 0, listType,
                     bufferInfo(stack, occList.vkBuffer(), occList.offset(), occList.range()));
             bufferWrite(writes.get(1), 1, VK10.VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -515,6 +610,15 @@ final class TerrainOcclusion {
                     bufferInfo(stack, regionStamps.vkBuffer(), 0, VK10.VK_WHOLE_SIZE));
             bufferWrite(writes.get(5), 5, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     bufferInfo(stack, sectionRecordsBuffer, 0, VK10.VK_WHOLE_SIZE));
+            if (mark) {
+                // prevStamps: the OTHER ping-pong buffer, holding last
+                // frame's marks - the "was it visible last frame" half of
+                // the newly-visible test.
+                bufferWrite(writes.get(6), 6, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        bufferInfo(stack, otherStampsBuffer(curStampsBuffer), 0, VK10.VK_WHOLE_SIZE));
+                bufferWrite(writes.get(7), 7, VK10.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        bufferInfo(stack, predicate.vkBuffer(), 0, VK10.VK_WHOLE_SIZE));
+            }
             KHRPushDescriptor.vkCmdPushDescriptorSetKHR(cb,
                     VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, writes);
             pushStamp(cb, stack, layout,
@@ -550,6 +654,14 @@ final class TerrainOcclusion {
             // dependency inside our own CB.
             VulkanCommandEncoder.memoryBarrier(cb, stack);
             VK10.vkCmdFillBuffer(cb, stats.vkBuffer(), 0, STATS_BYTES, 0);
+            if (predicate != null) {
+                // Queued AFTER this frame's phase B in submission order, so
+                // the consume already happened; the CB-final barrier orders
+                // this zero before the NEXT frame's raster marks. A quiet
+                // frame therefore skips, a camera cut marks and runs - the
+                // exact semantics phase B exists for.
+                VK10.vkCmdFillBuffer(cb, predicate.vkBuffer(), 0, 4L, 0);
+            }
             VulkanCommandEncoder.memoryBarrier(cb, stack);
             checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(occlusion stats)");
             encoder.execute(cb);
@@ -644,6 +756,9 @@ final class TerrainOcclusion {
         MesheliumVkBuffers.destroy(vma, regionStamps.vkBuffer(), regionStamps.allocation());
         MesheliumVkBuffers.destroy(vma, stats.vkBuffer(), stats.allocation());
         MesheliumVkBuffers.destroy(vma, statsRing.vkBuffer(), statsRing.allocation());
+        if (predicate != null) {
+            MesheliumVkBuffers.destroy(vma, predicate.vkBuffer(), predicate.allocation());
+        }
     }
 
     /** Queue every per-world buffer on vanilla's deferred-destroy rotation. */
@@ -654,12 +769,16 @@ final class TerrainOcclusion {
         MesheliumVkBuffers.DeviceBuffer region = regionStamps;
         MesheliumVkBuffers.DeviceBuffer st = stats;
         MesheliumVkBuffers.MappedBuffer ring = statsRing;
+        MesheliumVkBuffers.DeviceBuffer pred = predicate;
         encoder.queueForDestroy(() -> {
             MesheliumVkBuffers.destroy(vmaHandle, a.vkBuffer(), a.allocation());
             MesheliumVkBuffers.destroy(vmaHandle, b.vkBuffer(), b.allocation());
             MesheliumVkBuffers.destroy(vmaHandle, region.vkBuffer(), region.allocation());
             MesheliumVkBuffers.destroy(vmaHandle, st.vkBuffer(), st.allocation());
             MesheliumVkBuffers.destroy(vmaHandle, ring.vkBuffer(), ring.allocation());
+            if (pred != null) {
+                MesheliumVkBuffers.destroy(vmaHandle, pred.vkBuffer(), pred.allocation());
+            }
         });
     }
 

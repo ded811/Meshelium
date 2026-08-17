@@ -409,6 +409,41 @@ public final class TerrainDrawer {
     /** Mesh-knob ceiling: 64 quads = the 256-output-vertex spec cap / 4. */
     static final int MESH_WG_MAX = 64;
 
+    /**
+     * Per-vertex output locations both terrain mesh shaders emit: locations
+     * 0 to 5 in {@code terrain.mesh} plus {@code gl_Position}, which the
+     * output-size formula counts like any other vec4. MUST move with the
+     * shader's out declarations - it exists because the spec sizes a mesh
+     * workgroup's output as verts x locations x 16 B against
+     * {@code maxMeshOutputMemorySize}, whose guaranteed minimum is 32768 B
+     * and which the dev RDNA4 card reports at EXACTLY that floor. The
+     * greedy-merge varyings briefly grew this to 9, putting the 64-quad
+     * translucent workgroup at 36864 B - over the limit on the very card
+     * that ran every test, undefined behavior the driver happened to
+     * tolerate. The varyings are now packed back to 7 (sprite rect as one
+     * vec4, tile counts re-derived from materialBits per fragment), and
+     * the budget is queried, clamped and asserted so the NEXT growth is a
+     * loud failure instead of a silent one.
+     */
+    static final int MESH_OUTPUT_LOCATIONS = 7;
+
+    /** verts/quad x locations x 16 B: what one quad costs the output budget. */
+    static final int MESH_OUTPUT_BYTES_PER_QUAD = 4 * MESH_OUTPUT_LOCATIONS * 16;
+
+    /**
+     * Largest quads-per-workgroup the device's mesh-output memory admits,
+     * or {@code Integer.MAX_VALUE} before caps exist. At the spec floor
+     * this is 56; the dev RDNA4 admits far more, so the clamp is a no-op
+     * everywhere the mod has ever actually run.
+     */
+    private static int maxQuadsByOutputMemory() {
+        MesheliumVulkanState.MeshShaderCaps caps = MesheliumVulkanState.caps();
+        if (caps == null || caps.maxMeshOutputMemorySize() <= 0) {
+            return Integer.MAX_VALUE; // no information is never no capacity
+        }
+        return Math.max(1, caps.maxMeshOutputMemorySize() / MESH_OUTPUT_BYTES_PER_QUAD);
+    }
+
     /** Task-knob ceiling: 128 × 80 B payload = 10240 ≤ spec-min 16384. */
     static final int TASK_WG_MAX = 128;
 
@@ -422,7 +457,24 @@ public final class TerrainDrawer {
         int v = resolvedMeshWgQuads;
         if (v < 0) {
             v = resolveKnob(PROPERTY_MESH_WG, WORKGROUP_QUADS, MESH_WG_MAX);
-            resolvedMeshWgQuads = v;
+            // Output-memory clamp (see MESH_OUTPUT_LOCATIONS): the default 32
+            // fits every conformant device, but the knob reaches 64, which a
+            // spec-floor device cannot hold at 9 locations per vertex. Only
+            // CACHE once caps exist, so an early call cannot freeze an
+            // unclamped value that a later pipeline build would disagree with.
+            int memoryCap = maxQuadsByOutputMemory();
+            int clamped = Math.min(v, memoryCap);
+            if (clamped != v) {
+                MesheliumClient.LOGGER.warn(
+                        "Meshelium mesh workgroup clamped {} -> {} quads: this device's "
+                                + "maxMeshOutputMemorySize admits {} at {} output locations",
+                        v, clamped, memoryCap, MESH_OUTPUT_LOCATIONS);
+            }
+            if (MesheliumVulkanState.caps() == null) {
+                return clamped;
+            }
+            resolvedMeshWgQuads = clamped;
+            v = clamped;
         }
         return v;
     }
@@ -1851,6 +1903,13 @@ public final class TerrainDrawer {
         MesheliumGpuTimers.mark(encoder, MesheliumGpuTimers.POINT_AFTER_SECTION_RASTER);
 
         // ---- pass 4: phase B (the latency hider) ----
+        // Measurement-only switch, re-added 2026-08-16 for the predicate
+        // work: skipping phase B outright is DELIBERATELY INCORRECT
+        // (revealed terrain arrives a frame late) and exists so the prize of
+        // a correct conditional-rendering skip can be re-measured in the
+        // same session that evaluates it. Never a setting.
+        boolean phaseBSkipUnsafe = Boolean.getBoolean("meshelium.occlusion.phaseBSkipUnsafe");
+        if (!phaseBSkipUnsafe)
         try (RenderPass pass = encoder.createRenderPass(() -> "meshelium terrain phase B",
                 colorView, Optional.empty(), depthView, OptionalDouble.empty())) {
             VulkanRenderPass backendPass = (VulkanRenderPass) ((RenderPassAccessor) pass).meshelium$backend();
@@ -1866,7 +1925,34 @@ public final class TerrainDrawer {
                     atlasView, atlasSampler, lightmapView,
                     snap.sectionRecordsHandle(), occListSlice,
                     prevStamps, curStamps, occlusion.statsBuffer());
+            // The predicate skip: the section raster set this frame's
+            // 4-byte predicate to 1 iff any section transitioned to
+            // newly-visible, and conditional rendering executes the
+            // dispatches below only then. On the measured static frame that
+            // is 0.234 ms of task dispatches that draw nothing, skipped by
+            // the GPU with no CPU readback and no one-frame reveal artifact
+            // (a cut marks, so a cut runs). Vanilla's pass-end ALL_COMMANDS
+            // barrier between passes 3 and 4 orders the fragment write
+            // against this read exactly as it already orders curStamps
+            // against phase B's task reads.
+            boolean phaseBPredicated = occlusion.phaseBPredicateActive();
+            if (phaseBPredicated) {
+                try (org.lwjgl.system.MemoryStack stack = org.lwjgl.system.MemoryStack.stackPush()) {
+                    org.lwjgl.vulkan.VkConditionalRenderingBeginInfoEXT begin =
+                            org.lwjgl.vulkan.VkConditionalRenderingBeginInfoEXT.calloc(stack)
+                                    .sType(org.lwjgl.vulkan.EXTConditionalRendering
+                                            .VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT)
+                                    .buffer(occlusion.predicateVkBuffer())
+                                    .offset(0L)
+                                    .flags(0);
+                    org.lwjgl.vulkan.EXTConditionalRendering
+                            .vkCmdBeginConditionalRenderingEXT(cb, begin);
+                }
+            }
             taskGroupsThisFrame += recordPhaseDraws(cb, p, dispatched, frameStamp32, MODE_PHASE_B);
+            if (phaseBPredicated) {
+                org.lwjgl.vulkan.EXTConditionalRendering.vkCmdEndConditionalRenderingEXT(cb);
+            }
         }
         MesheliumGpuTimers.mark(encoder, MesheliumGpuTimers.POINT_AFTER_PHASE_B);
 
@@ -2465,6 +2551,7 @@ public final class TerrainDrawer {
         if (opaqueOwnedSerial != frameSerial) {
             return false; // vanilla drew opaque this frame — it draws translucent too
         }
+        long probeEntry = TranslucentPhaseProbe.ARMED ? System.nanoTime() : 0L;
         RenderTarget target = ChunkSectionLayerGroup.TRANSLUCENT.outputTarget();
         // Wave-16 harness probe: is this the SEPARATE translucent target
         // (improved transparency, what used to be called fabulous) or the
@@ -2486,6 +2573,11 @@ public final class TerrainDrawer {
         if (colorView == null || depthView == null || atlasView == null || lightmapView == null) {
             return false;
         }
+        long probeViews = 0L;
+        if (TranslucentPhaseProbe.ARMED) {
+            probeViews = System.nanoTime();
+            TranslucentPhaseProbe.targetViews(probeViews - probeEntry);
+        }
         TerrainResidency.DrawSnapshot snap = snapshot; // refreshed by drawOpaque this frame
         if (snap == null || snap.sectionCount() == 0 || snap.arenaBackingHandle() == 0L) {
             // Opaque owned an empty world — own translucent-empty too, so
@@ -2505,28 +2597,42 @@ public final class TerrainDrawer {
         int cap = transQuadCapacity();
         boolean occGate = occGateSerial == frameSerial && occCurStampsHandle != 0L
                 && snap.sectionRecordsHandle() != 0L;
-        // Wave-9 ledger-17 experiment (re-read every call, default OFF):
-        // one multi-workgroup draw per section instead of one 1-WG draw
-        // per ≤cap-quad slice. Pixel-identical iff the device rasterizes
-        // a dispatch's workgroups in gl_WorkGroupID order — the property
-        // the coordinator's 60/61 run with this ON exists to measure.
-        // Wave-12 default flip, vendor-honest: measured on RDNA4 as
-        // pixel-identical (wave-9 experiment, re-verified with wave-12
-        // knobs 2026-08-10) AND worth 1.3 ms/frame at rd 64 (translucent
-        // recording 1.94 -> 0.63 ms), so AMD devices default ON. The
-        // inter-workgroup ordering guarantee is still spec-unclear, so
-        // every other vendor stays default OFF until measured on real
-        // silicon. Property overrides both ways.
+        // One multi-workgroup draw per section instead of one 1-WG draw
+        // per ≤cap-quad slice: worth 1.3 ms/frame at rd 64 (translucent
+        // recording 1.94 -> 0.63 ms, wave 12), pixel-identical iff the
+        // device rasterizes a dispatch's workgroups in order.
+        //
+        // Default ON everywhere since 1.3.0, and the history matters:
+        // waves 9 through 12 believed that ordering was SPEC-UNCLEAR and
+        // gated the default to the measured AMD device out of caution.
+        // Reading the actual text (2026-08-17) disproved that. The
+        // VK_EXT_mesh_shader proposal: "A group of mesh shader workgroups
+        // either launched directly by the API, indirectly by the API, or
+        // indirectly from a single task shader workgroup will rasterize
+        // their outputs in sequential order based on their flattened
+        // workgroup index." The spec's Mesh Shading chapter: "All output
+        // primitives generated from a given mesh workgroup are passed to
+        // subsequent pipeline stages before any output primitives
+        // generated from subsequent input workgroups." This pipeline
+        // launches its workgroups DIRECTLY (the translucent pipeline has
+        // no task stage), the ironclad case. Corroboration that the
+        // hardware exists on every target vendor: D3D12 requires the same
+        // ordering when no amplification shader is present, so every
+        // D3D12-mesh-shader GPU (Turing+, RDNA2+, Arc) implements ordered
+        // retirement or could not conform. The property forces either
+        // way; a non-conformant driver is the only case that needs it.
         String multiWGProp = System.getProperty(PROPERTY_TRANSLUCENT_MULTI_WG);
-        boolean multiWG = multiWGProp != null ? Boolean.parseBoolean(multiWGProp)
-                : isMeasuredAmdDevice();
+        boolean multiWG = multiWGProp == null || Boolean.parseBoolean(multiWGProp);
 
         if (multiWG && !multiWGLogged) {
             multiWGLogged = true;
             MesheliumClient.LOGGER.info(
-                    "Meshelium translucent multi-WG EXPERIMENT active (ledger 17): draw order now "
-                            + "depends on VK_EXT_mesh_shader inter-workgroup primitive ordering — "
-                            + "spec-unclear, default-OFF; this run exists to test it on real silicon");
+                    "Meshelium translucent multi-WG batching active: one draw per section "
+                            + "instead of one per 64 quads (worth 1.3 ms/frame at rd 64, "
+                            + "measured on RDNA4). The workgroup ordering it relies on is "
+                            + "guaranteed by VK_EXT_mesh_shader for directly launched "
+                            + "workgroups; -D{}=false forces the split-draw path",
+                    PROPERTY_TRANSLUCENT_MULTI_WG);
         }
 
         int drawCount = 0;
@@ -2544,6 +2650,11 @@ public final class TerrainDrawer {
         // can never blend twice. Intra-section order is the prefix's LAST
         // sort — vanilla resorts only live meshes, so retained sorts go
         // stale exactly as Nvidium's did (accepted; PERFORMANCE.md note).
+        long probeT0 = 0L;
+        if (TranslucentPhaseProbe.ARMED) {
+            probeT0 = System.nanoTime();
+            TranslucentPhaseProbe.prologueRest(probeT0 - probeViews);
+        }
         int retainedTransDrawn = 0;
         int snapCount = snap.sectionCount();
         if (transDrawnMark.length < snapCount) {
@@ -2611,6 +2722,12 @@ public final class TerrainDrawer {
             retainedTransDrawn++;
         }
 
+        long probeT1 = 0L;
+        if (TranslucentPhaseProbe.ARMED) {
+            probeT1 = System.nanoTime();
+            TranslucentPhaseProbe.retainedScan(probeT1 - probeT0, snapCount);
+        }
+
         // ---- draw list: vanilla's section order, far → near ----
         ObjectArrayList<SectionRenderDispatcher.RenderSection> visible =
                 Minecraft.getInstance().levelRenderer.visibleSections();
@@ -2673,6 +2790,12 @@ public final class TerrainDrawer {
         }
         transDrawnList.clear();
 
+        long probeT2 = 0L;
+        if (TranslucentPhaseProbe.ARMED) {
+            probeT2 = System.nanoTime();
+            TranslucentPhaseProbe.visibleLoop(probeT2 - probeT1, sectionsDrawn, drawCount);
+        }
+
         lastTranslucentSections = sectionsDrawn;
         lastTranslucentDraws = drawCount;
         lastRetainedTranslucentSections = retainedTransDrawn;
@@ -2727,14 +2850,22 @@ public final class TerrainDrawer {
         if (multiWG) {
             translucentMultiWGFrames++;
         }
+        if (TranslucentPhaseProbe.ARMED) {
+            TranslucentPhaseProbe.record(System.nanoTime() - probeT2);
+        }
         translucentFrames++;
         return true;
     }
 
     /**
      * Quads one translucent draw carries: {@link #TRANS_QUADS_DEFAULT}
-     * clamped to the REAL device's mesh-output caps (spec minimums already
-     * admit the default: 256 vertices / 256 primitives ≥ 64×4 / 64×2).
+     * clamped to the REAL device's mesh-output caps. The vertex and
+     * primitive spec minimums admit the default (256 / 256 against 64x4 /
+     * 64x2), but the OUTPUT MEMORY minimum does not: 64 quads x
+     * {@value #MESH_OUTPUT_BYTES_PER_QUAD} B = 36864 B against a guaranteed
+     * floor of 32768, which admits 56. That gap arrived with the
+     * greedy-merge varyings and was found by review; the clamp makes the
+     * shape legal per device instead of hoping every card is generous.
      */
     private static int transQuadCapacity() {
         MesheliumVulkanState.MeshShaderCaps caps = MesheliumVulkanState.caps();
@@ -2742,6 +2873,7 @@ public final class TerrainDrawer {
         if (caps != null) {
             cap = Math.min(cap, Math.min(caps.maxMeshOutputVertices() / 4,
                     caps.maxMeshOutputPrimitives() / 2));
+            cap = Math.min(cap, maxQuadsByOutputMemory());
         }
         return Math.max(cap, 1);
     }
@@ -2756,9 +2888,12 @@ public final class TerrainDrawer {
             MesheliumVulkanState.MeshShaderCaps caps = MesheliumVulkanState.caps();
             if (caps != null && (caps.maxMeshWorkGroupInvocations() < meshWorkgroupQuads()
                     || caps.maxMeshOutputVertices() < transQuads * 4
-                    || caps.maxMeshOutputPrimitives() < transQuads * 2)) {
+                    || caps.maxMeshOutputPrimitives() < transQuads * 2
+                    || (caps.maxMeshOutputMemorySize() > 0
+                            && caps.maxMeshOutputMemorySize() < transQuads * MESH_OUTPUT_BYTES_PER_QUAD))) {
                 throw new IllegalStateException("device mesh caps below the translucent shape ("
-                        + transQuads + " quads/draw): " + caps);
+                        + transQuads + " quads/draw, " + transQuads * MESH_OUTPUT_BYTES_PER_QUAD
+                        + " B output): " + caps);
             }
             p = TerrainDrawPipeline.createTranslucent(vkPass.meshelium$device().vkDevice(),
                     vkColorFormat, vkDepthFormat, meshWorkgroupQuads(), transQuads);
@@ -2984,9 +3119,12 @@ public final class TerrainDrawer {
             if (caps != null) {
                 if (caps.maxMeshWorkGroupInvocations() < wg
                         || caps.maxMeshOutputVertices() < wg * 4
-                        || caps.maxMeshOutputPrimitives() < wg * 2) {
+                        || caps.maxMeshOutputPrimitives() < wg * 2
+                        || (caps.maxMeshOutputMemorySize() > 0
+                                && caps.maxMeshOutputMemorySize() < wg * MESH_OUTPUT_BYTES_PER_QUAD)) {
                     throw new IllegalStateException("device mesh caps below the terrain workgroup shape ("
-                            + wg + " quads): " + caps);
+                            + wg + " quads, " + wg * MESH_OUTPUT_BYTES_PER_QUAD
+                            + " B output): " + caps);
                 }
                 if (taskCull) {
                     // Wave-9: the payload-budget assert, extended to the
@@ -3017,6 +3155,13 @@ public final class TerrainDrawer {
                         taskCull ? "task-cull" : "cpu-cull", wg, wg * 4, wg * 2,
                         caps.maxMeshWorkGroupInvocations(), caps.maxMeshOutputVertices(),
                         caps.maxMeshOutputPrimitives(), caps.maxPreferredMeshWorkGroupInvocations());
+                MesheliumClient.LOGGER.info(
+                        "Meshelium mesh-output budget: {} B/workgroup of maxMeshOutputMemorySize={} "
+                                + "({} locations/vertex, {} components of maxMeshOutputComponents={}) "
+                                + "- the translucent shape is clamped by the same budget",
+                        wg * MESH_OUTPUT_BYTES_PER_QUAD, caps.maxMeshOutputMemorySize(),
+                        MESH_OUTPUT_LOCATIONS, MESH_OUTPUT_LOCATIONS * 4,
+                        caps.maxMeshOutputComponents());
             }
             p = TerrainDrawPipeline.create(vkPass.meshelium$device().vkDevice(),
                     vkColorFormat, vkDepthFormat, wg, tws, MAX_MASK_REGIONS, taskCull, extLists);
@@ -3242,15 +3387,5 @@ public final class TerrainDrawer {
         perfFrames = 0;
         perfTaskGroupsAccum = 0;
         lastPerfLogNanos = now;
-    }
-    /**
-     * Wave-12 vendor gate for the multiWG default: true only for the
-     * device family the ordering experiment actually measured (AMD/RADV
-     * Radeon). Name-based because vanilla's DeviceInfo exposes strings,
-     * not vendor ids, at this seam - conservative substring match.
-     */
-    private static boolean isMeasuredAmdDevice() {
-        String name = com.deds.meshelium.MesheliumVulkanState.deviceName();
-        return name != null && (name.contains("AMD") || name.contains("Radeon"));
     }
 }

@@ -290,6 +290,49 @@ public final class TerrainArena {
     }
 
     /**
+     * The inverse of {@link #grow}: lower the LAST block's capacity onto a
+     * smaller backing, handing the tail above it back to the driver.
+     *
+     * <p>The caller (the pump's quiet-time trim) has already created the
+     * smaller backing, scheduled the GPU copy of every byte up to the
+     * block's extent, and taken custody of the old backing for fence-gated
+     * destruction - the exact grow contract with the direction reversed.
+     * The floor is the block's own EXTENT, not its live bytes: holes below
+     * the high-water mark stay where they are (only compaction could move
+     * them, and moving is what this deliberately avoids), so a trim can
+     * never strand an allocation past the new capacity. Asserted anyway,
+     * because the whole design rests on it.</p>
+     */
+    public void shrinkLastBlock(long newLastBlockBytes, long newBackingHandle) {
+        int last = blockSegments.size() - 1;
+        long oldBytes = blockPhysicalQuads.getLong(last) * 4L * vertexStride;
+        if (newLastBlockBytes >= oldBytes) {
+            throw new IllegalArgumentException("arena shrink " + oldBytes + " -> "
+                    + newLastBlockBytes + " bytes is not a shrink");
+        }
+        long quads = newLastBlockBytes / (4L * vertexStride);
+        long extent = blockSegments.get(last).getSize();
+        if (quads < extent) {
+            throw new IllegalStateException("shrink would take block " + last + " to " + quads
+                    + " quads, below its live extent of " + extent);
+        }
+        blockHandles.set(last, newBackingHandle);
+        blockPhysicalQuads.set(last, quads);
+        blockSegments.get(last).setLimit(quads);
+        this.memoryBytes -= oldBytes - newLastBlockBytes;
+        this.quadLimit = totalQuadCapacity();
+    }
+
+    /**
+     * The LAST block's high-water extent in bytes: what a trim must keep.
+     * Shrinks when tail frees coalesce, so a settled world's value is the
+     * real footprint rather than the deepest it ever was.
+     */
+    public long lastBlockExtentBytes() {
+        return blockSegments.get(blockSegments.size() - 1).getSize() * 4L * vertexStride;
+    }
+
+    /**
      * Add a whole new block. The cheap half of growth: nothing is copied and
      * every existing address keeps its meaning, because a new block occupies
      * a range of the address space nothing has used yet.

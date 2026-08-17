@@ -123,8 +123,172 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         assertRendererSwap(context);
         assertRenderDistanceRestored(context);
         assertWorldHops(context);
+        assertRebuildHandover(context);
+        assertArenaTrim(context);
         assertArenaGrowth(context);
         assertCoverageGuard(context);
+    }
+
+    // ------------------------------------------------------------------
+    // Leg 5a — the rebuild handover (the 2026-08-15 "black ocean")
+    // ------------------------------------------------------------------
+
+    /**
+     * A section being rebuilt must never stop being drawable.
+     *
+     * <p>THE BUG THIS EXISTS FOR. With the upload seam armed, vanilla's copy
+     * of a section is cancelled at the moment vanilla would have staged it,
+     * and the seam then does vanilla's own bookkeeping, which includes the
+     * {@code checkSectionMesh} that RELEASES the predecessor. Meshelium's
+     * replacement is only ENQUEUED at that point and lands a pump or more
+     * later, so the section had no old copy, no new copy and no vanilla copy
+     * for at least one frame. Every rebuild opened that hole. It shipped in
+     * 1.2.0 and survived three versions because over land a missing section
+     * shows the terrain behind it; the owner finally caught it over an ocean,
+     * where the hole shows unlit water and reads as a black chunk.</p>
+     *
+     * <p><b>Why no existing leg caught it, which is the more important
+     * lesson.</b> The bench camera is a pinned spectator and every torture
+     * leg before this one is static, so nothing in this project's automated
+     * testing ever caused the sustained REBUILD churn that opens the gap. A
+     * renderer whose bugs live in the transitions cannot be tested only in
+     * steady states. This leg forces the transition directly rather than
+     * hoping a moving camera produces one.</p>
+     *
+     * <p>The assertion is on {@code handoverRetained}, which counts old
+     * copies deliberately kept alive until their successor's upload
+     * superseded them. It must RISE: zero would mean the protection is not
+     * engaging and the hole is back. Two conditions guard against the
+     * opposite failure, a protection that never lets go: retained must drain
+     * back to empty, and nothing may be dropped.</p>
+     */
+    private static void assertRebuildHandover(ClientGameTestContext context) {
+        try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
+            singleplayer.getClientLevel().waitForChunksRender();
+            waitForDrawing(context, "handover leg");
+            if (!VanillaUploadSeam.armed()) {
+                throw new AssertionError("the seam is not armed, so this leg would pass "
+                        + "vacuously: the hole it guards only exists when vanilla's copy "
+                        + "has been cancelled");
+            }
+            long heldBefore = TerrainResidency.handoverRetained();
+            long droppedBefore = totalDrops();
+
+            // EDITS, not allChanged(). This is the distinction the first
+            // version of this leg got wrong and the counters caught:
+            // allChanged() tears down the ViewArea, so every entry takes the
+            // RESET path and is orphaned by distance class, which is a
+            // different lifecycle that never opens the handover gap. A block
+            // edit is what produces a genuine in-place REPLACEMENT - the same
+            // position recompiles, the successor is enqueued, the predecessor
+            // is released - and that is the only thing the bug lived in.
+            var server = singleplayer.getServer();
+            for (int round = 0; round < 3; round++) {
+                server.runCommand("fill ~-16 ~12 ~-16 ~16 ~15 ~16 "
+                        + (round % 2 == 0 ? "stone" : "air"));
+                singleplayer.getClientLevel().waitForChunksRender();
+                waitForDrawing(context, "handover rebuild round " + round);
+            }
+
+            long held = TerrainResidency.handoverRetained() - heldBefore;
+            if (held <= 0) {
+                throw new AssertionError("a full rebuild storm held ZERO copies across the "
+                        + "handover. Either the protection in onMeshReleased is gone, in which "
+                        + "case every rebuilt section is a one-frame hole again, or this leg "
+                        + "stopped producing rebuilds and is no longer testing anything: "
+                        + TerrainResidency.counters());
+            }
+            // The other direction: a copy held forever is a leak, not a fix.
+            context.waitFor(client -> TerrainResidency.counters().retainedSections() == 0, TIMEOUT);
+            if (totalDrops() != droppedBefore) {
+                throw new AssertionError("the rebuild storm dropped sections (" + held
+                        + " handovers held): " + TerrainResidency.counters());
+            }
+            if (TerrainDrawer.coveragePassive()) {
+                throw new AssertionError("the coverage guard went passive during a plain "
+                        + "rebuild storm, so Meshelium handed the frame back: "
+                        + TerrainResidency.guardTrip());
+            }
+            context.takeScreenshot(TestScreenshotOptions.of("82_meshelium_rebuild_handover"));
+            assertNoErrors();
+        }
+    }
+
+    private static long totalDrops() {
+        TerrainResidency.Counters c = TerrainResidency.counters();
+        return c.droppedOversize() + c.droppedArenaFull() + c.droppedRegionBudget()
+                + c.droppedEncoding();
+    }
+
+    // ------------------------------------------------------------------
+    // Leg 4b — wave-16 quiet-time arena trim
+    // ------------------------------------------------------------------
+
+    /**
+     * The trim must fire when the world goes quiet, must never cut below
+     * the extent, must keep drawing through the swap, and the world must
+     * grow straight back through the trimmed arena when work resumes.
+     *
+     * <p>The quiet window is compressed to 2 seconds by property; the
+     * standard 256 MiB initial arena against a superflat world's small
+     * extent clears the 64 MiB minimum saving by a wide margin, so the
+     * trim fires without any world-size gymnastics. The regrow half then
+     * runs the same fill storm as the handover leg, which is a rebuild
+     * surge into an arena that just shrank - the exact transition a
+     * player produces by going exploring after standing still.</p>
+     */
+    private static void assertArenaTrim(ClientGameTestContext context) {
+        long trimsBefore = TerrainResidency.arenaTrims();
+        long retiredBefore = com.deds.meshelium.vk.MesheliumTerrainGpu.arenaBuffersRetired();
+        long droppedBefore = totalDrops();
+        context.runOnClient(client ->
+                System.setProperty("meshelium.tune.arenaTrimQuietSec", "2"));
+        try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
+            singleplayer.getClientLevel().waitForChunksRender();
+            waitForDrawing(context, "trim leg standup");
+            long capacityBefore = TerrainResidency.counters().arenaCapacityBytes();
+            try {
+                context.waitFor(client ->
+                        TerrainResidency.arenaTrims() > trimsBefore, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("the arena never trimmed although the world was "
+                        + "quiet and the saving was large: " + TerrainResidency.counters(), t);
+            }
+            TerrainResidency.Counters c = TerrainResidency.counters();
+            if (c.arenaCapacityBytes() >= capacityBefore) {
+                throw new AssertionError("arenaTrims moved but capacity did not drop: "
+                        + capacityBefore + " -> " + c.arenaCapacityBytes());
+            }
+            if (c.arenaCapacityBytes() < c.arenaExtentBytes()) {
+                throw new AssertionError("trim cut below the extent - live geometry has "
+                        + "nowhere to be: " + c);
+            }
+            waitForDrawing(context, "post-trim");
+            // The outgrown backing must retire through the same fence-gated
+            // path growth uses; the growth leg's catch-up bar applies.
+            context.waitFor(client ->
+                    com.deds.meshelium.vk.MesheliumTerrainGpu.arenaBuffersRetired()
+                            > retiredBefore, TIMEOUT);
+
+            // Regrow: a rebuild surge straight into the shrunken arena.
+            var server = singleplayer.getServer();
+            for (int round = 0; round < 2; round++) {
+                server.runCommand("fill ~-16 ~12 ~-16 ~16 ~15 ~16 "
+                        + (round % 2 == 0 ? "stone" : "glass"));
+                singleplayer.getClientLevel().waitForChunksRender();
+                waitForDrawing(context, "post-trim rebuild round " + round);
+            }
+            if (totalDrops() != droppedBefore) {
+                throw new AssertionError("the post-trim rebuild dropped sections - regrowth "
+                        + "through a trimmed arena must be as safe as first growth: "
+                        + TerrainResidency.counters());
+            }
+            context.takeScreenshot(TestScreenshotOptions.of("83_meshelium_arena_trim"));
+            assertNoErrors();
+        } finally {
+            context.runOnClient(client ->
+                    System.clearProperty("meshelium.tune.arenaTrimQuietSec"));
+        }
     }
 
     // ------------------------------------------------------------------
@@ -134,13 +298,21 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
     private static void assertArenaGrowth(ClientGameTestContext context) {
         long growthsBefore = TerrainResidency.counters().arenaGrowths();
         long retiredBefore = com.deds.meshelium.vk.MesheliumTerrainGpu.arenaBuffersRetired();
-        context.runOnClient(client -> System.setProperty("meshelium.tune.arenaInitialMiB", "1"));
+        context.runOnClient(client -> {
+            System.setProperty("meshelium.tune.arenaInitialMiB", "1");
+            pinBudgetLegContent();
+        });
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
             singleplayer.getClientLevel().waitForChunksRender();
             // The same world content that overflows a FIXED 1 MiB arena in
             // the guard leg must grow right through it here.
-            context.waitFor(client ->
-                    TerrainResidency.counters().arenaGrowths() > growthsBefore, TIMEOUT);
+            try {
+                context.waitFor(client ->
+                        TerrainResidency.counters().arenaGrowths() > growthsBefore, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("the 1 MiB arena never grew: "
+                        + TerrainResidency.counters(), t);
+            }
             TerrainResidency.Counters c = TerrainResidency.counters();
             if (c.arenaCapacityBytes() <= (1L << 20)) {
                 throw new AssertionError("arenaGrowths moved but capacity is still "
@@ -172,9 +344,43 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             context.takeScreenshot(TestScreenshotOptions.of("81_meshelium_arena_growth"));
             assertNoErrors();
         } finally {
-            context.runOnClient(client ->
-                    System.clearProperty("meshelium.tune.arenaInitialMiB"));
+            context.runOnClient(client -> {
+                System.clearProperty("meshelium.tune.arenaInitialMiB");
+                unpinBudgetLegContent();
+            });
         }
+    }
+
+    /**
+     * Hold the two budget legs' world content fixed by turning greedy
+     * meshing off for them.
+     *
+     * <p>Both legs pin a 1 MiB arena and then require the world to overflow
+     * it, which makes them the only legs calibrated against a SIZE rather
+     * than a behaviour. At the harness's fixed 5-chunk server view distance
+     * that world sits right on the line, and 1.3.0's greedy meshing shrank
+     * it just far enough to drop under: the growth leg then timed out with
+     * nothing wrong except the assumption.</p>
+     *
+     * <p>Sizing the world up instead does not work here. The harness pins
+     * the SERVER view distance at 5, so raising the client's render distance
+     * only makes it wait for chunks that never arrive - which is the same
+     * mechanism behind the hand-it-back rule in
+     * {@link #assertRenderDistanceRestored}. Shrinking the arena further is
+     * not available either: 1 MiB is the floor both knobs can express.</p>
+     *
+     * <p>So the mesher is what gives. These legs test growth and drop
+     * plumbing, which does not care what the geometry looks like, and every
+     * leg before them runs with whatever the run configured - merged terrain
+     * is covered by the initial world, the renderer swap, the resource
+     * reload and the world hops.</p>
+     */
+    private static void pinBudgetLegContent() {
+        System.setProperty("meshelium.greedyMeshing", "false");
+    }
+
+    private static void unpinBudgetLegContent() {
+        System.clearProperty("meshelium.greedyMeshing");
     }
 
     // ------------------------------------------------------------------
@@ -427,13 +633,23 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
     private static void assertCoverageGuard(ClientGameTestContext context) {
         long tripsBefore = TerrainDrawer.coverageTrips();
         long growthsBefore = TerrainResidency.counters().arenaGrowths();
-        context.runOnClient(client -> System.setProperty("meshelium.test.arenaMiB", "1"));
+        context.runOnClient(client -> {
+            System.setProperty("meshelium.test.arenaMiB", "1");
+            pinBudgetLegContent();
+        });
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
             singleplayer.getClientLevel().waitForChunksRender();
             // The 1 MiB arena (16384 quads) fills in the first pumps —
             // and since wave 14 the property also pins the CEILING to
-            // 1 MiB, so growth is exhausted before it can start.
-            context.waitFor(client -> TerrainResidency.dropsThisWorld() > 0, TIMEOUT);
+            // 1 MiB, so growth is exhausted before it can start. "Fills"
+            // is a claim about SIZE, which is why pinBudgetLegContent holds
+            // the mesher still for this leg.
+            try {
+                context.waitFor(client -> TerrainResidency.dropsThisWorld() > 0, TIMEOUT);
+            } catch (Throwable t) {
+                throw new AssertionError("the 1 MiB arena never overflowed: "
+                        + TerrainResidency.counters(), t);
+            }
             context.waitFor(client -> TerrainDrawer.coveragePassive(), TIMEOUT);
             if (TerrainDrawer.coverageTrips() != tripsBefore + 1) {
                 throw new AssertionError("coverage guard tripped but the once-only WARN count is "
@@ -495,7 +711,10 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             // Passive is a designed state, not a failure: no error latches.
             assertNoErrors();
         } finally {
-            context.runOnClient(client -> System.clearProperty("meshelium.test.arenaMiB"));
+            context.runOnClient(client -> {
+                System.clearProperty("meshelium.test.arenaMiB");
+                unpinBudgetLegContent();
+            });
         }
 
         // A normal world re-arms the switch: fresh baseline, clean

@@ -27,6 +27,8 @@ import org.lwjgl.vulkan.VkPhysicalDeviceMemoryBudgetPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderFeaturesEXT;
+import org.lwjgl.vulkan.EXTConditionalRendering;
+import org.lwjgl.vulkan.VkPhysicalDeviceConditionalRenderingFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
@@ -137,6 +139,28 @@ public final class MeshShaderDeviceSupport {
     public static final String MEMORY_BUDGET_EXTENSION =
             EXTMemoryBudget.VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
 
+    /**
+     * {@code VK_EXT_conditional_rendering} - lets a 4-byte GPU buffer decide
+     * whether recorded draws execute. The phase-B skip rides on it: phase B
+     * costs a quarter millisecond of task dispatches at rd 64 and draws
+     * nothing on almost every frame, and with this the raster passes
+     * themselves flip the predicate on exactly the frames with something to
+     * reveal. Probed before requested, like everything here: asking for an
+     * absent feature fails device creation.
+     */
+    public static final String CONDITIONAL_RENDERING_EXTENSION =
+            EXTConditionalRendering.VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
+
+    public static final VulkanPNextStruct CONDITIONAL_RENDERING_FEATURES_STRUCT =
+            new VulkanPNextStruct(
+                    EXTConditionalRendering
+                            .VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
+                    VkPhysicalDeviceConditionalRenderingFeaturesEXT.SIZEOF);
+
+    public static final VulkanFeature CONDITIONAL_RENDERING_FEATURE = new VulkanFeature(
+            CONDITIONAL_RENDERING_FEATURES_STRUCT, "conditionalRendering",
+            VkPhysicalDeviceConditionalRenderingFeaturesEXT.CONDITIONALRENDERING);
+
     private static final VulkanPNextStruct MAINTENANCE_3_PROPERTIES_STRUCT = new VulkanPNextStruct(
             VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
             VkPhysicalDeviceMaintenance3Properties.SIZEOF);
@@ -237,6 +261,17 @@ public final class MeshShaderDeviceSupport {
                                 + "culling cannot run (mesh-shader terrain is unaffected). "
                                 + "Device '{}', driver '{}'", name, driver);
             }
+
+            // Conditional rendering, for the phase-B predicate skip. Optional
+            // both ways: absent, phase B records its draws directly, exactly
+            // the pre-predicate behavior.
+            boolean condRender = physicalDevice.hasDeviceExtension(CONDITIONAL_RENDERING_EXTENSION)
+                    && isFeatureSupported(vk, CONDITIONAL_RENDERING_FEATURE);
+            if (condRender) {
+                extensions.add(CONDITIONAL_RENDERING_EXTENSION);
+                features.add(CONDITIONAL_RENDERING_FEATURE);
+            }
+            MesheliumVulkanState.setConditionalRenderingSupported(condRender);
 
             MesheliumVulkanState.MeshShaderCaps caps = queryCaps(vk);
             MesheliumVulkanState.recordDeviceCreation(name, driver, true, caps, localHeapBytes,
@@ -537,6 +572,8 @@ public final class MeshShaderDeviceSupport {
                     props.maxMeshWorkGroupInvocations(),
                     props.maxMeshOutputVertices(),
                     props.maxMeshOutputPrimitives(),
+                    props.maxMeshOutputComponents(),
+                    props.maxMeshOutputMemorySize(),
                     props.maxPreferredTaskWorkGroupInvocations(),
                     props.maxPreferredMeshWorkGroupInvocations(),
                     props.prefersLocalInvocationVertexOutput(),

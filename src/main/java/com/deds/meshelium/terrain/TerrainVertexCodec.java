@@ -153,10 +153,74 @@ public final class TerrainVertexCodec {
      * SodiumResultCompatibility.java:112,185,202-211).
      */
     public static int materialBits(int alphaCutoffIndex, boolean mip) {
+        return materialBits(alphaCutoffIndex, mip, 1, 1);
+    }
+
+    /**
+     * The material byte, with a greedy-merge tile repeat in the spare bits.
+     *
+     * <p>Bits 0-1 alpha cutoff, bit 2 mip, and then the five bits at 3-7
+     * that have been unused since the format was ported. They are already
+     * stamped identically on all four vertices of a quad, so they are
+     * already a per-QUAD channel, and {@code terrain.mesh} already forwards
+     * the whole byte to the fragment stage as a flat varying where
+     * everything above bit 1 is currently read by nothing. A repeat count
+     * therefore costs no vertex bytes and no new interpolant.</p>
+     *
+     * <p>Power-of-two runs, {1,2,4,8,16} on each axis. Sixteen is the width
+     * of a section, so it is the largest run this merge can ever produce,
+     * and it is a common one: the top faces of flat ground fill a section's
+     * whole footprint. Capping at 8 turned one such face into four quads.</p>
+     *
+     * <p>Five values on each axis will not fit as two independent 2-bit
+     * fields, and 3 bits each would need nine bits in an eight-bit byte. So
+     * the PAIR is encoded jointly: {@code log2(u) * 5 + log2(v)}, which is
+     * 0..24 and fits the five bits at 3-7 exactly. The shader turns it back
+     * into two numbers once per primitive, not once per pixel.</p>
+     *
+     * @param repeatU tiles along the quad's U axis, a power of two in 1..16
+     * @param repeatV tiles along the quad's V axis, a power of two in 1..16
+     */
+    public static int materialBits(int alphaCutoffIndex, boolean mip, int repeatU, int repeatV) {
         if (alphaCutoffIndex < 0 || alphaCutoffIndex > 2) {
             throw new IllegalArgumentException("alphaCutoffIndex must be 0..2, got " + alphaCutoffIndex);
         }
-        return (alphaCutoffIndex & 3) | (mip ? 4 : 0);
+        int pair = log2Repeat(repeatU, "repeatU") * REPEAT_STEPS
+                + log2Repeat(repeatV, "repeatV");
+        return (alphaCutoffIndex & 3) | (mip ? 4 : 0) | (pair << 3);
+    }
+
+    /** Distinct run lengths per axis: 1, 2, 4, 8, 16. */
+    public static final int REPEAT_STEPS = 5;
+
+    /** Longest run the encoding can express on one axis, and a section's width. */
+    public static final int MAX_REPEAT = 16;
+
+    /** 1,2,4,8,16 to 0..4. Anything else is a caller bug, not a clamp. */
+    private static int log2Repeat(int repeat, String what) {
+        return switch (repeat) {
+            case 1 -> 0;
+            case 2 -> 1;
+            case 4 -> 2;
+            case 8 -> 3;
+            case 16 -> 4;
+            default -> throw new IllegalArgumentException(
+                    what + " must be 1, 2, 4, 8 or 16, got " + repeat);
+        };
+    }
+
+    /** Largest power-of-two tile run that fits in {@code span} blocks. */
+    public static int largestRepeat(int span) {
+        if (span >= 16) {
+            return 16;
+        }
+        if (span >= 8) {
+            return 8;
+        }
+        if (span >= 4) {
+            return 4;
+        }
+        return span >= 2 ? 2 : 1;
     }
 
     /**
@@ -202,7 +266,8 @@ public final class TerrainVertexCodec {
      * (SodiumResultCompatibility.java:110-113,183-189).
      */
     public static void encodeQuad(ByteBuffer dst, TerrainQuad quad) {
-        int material = materialBits(quad.alphaCutoffIndex(), quad.mip());
+        int material = materialBits(quad.alphaCutoffIndex(), quad.mip(),
+                quad.repeatU(), quad.repeatV());
         for (int i = 0; i < 4; i++) {
             encodeVertex(dst, quad.vertex(i), material);
         }

@@ -79,7 +79,20 @@ public final class SectionBuildTap {
                 TerrainResidency.onSectionCompiledEmpty(pos.x(), pos.y(), pos.z()); // wave-11
                 return;
             }
-            EncodedSectionMesh encoded = SectionMeshEncoder.encode(decoded.quads());
+            // Measurement only, and off unless -Dmeshelium.probe.greedy is
+            // set. This is the exact point a real merge pass would go, so
+            // measuring here measures the thing that would actually be
+            // built rather than a model of it.
+            com.deds.meshelium.terrain.GreedyMeshProbe.observe(decoded.quads());
+            // The merge, when it is on. A pure list transform, on this build
+            // worker, before anything is packed: the encoder, the arena and
+            // the shaders see nothing but a shorter list of ordinary quads
+            // carrying a tile repeat.
+            java.util.List<com.deds.meshelium.terrain.TerrainQuad> toEncode =
+                    com.deds.meshelium.MesheliumConfig.greedyMeshingEnabled()
+                            ? com.deds.meshelium.terrain.GreedyMesher.merge(decoded.quads())
+                            : decoded.quads();
+            EncodedSectionMesh encoded = SectionMeshEncoder.encode(toEncode);
             PARKED.set(new Parked(results, pos.x(), pos.y(), pos.z(), encoded,
                     decoded.translucentOrder()));
         } catch (Throwable t) {

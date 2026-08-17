@@ -27,6 +27,15 @@ public final class MesheliumVulkanState {
             int maxMeshWorkGroupInvocations,
             int maxMeshOutputVertices,
             int maxMeshOutputPrimitives,
+            // The two OUTPUT-SIZE limits, queried since 2026-08-16. They were
+            // omitted for the whole first year of this renderer because the
+            // vertex/primitive counts alone happened to admit every shape it
+            // used - until the greedy-merge varyings grew a vertex to 9
+            // locations and the 256-vertex translucent workgroup quietly
+            // crossed the spec-minimum maxMeshOutputMemorySize of 32768 B.
+            // The dev card reports far more, so only a review caught it.
+            int maxMeshOutputComponents,
+            int maxMeshOutputMemorySize,
             int maxPreferredTaskWorkGroupInvocations,
             int maxPreferredMeshWorkGroupInvocations,
             boolean prefersLocalInvocationVertexOutput,
@@ -86,6 +95,21 @@ public final class MesheliumVulkanState {
 
     public static void setMemoryBudgetSupported(boolean supported) {
         memoryBudgetSupported = supported;
+    }
+
+    private static volatile boolean conditionalRenderingSupported;
+
+    /**
+     * True when VK_EXT_conditional_rendering was offered by the device and
+     * enabled at creation. Consumed by the phase-B predicate skip: with it,
+     * the GPU itself decides each frame whether the phase-B dispatches run.
+     */
+    public static boolean conditionalRenderingSupported() {
+        return conditionalRenderingSupported;
+    }
+
+    public static void setConditionalRenderingSupported(boolean supported) {
+        conditionalRenderingSupported = supported;
     }
 
     /**

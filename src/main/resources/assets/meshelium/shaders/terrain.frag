@@ -66,8 +66,46 @@ layout(location = 1) in vec2 texCoord0;
 layout(location = 2) in float sphericalVertexDistance;
 layout(location = 3) in float cylindricalVertexDistance;
 layout(location = 4) flat in uint materialBits;
+// Sprite rectangle: xy = atlas min, zw = atlas max. One vec4 rather than
+// two vec2s plus a repeat varying, because mesh-stage output memory is
+// charged per LOCATION and the spec floor is 32768 B per workgroup; the
+// repeat pair is re-derived from materialBits below instead of shipped.
+layout(location = 5) flat in vec4 spriteRect;
 
 layout(location = 0) out vec4 fragColor;
+
+// Wrap a greedy-merged quad's coordinate back inside its sprite.
+//
+// The merged quad keeps ONE tile's UVs and carries a tile count, {1,2,4,8,16}
+// per axis, unpacked from the material byte by the mesh stage and arriving
+// here as a flat varying. The interpolated coordinate therefore sweeps the
+// sprite once across a quad that should show it N times, and this multiplies
+// it up and folds it back.
+//
+// The derivative is the subtle part and the reason this returns one rather
+// than calling texture() directly. fract() is discontinuous at every tile
+// boundary, so a hardware-derived gradient spikes there, the sampler picks
+// the smallest mip, and the seams show as a sharp grid at distance. Taking
+// the gradient from the UNWRAPPED coordinate and sampling with textureGrad
+// keeps it continuous across the fold.
+struct TiledUv {
+    vec2 uv;
+    vec2 dx;
+    vec2 dy;
+};
+
+TiledUv meshelium_tileUv(vec2 uv, vec2 repeat) {
+    vec2 uvMin = spriteRect.xy;
+    vec2 span = max(spriteRect.zw - uvMin, vec2(1.0e-9));
+    // Position within the sprite, scaled up to the tile count. Gradients
+    // come from THIS, before the fold.
+    vec2 scaled = (uv - uvMin) / span * repeat;
+    TiledUv r;
+    r.dx = dFdx(scaled) * span;
+    r.dy = dFdy(scaled) * span;
+    r.uv = uvMin + fract(scaled) * span;
+    return r;
+}
 
 // ---- vanilla fog.glsl, verbatim ----
 
@@ -113,11 +151,18 @@ vec4 sampleNearest(sampler2D source, vec2 uv, vec2 pixelSize) {
     return sampleNearest(source, uv, pixelSize, du, dv, texelScreenSize);
 }
 
-// Rotated Grid Super-Sampling
-vec4 sampleRGSS(sampler2D source, vec2 uv, vec2 pixelSize) {
-    vec2 du = dFdx(uv);
-    vec2 dv = dFdy(uv);
-
+// Rotated Grid Super-Sampling.
+//
+// The gradient-taking overload exists for greedy-merged quads, whose folded
+// UV is discontinuous at every tile boundary: RGSS derives its mip LEVEL and
+// its nearest-blend factor from the derivative, so deriving that from the
+// folded coordinate spikes at the fold and draws the tile grid in wrong-mip
+// seams, exactly the artifact meshelium_tileUv exists to prevent (and the
+// same mistake this file already avoids on the sampleNearest path). The
+// vanilla-verbatim 3-argument form below is untouched and remains the only
+// one the unmerged path calls, so pixel parity for vanilla geometry is
+// unaffected.
+vec4 sampleRGSS(sampler2D source, vec2 uv, vec2 pixelSize, vec2 du, vec2 dv) {
     vec2 texelScreenSize = sqrt(du * du + dv * dv);
     float maxTexelSize = max(texelScreenSize.x, texelScreenSize.y);
 
@@ -164,13 +209,45 @@ vec4 sampleRGSS(sampler2D source, vec2 uv, vec2 pixelSize) {
     return mix(nearestColor, rgssColor, blendFactor);
 }
 
+// Vanilla terrain.fsh's own form, verbatim: hardware derivatives.
+vec4 sampleRGSS(sampler2D source, vec2 uv, vec2 pixelSize) {
+    return sampleRGSS(source, uv, pixelSize, dFdx(uv), dFdy(uv));
+}
+
 // Material bits 0-1 → alpha cutoff (vertex_format.glsl:29-31 / wave-3b
 // material mapping: SOLID=0 → 0.0, TRANSLUCENT=1 → 0.1, CUTOUT=2 → 0.5).
 const float ALPHA_CUTOFFS[3] = float[](0.0, 0.1, 0.5);
 
 void main() {
     vec2 TextureSize = SceneMisc.xy;
-    vec4 color = (UseRgss == 1 ? sampleRGSS(Sampler0, texCoord0, 1.0f / TextureSize) : sampleNearest(Sampler0, texCoord0, 1.0f / TextureSize)) * vertexColor;
+    vec2 pixelSize = 1.0f / TextureSize;
+    // Unmerged quads take the vanilla-verbatim path untouched: the packed
+    // pair is index 0, which is repeat (1,1), the branch is flat (the pair
+    // rides in materialBits, a flat varying, so it is uniform across the
+    // primitive), and pixel parity with vanilla is unaffected for every quad
+    // the mesher did not touch.
+    vec4 color;
+    if ((materialBits & 0xF8u) != 0u) {
+        // The tile counts ride in materialBits as log2(u) * 5 + log2(v)
+        // (bits 3-7). Re-deriving them here costs a few integer ops on
+        // merged-quad fragments only, and it bought back a whole output
+        // location in the mesh stage, which is what keeps the 64-quad
+        // translucent workgroup inside spec-minimum output memory.
+        uint repeatPair = materialBits >> 3u;
+        vec2 repeat = vec2(float(1u << (repeatPair / 5u)), float(1u << (repeatPair % 5u)));
+        TiledUv t = meshelium_tileUv(texCoord0, repeat);
+        vec2 texelScreenSize = sqrt(t.dx * t.dx + t.dy * t.dy);
+        // Both samplers get the UNWRAPPED gradients. The first build of this
+        // passed the folded uv to the 3-argument sampleRGSS, whose internal
+        // dFdx reintroduced the seam this branch exists to avoid; found by
+        // review, not by screenshot, because RGSS is a vanilla setting the
+        // harness never turns on.
+        color = (UseRgss == 1
+                ? sampleRGSS(Sampler0, t.uv, pixelSize, t.dx, t.dy)
+                : sampleNearest(Sampler0, t.uv, pixelSize, t.dx, t.dy, texelScreenSize)) * vertexColor;
+    } else {
+        color = (UseRgss == 1 ? sampleRGSS(Sampler0, texCoord0, pixelSize) : sampleNearest(Sampler0, texCoord0, pixelSize)) * vertexColor;
+    }
     // vanilla: color = mix(FogColor * vec4(1,1,1,color.a), color, ChunkVisibility);
     // ChunkVisibility == 1.0 here (fade-in deviation, see header) → identity.
     if (color.a < ALPHA_CUTOFFS[materialBits & 3u]) {

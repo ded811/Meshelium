@@ -55,12 +55,243 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
         segmentedManagerLimit();
         segmentedManagerFuzz();
         idProviderBehaviour();
+        greedyMergeTileAxes();
+        greedyMergeCornerShading();
+        resetCoversEveryField();
         arenaBasics();
         arenaPendingRelease();
         arenaExhaustionAndStats();
         arenaCoalescingPathological();
         arenaChurnLeakCounters();
         translucentPrefixPermutation();
+    }
+
+    // ==================================================================
+    // Reset To Defaults must cover every field, enforced by reflection
+    // ==================================================================
+
+    /**
+     * The same bug has now shipped twice: a config field gains a UI row,
+     * {@code resetToDefaults()} is not taught about it, and the reset
+     * button quietly leaves that one setting behind (suppressVanillaUploads
+     * first, then greedyMeshing). Listing fields by hand is exactly the
+     * pattern that keeps failing, so this walks EVERY public instance field
+     * by reflection: perturb it, reset, and require the default back.
+     *
+     * <p>Fields the reset deliberately preserves go in the skip set BY
+     * NAME, so adding a config field makes this test fail until the author
+     * either resets it or consciously exempts it. That converts the
+     * forgotten-field bug from silent to compile-adjacent.</p>
+     */
+    private static void resetCoversEveryField() {
+        java.util.Set<String> deliberatelyKept = java.util.Set.of(
+                // Once-per-install notice latches: a reset of SETTINGS must
+                // not re-arm popups the player has already dismissed (the
+                // popup row re-arms them itself, deliberately).
+                "noMeshShaderNoticeShown", "vulkanFailedNoticeShown",
+                // The migration cursor is history, not a setting.
+                "configVersion");
+        com.deds.meshelium.MesheliumConfig config = new com.deds.meshelium.MesheliumConfig();
+        com.deds.meshelium.MesheliumConfig defaults = new com.deds.meshelium.MesheliumConfig();
+        java.util.List<String> stuck = new ArrayList<>();
+        try {
+            for (java.lang.reflect.Field f : com.deds.meshelium.MesheliumConfig.class.getFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())
+                        || deliberatelyKept.contains(f.getName())) {
+                    continue;
+                }
+                perturb(f, config);
+            }
+            config.resetToDefaults();
+            for (java.lang.reflect.Field f : com.deds.meshelium.MesheliumConfig.class.getFields()) {
+                if (java.lang.reflect.Modifier.isStatic(f.getModifiers())
+                        || deliberatelyKept.contains(f.getName())) {
+                    continue;
+                }
+                Object got = f.get(config);
+                Object want = f.get(defaults);
+                if (!java.util.Objects.equals(got, want)) {
+                    stuck.add(f.getName() + " (left at " + got + ", default " + want + ")");
+                }
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("reset reflection walk failed", e);
+        }
+        check(stuck.isEmpty(), "Reset To Defaults left row-backed fields behind: " + stuck
+                + " - add them to resetToDefaults() or, deliberately, to this test's skip set");
+    }
+
+    /** Set a field to something that is provably not its default. */
+    private static void perturb(java.lang.reflect.Field f,
+            com.deds.meshelium.MesheliumConfig config) throws ReflectiveOperationException {
+        Class<?> t = f.getType();
+        if (t == boolean.class) {
+            f.setBoolean(config, !f.getBoolean(config));
+        } else if (t == int.class) {
+            f.setInt(config, f.getInt(config) + 7);
+        } else if (t.isEnum()) {
+            Object[] values = t.getEnumConstants();
+            int i = java.util.Arrays.asList(values).indexOf(f.get(config));
+            f.set(config, values[(i + 1) % values.length]);
+        } else {
+            throw new AssertionError("config field " + f.getName() + " has type " + t
+                    + " this walk cannot perturb - teach perturb() about it");
+        }
+    }
+
+    // ==================================================================
+    // Greedy meshing: the tile counts must land on the SPRITE's axes
+    // ==================================================================
+
+    /**
+     * A run counted along a POSITION axis is not necessarily a run along the
+     * sprite's U axis, and on east and west faces it is not.
+     *
+     * <p>Vanilla's own face UVs take U from Z and V from Y there
+     * ({@code FaceBakery.defaultFaceUV}), while the mesher's two in-plane
+     * axes for an X-facing quad are Y then Z. Hand a four-tall wall merge to
+     * the shader as {@code repeatU = 4} and it repeats the sprite four times
+     * SIDEWAYS across one block of Z and stretches it once vertically over
+     * four blocks of Y.</p>
+     *
+     * <p>This is the test the harness could not have caught by itself: its
+     * world is superflat, so every merge it has ever made was on a top face,
+     * which is the one orientation where the naive mapping happens to be
+     * right. The top-face case is kept here as the control that proves the
+     * fix did not simply swap the bug to the other faces.</p>
+     */
+    private static void greedyMergeTileAxes() {
+        // A wall: four unit faces stacked in Y at x = 1, one block deep in Z.
+        List<TerrainQuad> wall = new ArrayList<>();
+        for (int y = 0; y < 4; y++) {
+            wall.add(eastFace(y));
+        }
+        TerrainQuad mergedWall = onlyMerged(com.deds.meshelium.terrain.GreedyMesher.merge(wall),
+                "four stacked east faces");
+        checkEq(1, mergedWall.repeatU(),
+                "a wall merged in Y must NOT tile along U, which runs along Z on an east face");
+        checkEq(4, mergedWall.repeatV(), "it tiles four times along V, which runs along Y");
+
+        // The control: four unit faces in a row along X on a top face, where
+        // U really does run along X.
+        List<TerrainQuad> floor = new ArrayList<>();
+        for (int x = 0; x < 4; x++) {
+            floor.add(topFace(x));
+        }
+        TerrainQuad mergedFloor = onlyMerged(com.deds.meshelium.terrain.GreedyMesher.merge(floor),
+                "four east-west top faces");
+        checkEq(4, mergedFloor.repeatU(), "a floor run along X tiles along U");
+        checkEq(1, mergedFloor.repeatV(), "and not along V, which runs along Z");
+
+        // Two faces with the same sprite RECTANGLE but rotated UVs must not
+        // merge: the rectangle is identical under a 90 degree rotation, so
+        // the rect alone cannot tell them apart, and a merged quad would
+        // draw the seed's orientation over both.
+        List<TerrainQuad> mixed = new ArrayList<>();
+        mixed.add(topFace(0));
+        mixed.add(topFaceRotated(1));
+        List<TerrainQuad> mixedOut = com.deds.meshelium.terrain.GreedyMesher.merge(mixed);
+        checkEq(2, mixedOut.size(),
+                "a rotated sprite must not merge with an unrotated one sharing its rectangle");
+        for (TerrainQuad q : mixedOut) {
+            check(!q.merged(), "neither survivor may claim a tile repeat");
+        }
+    }
+
+    /**
+     * The merged quad must carry the RECTANGLE's corner values, not the seed
+     * cell's, and it must refuse a field that linear interpolation cannot
+     * reproduce.
+     *
+     * <p>This is the pin for the affine merge. Copying the seed's four
+     * values would paint a whole run with one cell's shading, which is
+     * exactly the bug that a superflat harness cannot see, because every
+     * face there carries the same light anyway.</p>
+     */
+    private static void greedyMergeCornerShading() {
+        // Light rising 100, 110, 120, 130, 140 across five lattice points:
+        // affine, so four faces collapse to one and the merged quad must
+        // span the full 100 to 140.
+        List<TerrainQuad> ramp = new ArrayList<>();
+        for (int x = 0; x < 4; x++) {
+            ramp.add(litTopFace(x, 100 + 10 * x, 100 + 10 * (x + 1)));
+        }
+        TerrainQuad merged = onlyMerged(com.deds.meshelium.terrain.GreedyMesher.merge(ramp),
+                "an affine light ramp");
+        checkEq(4, merged.repeatU(), "the whole ramp is one four-tile quad");
+        int low = Integer.MAX_VALUE;
+        int high = Integer.MIN_VALUE;
+        for (int i = 0; i < 4; i++) {
+            low = Math.min(low, merged.vertex(i).blockLight());
+            high = Math.max(high, merged.vertex(i).blockLight());
+        }
+        checkEq(100, low, "the merged quad's low edge keeps the FIRST cell's light");
+        checkEq(140, high, "and its high edge the LAST cell's, not the seed's");
+
+        // The same run with one step doubled is not affine, so interpolating
+        // four corners across it would move pixels. It must not collapse.
+        List<TerrainQuad> bent = new ArrayList<>();
+        int[] lattice = {100, 110, 130, 140, 150};
+        for (int x = 0; x < 4; x++) {
+            bent.add(litTopFace(x, lattice[x], lattice[x + 1]));
+        }
+        List<TerrainQuad> bentOut = com.deds.meshelium.terrain.GreedyMesher.merge(bent);
+        check(bentOut.size() > 1, "a bent light ramp must not become one quad: "
+                + "linear interpolation cannot reproduce it");
+    }
+
+    /** A +Y face at y=1 spanning x..x+1, with its own light at each X edge. */
+    private static TerrainQuad litTopFace(int x, int lightLow, int lightHigh) {
+        return new TerrainQuad(QuadFacing.POS_Y, false, 0, true,
+                new TerrainVertex(x, 1.0f, 0, 0.0f, 0.0f, 0xFF808080, lightLow, 200),
+                new TerrainVertex(x + 1, 1.0f, 0, TILE, 0.0f, 0xFF808080, lightHigh, 200),
+                new TerrainVertex(x + 1, 1.0f, 1, TILE, TILE, 0xFF808080, lightHigh, 200),
+                new TerrainVertex(x, 1.0f, 1, 0.0f, TILE, 0xFF808080, lightLow, 200));
+    }
+
+    private static TerrainQuad onlyMerged(List<TerrainQuad> out, String what) {
+        checkEq(1, out.size(), what + " must collapse to exactly one quad");
+        TerrainQuad q = out.get(0);
+        check(q.merged(), what + " must come back carrying a tile repeat");
+        return q;
+    }
+
+    /** Sprite extent: one 16-texel tile in a 256-texel atlas. */
+    private static final float TILE = 16.0f / 256.0f;
+
+    /** A +X face at x=1 spanning y..y+1, z 0..1. U runs along Z, V along Y. */
+    private static TerrainQuad eastFace(int y) {
+        return new TerrainQuad(QuadFacing.POS_X, false, 0, true,
+                wallVertex(y, 0, 0.0f, 0.0f),
+                wallVertex(y + 1, 0, 0.0f, TILE),
+                wallVertex(y + 1, 1, TILE, TILE),
+                wallVertex(y, 1, TILE, 0.0f));
+    }
+
+    private static TerrainVertex wallVertex(int y, int z, float u, float v) {
+        return new TerrainVertex(1.0f, y, z, u, v, 0xFF808080, 32, 200);
+    }
+
+    /** A +Y face at y=1 spanning x..x+1, z 0..1. U runs along X, V along Z. */
+    private static TerrainQuad topFace(int x) {
+        return new TerrainQuad(QuadFacing.POS_Y, false, 0, true,
+                floorVertex(x, 0, 0.0f, 0.0f),
+                floorVertex(x + 1, 0, TILE, 0.0f),
+                floorVertex(x + 1, 1, TILE, TILE),
+                floorVertex(x, 1, 0.0f, TILE));
+    }
+
+    /** The same face with its sprite turned 90 degrees: U now runs along Z. */
+    private static TerrainQuad topFaceRotated(int x) {
+        return new TerrainQuad(QuadFacing.POS_Y, false, 0, true,
+                floorVertex(x, 0, 0.0f, 0.0f),
+                floorVertex(x + 1, 0, 0.0f, TILE),
+                floorVertex(x + 1, 1, TILE, TILE),
+                floorVertex(x, 1, TILE, 0.0f));
+    }
+
+    private static TerrainVertex floorVertex(int x, int z, float u, float v) {
+        return new TerrainVertex(x, 1.0f, z, u, v, 0xFF808080, 32, 200);
     }
 
     // ==================================================================
@@ -160,6 +391,43 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
         checkEq(0b100, TerrainVertexCodec.materialBits(0, true), "solid/translucent material = 0b100");
         checkEq(0b101, TerrainVertexCodec.materialBits(1, true), "cutout 0.1 + mip = 0b101");
         checkEq(0b010, TerrainVertexCodec.materialBits(2, false), "cutout 0.5 no mip = 0b010");
+
+        // The greedy-merge tile repeat, packed as ONE index in bits 3-7:
+        // log2(u) * 5 + log2(v), so 0..24. Two independent 2-bit fields
+        // could not hold five values per axis and three bits each would
+        // need nine of the byte's eight, so the pair travels jointly and
+        // terrain.mesh divides it back apart once per quad. Every case here
+        // is a number the shader has to agree with exactly.
+        checkEq(0b100, TerrainVertexCodec.materialBits(0, true, 1, 1),
+                "repeat 1x1 is pair index 0, so an unmerged quad is bit-identical");
+        checkEq((0 * 5 + 1) << 3 | 0b100, TerrainVertexCodec.materialBits(0, true, 1, 2),
+                "repeat 1x2 = index 1");
+        checkEq((1 * 5 + 0) << 3 | 0b100, TerrainVertexCodec.materialBits(0, true, 2, 1),
+                "repeat 2x1 = index 5, and u/v are not interchangeable");
+        checkEq((4 * 5 + 4) << 3 | 0b100, TerrainVertexCodec.materialBits(0, true, 16, 16),
+                "repeat 16x16 = index 24, the largest, still inside the byte");
+        check((TerrainVertexCodec.materialBits(2, false, 16, 16) & ~0xFF) == 0,
+                "the whole material byte, repeat included, fits in 8 bits");
+        checkThrows(() -> TerrainVertexCodec.materialBits(0, true, 3, 1),
+                "a non-power-of-two run is a caller bug, not something to clamp");
+        checkThrows(() -> TerrainVertexCodec.materialBits(0, true, 32, 1),
+                "a run past 16 has nowhere to go in the encoding");
+
+        // largestRepeat is what the sweep uses to fall back to a legal run.
+        checkEq(1, TerrainVertexCodec.largestRepeat(1), "span 1 -> 1");
+        checkEq(2, TerrainVertexCodec.largestRepeat(3), "span 3 floors to 2");
+        checkEq(8, TerrainVertexCodec.largestRepeat(15), "span 15 floors to 8");
+        checkEq(16, TerrainVertexCodec.largestRepeat(16), "span 16 -> 16, a section's width");
+        checkEq(16, TerrainVertexCodec.largestRepeat(64), "anything larger still caps at 16");
+    }
+
+    private static void checkThrows(Runnable body, String what) {
+        try {
+            body.run();
+        } catch (IllegalArgumentException expected) {
+            return;
+        }
+        throw new AssertionError("expected an IllegalArgumentException: " + what);
     }
 
     /**

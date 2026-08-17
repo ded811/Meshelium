@@ -290,6 +290,25 @@ layout(location = 1) out vec2 texCoord0[];
 layout(location = 2) out float sphericalVertexDistance[];
 layout(location = 3) out float cylindricalVertexDistance[];
 layout(location = 4) flat out uint materialBits[];
+// The quad's sprite rectangle in atlas space (xy = min, zw = max), for
+// greedy-merged quads.
+//
+// A merged quad spans several blocks and must TILE its sprite, but the UV
+// field holds absolute atlas coordinates and vanilla's block-atlas sampler
+// is CLAMP_TO_EDGE on both axes, so there is no hardware wrap to lean on:
+// walking the UV past the sprite samples whatever sprite is next to it on
+// the sheet. The fragment shader therefore wraps by hand, and to do that it
+// needs the sprite's bounds.
+//
+// ONE vec4, not two vec2s, and the tile counts travel inside materialBits
+// rather than as their own varying. The output-size formula charges a full
+// 16 B location for a vec2, and this stage's budget is real: at 9 locations
+// the 64-quad translucent workgroup cost 36864 B against a spec-minimum
+// maxMeshOutputMemorySize of 32768 that this very card reports. Packing to
+// 7 locations puts the same shape at 28672 B, legal on the spec floor, and
+// the fragment stage re-derives the repeat pair from materialBits with a
+// handful of integer ops on merged-quad fragments only.
+layout(location = 5) flat out vec4 spriteRect[];
 
 // ---- 16-byte packed-vertex decoders (docs/TERRAIN-DATA.md §1; the GLSL
 // twins of TerrainVertexCodec, ported from vertex_format.glsl) ----
@@ -323,9 +342,22 @@ vec4 sampleLightmap(uvec4 v) {
 // verbatim, hoisted so all three variants share the parity-proven math).
 void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
     uint vertBase = slot * 4u;
+    // Fetch first, emit second. The sprite rectangle is a property of the
+    // whole quad, so it cannot be known until all four UVs are in hand, and
+    // fetching twice would double the arena reads on the hottest path.
+    uvec4 vs[4];
+    vec2 uvMin = vec2(1.0e9);
+    vec2 uvMax = vec2(-1.0e9);
     for (uint i = 0u; i < 4u; ++i) {
-        uvec4 v = meshelium_fetchVertex(quad, i);
+        vs[i] = meshelium_fetchVertex(quad, i);
+        vec2 uv = decodeVertexUV(vs[i]);
+        uvMin = min(uvMin, uv);
+        uvMax = max(uvMax, uv);
+    }
+    for (uint i = 0u; i < 4u; ++i) {
+        uvec4 v = vs[i];
         uint vi = vertBase + i;
+        spriteRect[vi] = vec4(uvMin, uvMax);
         vec3 pos = decodeVertexPosition(v) + origin;
         gl_MeshVerticesEXT[vi].gl_Position = ProjMat * (ModelViewMat * vec4(pos, 1.0));
         // Vanilla fog.glsl: fog_spherical_distance / fog_cylindrical_distance.
