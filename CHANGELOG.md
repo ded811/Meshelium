@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.4.0
+
+**Occlusion culling now costs almost nothing while you stand still.**
+
+One of occlusion culling's GPU passes exists to catch terrain that
+becomes visible mid-frame. On a frame where the camera has not moved a
+bit and no terrain changed, it provably has nothing to catch, and
+Meshelium now proves that on the CPU each frame and skips the pass
+entirely. Measured at render distance 64, where occlusion culling is on
+by default, standing still gets about 11 percent of the frame back, and
+it held 96 percent of that while the test camera panned, because the
+proof only needs the view to hold still for a few frames at a time.
+
+The moment you move, edit a block, resize the window, or a chunk
+arrives, the pass runs exactly as it always did. It cannot show a stale
+picture: anything doubtful counts as movement, and the passes that
+decide what is visible never stop running either way. A launch flag
+restores the old always-run path.
+
+**New in Advanced: two distance sliders that trade far-away detail for
+frames. Both ship Off.**
+
+**Cull Tiny Plants Beyond** stops drawing small plants like grass tufts
+and flowers past a distance you choose. At 2560x1440 a one-block plant
+is smaller than a single pixel beyond about 64 chunks, so there is a lot
+of room to move this slider before anything visibly changes.
+
+**Cull Sub-Pixel Detail Beyond** goes further: past your chosen
+distance, any face whose four corners land inside one pixel on your
+screen is skipped entirely.
+
+Both apply instantly while you watch, so the honest way to set them is
+to drag until you see the picture change, then back off a step. Off
+draws everything exactly as before; that is measured, not promised.
+They are sliders rather than defaults because the frame-rate gain
+depends on your world and your screen, and you are a better judge of
+your own horizon than we are.
+
 ## 1.3.0
 
 **Fixed: chunks could flash invisible for a split second while moving.**

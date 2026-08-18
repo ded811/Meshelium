@@ -64,7 +64,10 @@ abstract class LevelExtractorMixin {
         if (!MesheliumCpuStages.ARMED) {
             return;
         }
-        MesheliumCpuStages.beginFrame();
+        // Frame boundary moved to LevelRenderer.render HEAD (2026-08-18
+        // alignment fix): extract runs before render, so this bracket lands
+        // deterministically in the PRIOR committed row and stage rows tile
+        // the bench recorder's frame deltas exactly.
         meshelium$extractT0 = System.nanoTime();
     }
 

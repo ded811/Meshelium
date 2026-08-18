@@ -47,6 +47,12 @@ import java.util.Map;
  * the geometry. UNASSIGNED quads are excluded because they have no plane to
  * merge within: crosses (grass tufts, flowers) rotate 45 degrees, so their
  * normals fail the facing test by construction.</p>
+ *
+ * <p>Excluded from the merge, not from measurement: the census pass counts
+ * how much of the translucent layer is flat still-water surface - disjoint
+ * unit faces sharing one horizontal plane, the one geometry whose relative
+ * draw order provably cannot matter - so the decision to ever merge that
+ * layer starts from a number rather than a hunch.</p>
  */
 public final class GreedyMeshProbe {
 
@@ -114,6 +120,17 @@ public final class GreedyMeshProbe {
     private record LitKey(QuadFacing facing, int plane, int cutoff, boolean mip,
                           int u0, int v0, int u1, int v1) {}
 
+    /**
+     * The census key for translucent flat water: colour and light struck
+     * out (whether the corners agree is reported separately, not gated
+     * on), orientation kept for the reason {@link AffineMergeProbe} keeps
+     * it, and the plane QUANTISED rather than integral, because a still
+     * fluid's surface sits at y = block + 8/9 and would fail the lattice
+     * test every solid face passes.
+     */
+    private record WaterKey(QuadFacing facing, int plane, int cutoff, boolean mip,
+                            int u0, int v0, int u1, int v1, int orient) {}
+
     private GreedyMeshProbe() {
     }
 
@@ -163,6 +180,26 @@ public final class GreedyMeshProbe {
             new java.util.concurrent.atomic.LongAdder();
     private static final java.util.concurrent.atomic.LongAdder AFFINE_MERGED =
             new java.util.concurrent.atomic.LongAdder();
+    /** {@link #waterCensus}: the flat-water shape of the translucent layer. */
+    private static final java.util.concurrent.atomic.LongAdder WATER_TOPS =
+            new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder WATER_UNDERSIDES =
+            new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder WATER_UNIFORM =
+            new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder WATER_MERGED =
+            new java.util.concurrent.atomic.LongAdder();
+    /** Sections that had any translucent quad at all. */
+    private static final java.util.concurrent.atomic.LongAdder WET_SECTIONS =
+            new java.util.concurrent.atomic.LongAdder();
+    /**
+     * Sections whose entire translucent prefix is flat horizontal water,
+     * tops plus their undersides. Inside such a section any draw order
+     * produces the same pixels, so a merge there needs no answer to the
+     * resort question at all: the provably-safe population.
+     */
+    private static final java.util.concurrent.atomic.LongAdder PLANE_PURE_SECTIONS =
+            new java.util.concurrent.atomic.LongAdder();
     private static final java.util.concurrent.atomic.AtomicLong NANOS =
             new java.util.concurrent.atomic.AtomicLong();
 
@@ -202,6 +239,22 @@ public final class GreedyMeshProbe {
             CONSISTENT_MERGED.add(affine[0]);
             AFFINE_MERGED.add(affine[1]);
             AFFINE_ELIGIBLE.add(affine[2]);
+            long[] water = waterCensus(quads);
+            WATER_TOPS.add(water[0]);
+            WATER_UNDERSIDES.add(water[1]);
+            WATER_UNIFORM.add(water[2]);
+            WATER_MERGED.add(water[3]);
+            if (water[4] > 0) {
+                WET_SECTIONS.increment();
+                // Plane-pure: EVERY translucent quad classified as a flat
+                // cell (top or underside), so the whole prefix lies in the
+                // water planes and no ordering question survives. Each
+                // cell is one translucent quad, so >= is equality here -
+                // a single glass block or shore face breaks the property.
+                if (water[0] + water[1] >= water[4]) {
+                    PLANE_PURE_SECTIONS.increment();
+                }
+            }
         } catch (Throwable t) {
             return; // same containment as the model pass
         }
@@ -258,6 +311,14 @@ public final class GreedyMeshProbe {
         String agreement = shipped == after
                 ? "model agrees"
                 : String.format("MODEL DISAGREES by %d quads - trust the shipped column", after - shipped);
+        long waterTops = WATER_TOPS.sum();
+        long waterUndersides = WATER_UNDERSIDES.sum();
+        long waterCells = waterTops + waterUndersides;
+        long waterMerged = WATER_MERGED.sum();
+        long translucentQuads = SKIP_TRANSLUCENT.sum();
+        double waterOfTranslucent = translucentQuads == 0
+                ? 0.0 : 100.0 * (waterCells - waterMerged) / translucentQuads;
+        double waterOfAll = 100.0 * (waterCells - waterMerged) / quads;
         return String.format(
                 "meshelium greedy probe: %d sections, %d quads -> %d SHIPPED (%.1f%% fewer overall); "
                         + "model says %d (%.1f%% overall, %.1f%% of the %d eligible, %s). "
@@ -266,13 +327,19 @@ public final class GreedyMeshProbe {
                         + "IF LIGHTING WERE IN THE SHADER: %d eligible -> %d (%.1f%% fewer overall). "
                         + "FREE CEILINGS over %d cells: single-valued lattice -> %d (%.1f%% overall), "
                         + "AFFINE (exact, no shader work) -> %d (%.1f%% overall). "
+                        + "TRANSLUCENT FLAT WATER over %d cells (%d tops, %d undersides, %d uniform) "
+                        + "-> %d rectangles (%.1f%% fewer of translucent, %.1f%% fewer overall), "
+                        + "PLANE-PURE sections %d of %d wet. "
                         + "Cost %.2f ms/section",
                 sections, quads, shipped, shippedOfAll,
                 after, ofAll, ofEligible, eligible, agreement,
-                SKIP_TRANSLUCENT.sum(), SKIP_UNASSIGNED.sum(),
+                translucentQuads, SKIP_UNASSIGNED.sum(),
                 SKIP_NON_UNIT.sum(), SKIP_NON_UNIFORM.sum(),
                 litEligible, litAfter, litOfAll,
                 affineEligible, consistentAfter, consistentOfAll, affineAfter, affineOfAll,
+                waterCells, waterTops, waterUndersides, WATER_UNIFORM.sum(),
+                waterMerged, waterOfTranslucent, waterOfAll,
+                PLANE_PURE_SECTIONS.sum(), WET_SECTIONS.sum(),
                 NANOS.get() / 1.0e6 / sections);
     }
 
@@ -340,6 +407,64 @@ public final class GreedyMeshProbe {
 
         return new Result(quads.size(), eligible, merged,
                 translucent, unassigned, nonUnit, nonUniform, litEligible, litMerged);
+    }
+
+    /**
+     * The flat-water shape of the translucent layer, measured rather than
+     * assumed.
+     *
+     * <p>Nothing here merges anything, and translucent stays excluded from
+     * every pass above, because draw order inside that layer is
+     * load-bearing. The one geometry where it provably is not is a set of
+     * disjoint quads sharing a single plane: any camera ray meets the plane
+     * once, so at most one of them covers any pixel and their relative
+     * order cannot change the image. Open water is exactly that shape -
+     * sheets of horizontal unit faces at y = block + 8/9 (vanilla's
+     * MAX_FLUID_HEIGHT), with back-faces at the same height - and this
+     * counts how much of the layer has it, before anyone touches the sort
+     * path on a hunch.</p>
+     *
+     * <p>Returns {tops, undersides, uniform, rectangles, translucent}: the
+     * flat POS_Y and NEG_Y cell counts, the subset whose corners pass
+     * {@link #uniform}, what the flat cells collapse into under the same
+     * clamped sweep as everything else, and all translucent quads seen.</p>
+     */
+    private static long[] waterCensus(List<TerrainQuad> quads) {
+        long translucent = 0;
+        long tops = 0;
+        long undersides = 0;
+        long uniformCells = 0;
+        Map<WaterKey, List<long[]>> groups = new HashMap<>();
+        for (TerrainQuad q : quads) {
+            if (!q.translucent()) {
+                continue;
+            }
+            translucent++;
+            if (q.facing() != QuadFacing.POS_Y && q.facing() != QuadFacing.NEG_Y) {
+                continue;
+            }
+            long[] cell = flatCell(q);
+            if (cell == null) {
+                continue;
+            }
+            if (q.facing() == QuadFacing.POS_Y) {
+                tops++;
+            } else {
+                undersides++;
+            }
+            if (uniform(q)) {
+                uniformCells++;
+            }
+            WaterKey key = new WaterKey(q.facing(), (int) cell[2], q.alphaCutoffIndex(), q.mip(),
+                    quant(minU(q)), quant(minV(q)), quant(maxU(q)), quant(maxV(q)),
+                    orientation(q));
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(cell);
+        }
+        long rectangles = 0;
+        for (List<long[]> group : groups.values()) {
+            rectangles += greedyRectangles(group);
+        }
+        return new long[] {tops, undersides, uniformCells, rectangles, translucent};
     }
 
     /**
@@ -467,6 +592,78 @@ public final class GreedyMeshProbe {
             return null;
         }
         return new long[] {Math.round(minA), Math.round(minB), Math.round(planeF)};
+    }
+
+    /**
+     * The water variant of {@link #unitCell}: a 1x1 horizontal face at ANY
+     * height, its plane quantised instead of required integral.
+     *
+     * <p>A still fluid's surface sits at y = block + 8/9, so the integral
+     * plane test every solid face passes would reject every water top. The
+     * in-plane extent must still be a unit cell on integer coordinates -
+     * shore and flow faces, whose corners sit at different heights, fail
+     * the planarity test and are counted only as translucent.</p>
+     */
+    private static long[] flatCell(TerrainQuad q) {
+        float planeF = q.v0().y();
+        float minA = Float.MAX_VALUE;
+        float maxA = -Float.MAX_VALUE;
+        float minB = Float.MAX_VALUE;
+        float maxB = -Float.MAX_VALUE;
+        for (int i = 0; i < 4; i++) {
+            TerrainVertex v = q.vertex(i);
+            if (!near(v.y(), planeF)) {
+                return null; // corners at different heights: not a flat sheet
+            }
+            minA = Math.min(minA, v.x());
+            maxA = Math.max(maxA, v.x());
+            minB = Math.min(minB, v.z());
+            maxB = Math.max(maxB, v.z());
+        }
+        if (!isUnitSpan(minA, maxA) || !isUnitSpan(minB, maxB)) {
+            return null;
+        }
+        return new long[] {Math.round(minA), Math.round(minB), quant(planeF)};
+    }
+
+    /**
+     * {@link AffineMergeProbe}'s orientation bits, specialised to the
+     * horizontal plane the census lives in. Kept in the key for the same
+     * reason it keeps them: a rotated variant shares its atlas rectangle,
+     * and merging across the rotation would rotate half the surface.
+     */
+    private static int orientation(TerrainQuad q) {
+        TerrainVertex origin = q.v0();
+        float a0 = origin.x();
+        float b0 = origin.z();
+        TerrainVertex alongA = null;
+        TerrainVertex alongB = null;
+        for (int i = 1; i < 4; i++) {
+            TerrainVertex o = q.vertex(i);
+            boolean sameA = near(o.x(), a0);
+            boolean sameB = near(o.z(), b0);
+            if (!sameA && sameB) {
+                alongA = o;
+            } else if (sameA && !sameB) {
+                alongB = o;
+            }
+        }
+        if (alongA == null || alongB == null) {
+            return -1;
+        }
+        float signA = alongA.x() > a0 ? 1.0f : -1.0f;
+        float signB = alongB.z() > b0 ? 1.0f : -1.0f;
+        float duA = (alongA.u() - origin.u()) * signA;
+        float dvA = (alongA.v() - origin.v()) * signA;
+        float duB = (alongB.u() - origin.u()) * signB;
+        float dvB = (alongB.v() - origin.v()) * signB;
+        boolean uAlongB = Math.abs(duB) > Math.abs(duA);
+        float du = uAlongB ? duB : duA;
+        float dv = uAlongB ? dvA : dvB;
+        if (du == 0.0f || dv == 0.0f) {
+            return -1;
+        }
+        return (uAlongB ? 1 : 0) | (du < 0.0f ? 2 : 0) | (dv < 0.0f ? 4 : 0);
     }
 
     private static float component(TerrainVertex v, int axis) {

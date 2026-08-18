@@ -1109,3 +1109,198 @@ back clean, with maxima of 4.18 and 4.27 ms. So the spikes are sporadic, they
 are not inside any measured stage, and they are not attributed to the merge.
 They are recorded here because a mean that one frame can move by 17 percent is
 why every table above carries a median column.
+
+### The 1.4.0 dev cycle, night one (2026-08-17)
+
+Same rig, same session for every pair below. The harness gained a fix this
+night that matters to every future number: 26.2 renamed all gamerules, the
+old camelCase freeze commands had been failing silently since the toolchain
+moved, and every earlier bench therefore ran with daylight advancing and
+random ticks at 3. Same-session pairs stayed fair because both legs drifted
+identically; the freeze works now.
+
+#### The phase-B CPU skip, measured: attempt 3 wins
+
+Attempt 2's post-mortem said the remaining route to the 8-to-12-percent
+phase-B prize was a CPU-side decision. Built this night: when the camera,
+frustum, scene matrices and raster extent are bit-identical, the residency
+epoch has not moved, the commit backlog is empty, and the lagged readback
+shows zero phase-B draws since the last input change, pass 4's recording is
+elided entirely. `plains-rd64` / 2560x1440, 600 frames, occlusion armed both
+legs, same build:
+
+| | frame p50 | frame p99 | worst | phase B GPU p50 | skip rate |
+|---|---|---|---|---|---|
+| skip off | 2.200 ms | 3.362 ms | 4.367 ms | 0.238 ms | 0% |
+| skip on | **1.957 ms (-11.0%)** | 3.566 ms | 4.076 ms | **0.000 ms** | 96.1% |
+
+The tail gate attempt 2 failed by a factor of eight is passed here: p99
+moves 6 percent, the worst frame improves. The win exceeds the 0.163 ms
+GPU-only ceiling because the CPU also stops recording ~158 push-constant
+and draw pairs plus a render pass per skipped frame. The quiet detector
+stayed quiet through 2,965 read-back stats frames, which is the skip being
+exact rather than suppressive: nothing it skipped was ever owed.
+
+The skip-rate column is the honesty condition for a static-only feature: a
+pinned camera is its best case. Spinning and mid-flight frames disarm it by
+key mismatch, so the blended real-play win is the static share of play
+times the number above. At render distances below the occlusion Auto
+crossover the occlusion path is off and the skip does not exist.
+
+#### The lightmap fetch group, killed for three microseconds
+
+The rank-4 scout idea (dedup the mesh stage's four lightmap fetches for
+uniform-light quads) got its kill-first run: `MESHELIUM_LIGHT_STUB` stubs
+every fetch to white, so one parity-breaking A/B pair bounds the entire
+cost group. At `plains-rd64` / 2560x1440 the stubbed opaque pass is 0.845
+versus 0.844 ms unstubbed: the whole group is worth about **0.003 ms**
+against a 0.05 ms kill line. The dedup is dead, and the premul-MVP idea
+sequenced behind it dies of the same arithmetic. Sixteen texture units
+reading a 16x16 texture out of L0 cost nothing to begin with.
+
+#### The flat-water census: the merge's premise is real
+
+The probe now measures the translucent layer the merge refuses to touch.
+Over the new deep-ocean scene (seed 4242, camera resolved from the biome
+source), final probe reports:
+
+| scene | flat cells | -> rectangles | of translucent | of ALL quads | plane-pure sections |
+|---|---|---|---|---|---|
+| ocean-rd32 | 1,758,689 | 27,667 | **-95.6%** | -15.2% | 2,822 of 4,761 wet |
+| ocean-rd64 | 2,275,067 | 61,480 | **-93.1%** | -14.0% | 3,677 of 7,117 wet |
+
+99.95 percent of flat cells pass the uniform-corner test, so the merge
+machinery that ships today reaches nearly all of it. The 50-percent kill
+line is beaten by 43 points; the sort-free flat-water merge graduates from
+hunch to funded project. Its frame-time multiplicand (the measured ocean
+translucent pass) still needs the settled bench legs, which the gamerule
+fix above unblocks: kelp and seagrass random-ticking at speed 3 kept ocean
+worldgen churning past the settle budget, which is how the first four
+ocean legs died and is this project's third demonstration that a live
+world never stops ticking.
+
+**...and the multiplicand, measured (the second batch).** With the
+freezes working, all four ocean legs settled (deep-ocean camera at
+x=1088 z=1088, resolved from the biome source and recorded in the knob
+block). The ocean translucent pass: **0.119 ms** at rd 32 / 1080p,
+0.132 ms at rd 32 / 1440p, **0.316 ms** at rd 64 / 1440p. The 1.78x
+pixel step moves the pass 11 percent, so it is primitive-bound like
+every other pass and the merge's ceiling really is the pass times the
+93-percent reachable share. Verdict against the scout's own kill lines:
+the rd 32 frame case is DEAD (0.119 is under the 0.3 ms line; a
+sub-0.11 ms win cannot clear the noise floor), the rd 64 frame case is
+borderline-credible (~0.25-0.29 ms ceiling, greedy-meshing-sized), and
+the memory case stands on its own: roughly 2.2M merged-away quads at
+rd 64 is ~140 MB of arena prefix plus the same again in the CPU-side
+resident copy. Deferred, not killed: the mesher/resort work is days
+deep, and this cycle has bigger confirmed wins in hand.
+
+#### The second batch: the skip at rd 32, and what spinning actually measures
+
+With occlusion FORCED at rd 32 / 1080p (AUTO leaves it off there), the
+static pair reads mean 1.127 to **1.038 ms (-7.9%)**, skip rate 97.7% -
+the design doc's 8-percent prediction, delivered. The spin pairs then
+answered a different question than the one they were sent to ask. The
+bench spin rotates the player per TICK, so at bench frame rates ~24 of
+25 frames share one camera pose bit-for-bit, and the skip stayed 96-97
+percent engaged while spinning: rd 32 spin p50 1.701 to 1.599 ms, rd 64
+spin p50 7.545 to **6.972 ms**, tails no worse (the rd 64 spin-skip leg
+recorded one sporadic 696 ms frame in the class already documented
+above: no stage timer accounts for it, the off leg has its own 72 ms
+spike, medians are the row). Real mouse-look applies deltas per FRAME,
+not per tick, so a player actively turning disarms the skip far more
+than the spin legs did; the honest statement is that the skip pays
+during every stretch where the pose holds for ~6 frames, which is
+standing, building, menus, AFK, and the gaps between mouse movements,
+and costs a key-compare-and-a-lock on the frames where it cannot.
+
+**Default: ON**, as of the night it was built (the multiWG rule:
+measured winners are defaults, `-Dmeshelium.occlusion.phaseBCpuSkip=false`
+is the escape hatch). What was NOT directly measured tonight is a
+100-percent-disarm workload (per-frame pose change); the arithmetic
+bound on that path is one raw-bits key compare plus one uncontended
+lock per frame, and the ~10,000 disarm frames inside tonight's spin
+legs moved no tail. If a future session builds a per-frame-look leg,
+run it before trusting this paragraph further.
+
+#### The aligned frame (night two, 2026-08-18): 100 percent attribution
+
+The attribution wave (row boundary moved to render HEAD; new brackets
+compileUpload / encoderSubmit / levelRender / renderFrame; per-frame
+sectionCompiles) closed the frame completely. plains-rd64 / 1440p, same
+session, gamerule freezes working:
+
+| p50 ms | static | spin 3°/tick |
+|---|---|---|
+| frame | 1.966 | 6.807 |
+| renderFrame (whole) | 1.914 | 6.644 |
+| levelRender | 0.771 | 4.173 |
+| encoderSubmit (GPU-pace wait) | **0.702** | 0.122 |
+| extract | 0.284 | 1.833 |
+| applyFrustum | absent | **0.637** |
+| mesheliumOpaque | 0.072 | **2.831** |
+| mesheliumTranslucent | 0.623 | 0.870 |
+| compileUpload | 0.044 | 0.115 (p99 1.30) |
+| sectionCompiles/leg | **0** | **16,321** (max 122/frame) |
+
+Verdicts, each now same-session data rather than inference:
+
+1. **Static frames are GPU-paced.** encoderSubmit's semaphore wait is
+   0.70 ms of a 1.97 ms frame and tick+input is 0.05 ms; nothing is
+   hidden, and static-frame CPU work is confirmed free (the pace
+   absorbs it). Optimize static frames on the GPU side only.
+2. **The draw-snapshot conviction stands with aligned rows:**
+   mesheliumOpaque 0.072 to 2.831 ms p50 while turning - 40 percent of
+   the turning frame, in our code, with the fix designed in
+   DRAW-SNAPSHOT-INCREMENTAL.md. Night-three item one.
+3. **GC is convicted for the monster class:** 176 pauses in one
+   GC-logged spin leg (default G1, unpinned heap), p50 11 ms, eight
+   over 50 ms, max 777 ms - and that leg's 872 ms worst frame matches.
+   The snapshot rebuild's ~280 MB/s garbage stream is a prime feeder:
+   the incremental snapshot attacks median and tail at once. A
+   heap-pinning / collector recommendation for players waits until our
+   own garbage is fixed first (do not tune the collector around a leak
+   we own).
+4. **The build storm is real and budget-shaped:** 23 compiles/frame
+   average while turning, bursts of 66-122, zero static. The
+   direction-independent budgeted scheduler (A2) is funded by its own
+   kill test.
+5. **applyFrustum is 0.637 ms per ROTATING frame** - the old 0.022 ms
+   amortized figure was the tick-quantized spin rarely crossing 2°
+   buckets. Real mouse-look crosses per frame; the async-visibility
+   prize (A1+A3) is roughly extract's 1.8 ms while turning, bigger
+   than previously recorded.
+
+#### The 1440p curve, refitted against the shipped state (batch 3)
+
+Twenty-eight legs, two reps per cell, 2560x1440, phase-B CPU skip at
+its shipped default: its tax read **0.000 ms on every one of the
+fourteen occlusion legs**, in every scene. The curve, medians, both
+reps agreeing (bfsDraw = the bfsOnly leg's opaque + translucent;
+saved/tax per the stage-1 method; frame delta positive = occlusion
+slower):
+
+| cell | bfsDraw | saved | tax | frame delta | verdict |
+|---|---|---|---|---|---|
+| plains-rd16 | 0.233 | 0.03 | 0.15 | +21% | no result (CPU-limited) |
+| plains-rd24 | 0.457 | 0.08 | 0.18 | +14/15% | LOSS |
+| plains-rd32 | 0.758 | 0.16 | 0.22 | +5/7% | LOSS |
+| plains-rd48 | 1.434 | 0.45 | 0.26 | **-11/12%** | WIN |
+| plains-rd64 | 2.230 | 0.94 | 0.28 | **-25/28%** | WIN |
+| ground-rd32 | 0.502 | 0.33 | 0.14 | **-14/17%** | WIN |
+| ground-rd64 | 0.742 | 0.54 | 0.15 | **-27/37%** | WIN |
+
+Two headlines. First, at the flagship distance the whole shipped stack
+(occlusion + the new skip) beats bfsOnly by a quarter at plains and by
+a third at eye level, and ground-rd64 runs a 0.7 ms frame at rd 64.
+Second, **the draw-cost Auto trigger is refuted at 1440p**: ground-rd64
+wins 27-37 percent at 0.72-0.76 ms of bfsOnly draw while plains-rd32
+loses at the same 0.76 ms. Identical signal, opposite verdicts - the
+draw cost cannot see the cull fraction, only the prize pool. This is
+the second single-number Auto key this project has fitted and then
+refuted with more data (resident count died the same way at 1080p),
+and the conclusion is now structural, not parametric: **no passive
+scalar decides this; Auto must probe.** The design (draw-cost floor,
+short armed window, same-session verdict from the always-live GPU
+timers, latch and re-probe) is in OCCLUSION-FILLRATE-DESIGN.md's
+status section, unbuilt, first candidate for night two.

@@ -586,6 +586,21 @@ public final class TerrainResidency {
         }
     }
 
+    /**
+     * TRUE iff nothing already encoded can still LAND on the GPU without
+     * a fresh {@code drawEpoch} bump first: no dirty regions queued for
+     * commit and no staged uploads pending. The distinction matters
+     * because a requeued {@code commitDirty} from an earlier full-staging
+     * pump can deliver section records on a frame whose epoch is
+     * otherwise quiet; the phase-B CPU skip (TerrainDrawer) treats any
+     * backlog as an input change for exactly that reason.
+     */
+    public static boolean gpuCommitBacklogEmpty() {
+        synchronized (LOCK) {
+            return regionStore.dirtyRegionCount() == 0 && pendingUploads.isEmpty();
+        }
+    }
+
     /** Null = healthy (the wave-2 {@code lastError()} latch pattern). */
     public static String lastError() {
         return lastError;

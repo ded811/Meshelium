@@ -89,18 +89,52 @@ public final class MesheliumCpuStages {
     public static final int STAGE_MESHELIUM_OPAQUE = 4;
     public static final int STAGE_MESHELIUM_TRANSLUCENT = 5;
     public static final int STAGE_RESIDENCY_PUMP = 6;
-    public static final int STAGES = 7;
+    // The attribution-gap wave (2026-08-18): the four windows the first
+    // seven stages left dark. compileUpload = vanilla's compileSections
+    // through uploadTerrainBuffersToGpu (inline compiles + staging drains
+    // live here); encoderSubmit = VulkanCommandEncoder.submit(), whose tail
+    // is the 2-submits-in-flight timeline-semaphore wait where a GPU-paced
+    // CPU parks; levelRender = the whole LevelRenderer.render span;
+    // renderFrame = the whole Minecraft.renderFrame span (frame delta minus
+    // this = tick + input; renderFrame minus levelRender minus submit minus
+    // extract ~= GUI + acquire + blit + present).
+    public static final int STAGE_COMPILE_UPLOAD = 7;
+    public static final int STAGE_ENCODER_SUBMIT = 8;
+    public static final int STAGE_LEVEL_RENDER = 9;
+    public static final int STAGE_RENDER_FRAME = 10;
+    public static final int STAGES = 11;
 
     /** Stage names, index-aligned — the bench JSON + debug line labels. */
     public static final String[] NAMES = {
             "extract", "applyFrustum", "occlusionGraphUpdate", "prepareChunkRenders",
-            "mesheliumOpaque", "mesheliumTranslucent", "residencyPump"};
+            "mesheliumOpaque", "mesheliumTranslucent", "residencyPump",
+            "compileUpload", "encoderSubmit", "levelRender", "renderFrame"};
+
+    /**
+     * Executed section-compile tap entries (build threads; includes empty
+     * results, excludes resorts structurally — they never reach the tap).
+     * Cumulative; the per-frame capture stores deltas. Pure JDK, so the
+     * terrain tap calling in keeps this class GL-path-safe.
+     */
+    private static final java.util.concurrent.atomic.LongAdder TAP_COMPILES =
+            new java.util.concurrent.atomic.LongAdder();
+
+    /** Build-thread hook: one executed compile tap (any result). */
+    public static void noteTapCompile() {
+        TAP_COMPILES.increment();
+    }
+
+    /** Cumulative executed tap compiles (bench counters block). */
+    public static long tapCompiles() {
+        return TAP_COMPILES.sum();
+    }
 
     // Render thread only: the open frame's row (−1 = stage absent).
     private static final long[] current = new long[STAGES];
     private static int currentApplyRuns;
     private static int currentVisibleSections = -1;
     private static boolean frameOpen;
+    private static long lastTapCompilesSample;
 
     // Rolling 5 s means (render thread only).
     private static final long[] accum = new long[STAGES];
@@ -113,6 +147,7 @@ public final class MesheliumCpuStages {
     private static long[] captureRows = new long[0];
     private static int[] captureApplyRuns = new int[0];
     private static int[] captureVisibleSections = new int[0];
+    private static int[] captureSectionCompiles = new int[0];
     private static volatile int captureFilled;
     private static volatile boolean capturing;
 
@@ -135,9 +170,13 @@ public final class MesheliumCpuStages {
     // ------------------------------------------------------------------
 
     /**
-     * Frame boundary — called at {@code LevelExtractor.extract} HEAD (the
-     * first stage of a frame's CPU sequence, before {@code LevelRenderer
-     * .render} and everything inside it). Commits the PREVIOUS frame's row.
+     * Frame boundary — called at {@code LevelRenderer.render} HEAD, the
+     * SAME hook the bench recorder stamps its frame deltas from, so stage
+     * rows tile frame deltas exactly (the 2026-08-18 alignment fix: the
+     * old extract-HEAD boundary put every row 1-2 indices after its frame
+     * delta and manufactured an "unattributed frame"). extract runs before
+     * render, so its bracket lands deterministically in the PRIOR row.
+     * Commits the PREVIOUS frame's row.
      */
     public static void beginFrame() {
         if (frameOpen) {
@@ -180,6 +219,11 @@ public final class MesheliumCpuStages {
                 System.arraycopy(current, 0, captureRows, filled * STAGES, STAGES);
                 captureApplyRuns[filled] = currentApplyRuns;
                 captureVisibleSections[filled] = currentVisibleSections;
+                // Executed-compile delta since the last committed row: the
+                // build-storm series (worker-side, so a delta not a bracket).
+                long taps = TAP_COMPILES.sum();
+                captureSectionCompiles[filled] = (int) (taps - lastTapCompilesSample);
+                lastTapCompilesSample = taps;
                 captureFilled = filled + 1; // volatile publish AFTER the copies
             } else {
                 capturing = false;
@@ -246,6 +290,8 @@ public final class MesheliumCpuStages {
         captureRows = new long[rows * STAGES];
         captureApplyRuns = new int[rows];
         captureVisibleSections = new int[rows];
+        captureSectionCompiles = new int[rows];
+        lastTapCompilesSample = TAP_COMPILES.sum();
         captureFilled = 0;
         capturing = true;
     }
@@ -272,5 +318,10 @@ public final class MesheliumCpuStages {
     /** Per-row visibleSections.size() at prepare time (−1 = not sampled). */
     public static int[] captureVisibleSectionsSnapshot() {
         return Arrays.copyOf(captureVisibleSections, captureFilled);
+    }
+
+    /** Per-row executed-compile deltas (build-thread taps between commits). */
+    public static int[] captureSectionCompilesSnapshot() {
+        return Arrays.copyOf(captureSectionCompiles, captureFilled);
     }
 }

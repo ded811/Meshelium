@@ -178,13 +178,20 @@ uvec4 meshelium_fetchVertex(uint quad, uint i) {
 }
 
 // Meshelium's per-frame scene UBO (wave-5 layout — must match terrain.task /
-// terrain.frag and TerrainDrawer.uploadScene byte-for-byte). This stage
-// reads ModelViewMat only.
+// terrain.frag and TerrainDrawer.uploadScene byte-for-byte; frag and the
+// occlusion rasters declare the 192-byte PREFIX only, legal because the
+// bound slice always covers the largest declared block). This stage reads
+// ModelViewMat and CullMisc only.
 layout(set = 0, binding = 1, std140) uniform MesheliumScene {
     mat4 ModelViewMat;   // CameraRenderState.viewRotationMatrix (camera-relative)
     vec4 SceneMisc;      // xy = block atlas size in texels (TextureSize)
     vec4 FrustumPlanes[6];
     ivec4 CameraChunk;
+    vec4 CullMisc;       // x = plant-cull distance squared (task stage only),
+                         // y = sub-pixel-cull distance squared (blocks²),
+                         // zw = viewport size in pixels; a slider at 0
+                         // uploads 3.4e38, which every real distance
+                         // compares under, so the gate never arms
 };
 
 // Vanilla's own Projection UBO slice (RenderSystem.getProjectionMatrixBuffer())
@@ -331,11 +338,19 @@ vec2 decodeVertexUV(uvec4 v) {
 }
 
 vec4 sampleLightmap(uvec4 v) {
+#if MESHELIUM_LIGHT_STUB
+    // Measurement-only ceiling stub (parity-breaking by design): every
+    // lightmap fetch replaced by white, so an A/B pair bounds the entire
+    // lightmap cost group. Compiled out unless the bench property
+    // meshelium.bench.lightStub set it at pipeline creation.
+    return vec4(1.0);
+#else
     // Stored bytes are lightmap coord + 8, clamped [8,248] — already
     // vanilla's sample_lightmap((uv/256)+0.5/16, clamped) input; the +8
     // centring is verified against the vanilla include (wave-4 notes).
     uvec2 light = uvec2((v.y >> 24) & 0xFFu, (v.z >> 24) & 0xFFu);
     return textureLod(Sampler2, vec2(light) / 256.0, 0.0);
+#endif
 }
 
 // One quad's 4 vertices + 2 triangles into output slot `slot` (wave-4 body
@@ -354,12 +369,44 @@ void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
         uvMin = min(uvMin, uv);
         uvMax = max(uvMax, uv);
     }
+
+    // Cull Sub-Pixel Detail Beyond (default OFF): armed only when the
+    // section's center (origin is the section's camera-relative min
+    // corner in all three variants) sits beyond the configured distance.
+    // With the slider at 0 the CPU uploads 3.4e38 into CullMisc.y, no
+    // finite distance exceeds it, subPixelArmed is false everywhere, and
+    // every write in the loop below is the exact pre-existing expression
+    // in the exact pre-existing order — bit-identical output (parity
+    // shots 40/41 are the standing proof of that shape).
+    vec3 subPixelCenter = origin + 8.0;
+    bool subPixelArmed = dot(subPixelCenter, subPixelCenter) > CullMisc.y;
+    bool subPixelFront = true;
+    vec4 clipFirst = vec4(0.0);
+    vec2 pxMin = vec2(0.0);
+    vec2 pxMax = vec2(0.0);
     for (uint i = 0u; i < 4u; ++i) {
         uvec4 v = vs[i];
         uint vi = vertBase + i;
         spriteRect[vi] = vec4(uvMin, uvMax);
         vec3 pos = decodeVertexPosition(v) + origin;
-        gl_MeshVerticesEXT[vi].gl_Position = ProjMat * (ModelViewMat * vec4(pos, 1.0));
+        vec4 clipPos = ProjMat * (ModelViewMat * vec4(pos, 1.0));
+        gl_MeshVerticesEXT[vi].gl_Position = clipPos;
+        if (subPixelArmed) {
+            // Pixel-space corner: NDC (clip/w) mapped 0..viewport. A
+            // corner with w <= 0 is behind the eye plane and its divide
+            // means nothing — disarm rather than trust it; keeping the
+            // quad is always the safe answer.
+            subPixelFront = subPixelFront && clipPos.w > 0.0;
+            vec2 px = (clipPos.xy / clipPos.w * 0.5 + 0.5) * CullMisc.zw;
+            if (i == 0u) {
+                clipFirst = clipPos;
+                pxMin = px;
+                pxMax = px;
+            } else {
+                pxMin = min(pxMin, px);
+                pxMax = max(pxMax, px);
+            }
+        }
         // Vanilla fog.glsl: fog_spherical_distance / fog_cylindrical_distance.
         sphericalVertexDistance[vi] = length(pos);
         cylindricalVertexDistance[vi] = max(length(pos.xz), abs(pos.y));
@@ -367,6 +414,18 @@ void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
         texCoord0[vi] = decodeVertexUV(v);
         materialBits[vi] = (v.y >> 16) & 0xFFu; // flat; provoking vertices
                                                 // (vertBase+0/+2) are this quad's
+    }
+
+    if (subPixelArmed && subPixelFront && all(equal(round(pxMin), round(pxMax)))) {
+        // The quad's whole screen bounding box rounds to one pixel:
+        // re-emit it degenerate, all four corners on the first vertex.
+        // Zero-area triangles rasterise to nothing — the same
+        // nothing-drawn shape the fetch fallback above leans on ("a
+        // degenerate vertex draws nothing"). Only gl_Position moves; the
+        // other outputs stay written and are never sampled (no fragments).
+        gl_MeshVerticesEXT[vertBase + 1u].gl_Position = clipFirst;
+        gl_MeshVerticesEXT[vertBase + 2u].gl_Position = clipFirst;
+        gl_MeshVerticesEXT[vertBase + 3u].gl_Position = clipFirst;
     }
 
     // Vanilla's sequential quad index pattern {0,1,2, 2,3,0} (section-build

@@ -22,6 +22,7 @@ import com.google.gson.GsonBuilder;
 
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
 import net.fabricmc.loader.api.FabricLoader;
@@ -29,7 +30,9 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.CloudStatus;
 import net.minecraft.client.InactivityFpsLimit;
 import net.minecraft.client.gui.screens.worldselection.WorldCreationUiState;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
 
 import org.lwjgl.glfw.GLFW;
@@ -174,6 +177,25 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
     /** Carves the chamber around whatever CAVE_CAMERA_TP just pinned. */
     private static final String CAVE_CARVE =
             "execute as @p at @s run fill ~-4 ~-3 ~-4 ~4 ~3 ~4 minecraft:air";
+
+    /**
+     * Ocean scenes: the camera hangs over open deep ocean at y=105 with
+     * the scenic yaw and pitch of {@link #CAMERA_TP} - sea level is 63, so
+     * that is about forty blocks up, the plains framing ratio applied to
+     * water.
+     *
+     * <p>Unlike every other pose this cannot be a compile-time constant:
+     * where the nearest deep ocean is belongs to the seed, and hard-coding
+     * a spot found once for 4242 would silently bench the wrong scene for
+     * every seed override. It is resolved once at scene setup from the
+     * server's own biome source (see {@link #resolveOceanCamera}) and the
+     * resolved coordinates go into the report's knob block, so every run
+     * documents where it measured.</p>
+     */
+    private static volatile String oceanCameraTp;
+    /** The resolved deep-ocean column, for the knob block. */
+    private static volatile int oceanCameraX;
+    private static volatile int oceanCameraZ;
     private static final int WARMUP_FRAMES = 120;
     private static final int MEASURED_FRAMES = 600;
     private static final int READY_TIMEOUT_TICKS = 1200;
@@ -216,7 +238,15 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             // Enclosed/underground, the occlusion-culling extreme. See
             // CAVE_CAMERA_TP for why these exist.
             entry("cave-rd32", 32),
-            entry("cave-rd64", 64));
+            entry("cave-rd64", 64),
+            // Open water, the translucent extreme: every surface section
+            // contributes a 16x16 water sheet in the one layer the merge
+            // refuses to touch. Exists to carry the flat-water census and
+            // to put a real number on an ocean translucent pass, which the
+            // plains rivers cannot stand in for. See oceanCameraTp for why
+            // the pose is resolved at runtime rather than hard-coded.
+            entry("ocean-rd32", 32),
+            entry("ocean-rd64", 64));
 
     /**
      * Waits for a capture to fill, sweeping the camera if the spin knob is
@@ -287,7 +317,40 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         if (scene.startsWith("cave-")) {
             return CAVE_CAMERA_TP;
         }
+        if (scene.startsWith("ocean-")) {
+            if (oceanCameraTp == null) {
+                throw new AssertionError("ocean camera requested before the "
+                        + "deep-ocean lookup ran");
+            }
+            return oceanCameraTp;
+        }
         return CAMERA_TP;
+    }
+
+    /**
+     * Finds the nearest deep ocean to world spawn and pins the ocean pose
+     * over it. The query goes straight to the overworld's biome source
+     * with vanilla's own {@code /locate biome} parameters (radius 6400,
+     * steps 32 horizontal / 64 vertical), so the answer is a function of
+     * the seed and nothing else - no chunks need generating to compute it.
+     * No deep ocean in range is a hard failure: benching some other biome
+     * under an "ocean-" label would be worse than no number at all.
+     */
+    private static void resolveOceanCamera(TestServerContext server) {
+        BlockPos found = server.computeOnServer(mc -> {
+            var level = mc.overworld();
+            var hit = level.findClosestBiome3d(biome -> biome.is(Biomes.DEEP_OCEAN),
+                    level.getRespawnData().pos(), 6400, 32, 64);
+            return hit == null ? null : hit.getFirst();
+        });
+        if (found == null) {
+            throw new AssertionError("no deep_ocean within 6400 blocks of spawn for seed "
+                    + SEED + " - refusing to bench the wrong scene");
+        }
+        oceanCameraX = found.getX();
+        oceanCameraZ = found.getZ();
+        oceanCameraTp = "tp @p " + (oceanCameraX + 0.5) + " 105.0 "
+                + (oceanCameraZ + 0.5) + " 45 25";
     }
 
     @Override
@@ -383,14 +446,27 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             // worldgen-sized budget.
             settleWorldgen(context);
 
+            // Ocean scenes resolve their pose before any command references
+            // it; the settles around the tp below then absorb the worldgen
+            // the far teleport triggers, exactly as they do for every scene.
+            if (scene.startsWith("ocean-")) {
+                resolveOceanCamera(server);
+            }
+
             // Deterministic freezes (the parity protocol's set) + the
             // pinned spectator camera.
+            // 26.2 renamed every gamerule (GameRuleRegistryFix in the jar
+            // carries the old-to-new table; the old camelCase names fail to
+            // parse and the freeze silently never happened - benches ran
+            // with daylight advancing and random ticks at 3 until this).
+            // Harmless on plains pairs, fatal over oceans: kelp and
+            // seagrass random-tick forever and worldgen never settles.
             server.runCommand("time set " + TIME_OF_DAY);
-            server.runCommand("gamerule doDaylightCycle false");
+            server.runCommand("gamerule minecraft:advance_time false");
             server.runCommand("weather clear");
-            server.runCommand("gamerule doWeatherCycle false");
-            server.runCommand("gamerule doMobSpawning false");
-            server.runCommand("gamerule randomTickSpeed 0");
+            server.runCommand("gamerule minecraft:advance_weather false");
+            server.runCommand("gamerule minecraft:spawn_mobs false");
+            server.runCommand("gamerule minecraft:random_tick_speed 0");
             server.runCommand("gamemode spectator @p");
             server.runCommand(cameraFor(scene));
             if (scene.startsWith("cave-")) {
@@ -595,6 +671,12 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         knobs.put("skipVanillaPrep", MesheliumConfig.skipVanillaPrepEnabled());
         knobs.put("cachedCull", MesheliumConfig.cachedCullEnabled());
         knobs.put("cpuStagesArmed", MesheliumCpuStages.ARMED);
+        if (scene.startsWith("ocean-")) {
+            // The deep-ocean column the run actually measured over, not a
+            // promise of one - the pose is seed-dependent (see oceanCameraTp).
+            knobs.put("oceanCameraX", oceanCameraX);
+            knobs.put("oceanCameraZ", oceanCameraZ);
+        }
         root.put("knobs", knobs);
         // WHAT THE BASELINE ACTUALLY IS. Every "plain Minecraft" figure this
         // project published before 1.1 was vanilla running on Minecraft's
@@ -734,6 +816,10 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         out.put("applyFrustumRuns", applyRuns);
         out.put("applyFrustumRunsTotal", applyTotal);
         out.put("visibleSections", visibleSections);
+        // 2026-08-18: executed-compile deltas per committed row (build-thread
+        // taps; empties included, resorts structurally excluded) - the
+        // build-storm series the rebuild-scheduling kill test reads.
+        out.put("sectionCompiles", MesheliumCpuStages.captureSectionCompilesSnapshot());
         return out;
     }
 
@@ -767,6 +853,11 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         c.put("lastReadStatsFrame", lastRead);
         c.put("lastPhaseBStatsFrame", lastPhaseB);
         c.put("phaseBQuietStatsFrames", lastPhaseB < 0 ? lastRead + 1 : lastRead - lastPhaseB);
+        // The 1.4.0 CPU skip's engagement count. A static-only feature
+        // must publish its rate next to any win it claims: a bench pair
+        // without this column is the 854x480 mistake with a new axis.
+        c.put("phaseBCpuSkipFrames", TerrainDrawer.phaseBCpuSkipFrames());
+        c.put("tapCompiles", MesheliumCpuStages.tapCompiles());
         c.put("translucentFrames", TerrainDrawer.translucentFrames());
         c.put("gpuTimerFramesRead", MesheliumGpuTimers.framesRead());
         c.put("gpuTimerNotReady", MesheliumGpuTimers.framesNotReadyCount());

@@ -922,6 +922,26 @@ decidable cells, and it is readable while occlusion is off, which is the
 hard requirement. Use it to decide when probing is worthwhile; let the probe
 decide the answer.
 
+**2026-08-17 UPDATE: the draw-cost threshold died at 1440p, exactly the
+way resident count died at 1080p.** The 28-leg 1440p refit (two reps per
+cell, phase-B CPU skip in its shipped default-ON state, phase-B tax
+0.000 on every ON leg) reproduces the curve's shape - plains loses below
+48 and wins hugely at 48/64, ground wins everywhere decidable - but
+`ground-rd64` WINS by 27-37 percent at a 0.72-0.76 ms bfsOnly draw while
+`plains-rd32` LOSES at the same 0.76 ms. Identical signal value,
+opposite verdicts: the draw cost measures the prize pool, not the cull
+fraction, and no passive threshold on it can separate an eye-level
+camera from an elevated one. The full table is in PERFORMANCE.md. What
+survives is this section's own closing sentence: the draw cost is only
+the "worth probing" floor (~0.4-0.5 ms), and Auto must PROBE - arm
+occlusion for a short window, read the same-session verdict from the
+GPU timers that are live in both modes, latch the winner, re-probe on
+render-distance change or sustained draw-cost drift. With the phase-B
+CPU skip shipped, the flip's stamp-flush storm self-heals in a frame,
+so a probe every few seconds is invisible. That is the 1.4.0 Auto
+design; the rd crossover slider stays as the floor and the
+timers-not-live fallback.
+
 ### Phase B: half the cost, zero sections drawn
 
 Broken out of the tax column, phase B is **17 to 52 percent of everything
@@ -1063,6 +1083,66 @@ The 8 to 12 percent remains real and unclaimed. The remaining paths to it
 are a CPU-side skip fed by the stats readback (one-frame-late, the reveal
 artifact attempt 1 rejected) or waiting out the driver.
 
+#### Attempt 3: the CPU predicate (2026-08-17), and why it ships
+
+Attempt 3 keeps attempt 2's exact skip condition and moves the DECISION
+off the GPU, where nothing can charge for it, by making it an induction
+instead of a query. Stamped(t) is a deterministic function of phase-A
+depth (which is stamped(t-1) rendered), the dispatch list, the section
+records, the scene matrices and the raster extent. So: if every input is
+bit-identical since a frame whose read-back verdict showed zero phase-B
+draws, phase B draws zero again this frame, and `recordPhaseDraws(MODE_PHASE_B)`
+is simply not recorded. No readback added, no lag consumed - the lag is
+only in the induction BASE (has a post-change verdict landed yet), never
+in the reveal path, which is what separates this from the one-frame-late
+skip attempt 1 rejected: a camera cut or world edit reads as an input
+change the SAME frame, before recording, so the cut frame runs phase B
+exactly as today.
+
+Change detection is the `cachedCullFresh` raw-bits discipline: camera and
+frustum-camera doubles, the frustum matrix and both scene factor matrices
+(the product could collide in theory, the factors cannot), the raster
+extent (an aspect-preserving resize keeps every matrix bit identical),
+the residency `drawEpoch` (every mutation site bumps it, and the pump
+runs before the draw), a non-empty region-commit backlog
+(`gpuCommitBacklogEmpty` - a requeued commitDirty can land records with
+no same-frame epoch bump), the dispatch-signature tracker, any gap in
+occlusion frames, and world resets (the trackers restart and the
+predicate cannot hold until fresh verdicts land). Everything doubtful is
+a change. Passes 1 to 3, the stamp timeline, the stats transfer and the
+translucent carry run unchanged on skip frames, so the containment
+argument survives: a wrong skip costs one frame of late reveal and phase
+A heals it, never a hole that stays.
+
+Measured, `plains-rd64` / 2560x1440, same session, occlusion armed both
+legs (PERFORMANCE.md carries the full table): frame p50 2.200 to
+**1.957 ms (-11.0%)**, phase B GPU 0.238 to 0.000, skip rate 96.1% of
+frames, `phaseBQuietStatsFrames` 2,965. The tail gate attempt 2 failed
+eightfold passes: p99 3.362 to 3.566 ms, worst frame 4.367 to 4.076. The
+win exceeds the 0.163 ms GPU ceiling because the CPU stops recording ~158
+push-constant/draw pairs and a render pass per skipped frame.
+
+Property `meshelium.occlusion.phaseBCpuSkip`, mutually exclusive with the
+attempt-2 predicate (which stays for non-AMD measurement). The gametest
+leg (`assertPhaseBCpuSkip`) pins the arm on a converged scene, the
+world-edit disarm inside the guard window with the camera bit-still, the
+re-arm, and the camera-cut bound with the skip armed. The static camera
+maximally flatters this feature; any published number carries the
+skip-rate column, and the spin legs exist to prove the disarmed path
+costs nothing.
+
+Second-batch results (same night, PERFORMANCE.md has the prose): rd 32 /
+1080p occlusion-forced static pair mean 1.127 to 1.038 ms (-7.9%, skip
+rate 97.7%) - the 8-percent prediction, delivered. The spin legs stayed
+96-97 percent ENGAGED because the bench rotates per tick and ~24 of 25
+frames share one pose bit-for-bit at bench frame rates; real per-frame
+mouse-look disarms far more, and a true 100-percent-disarm leg has not
+been run (the arithmetic bound is a key compare plus one uncontended
+lock per frame). **DEFAULT ON as of 2026-08-17**, the multiWG rule
+applied; `=false` is the escape hatch, and the Auto-threshold refit this
+document's status section calls for must now be fitted with the skip in
+its shipped state.
+
 Both scenes, not one. The ground-level scene is the hard one and it is the
 one that exposed the bug, so a win at `plains-rd32` alone would prove
 nothing. `plains-rd64` should be reported alongside but is not the gate,
@@ -1104,18 +1184,45 @@ actually being culled, not on render distance alone.
    pass/fail gate on its own: a rise is ambiguous (it is equally the
    signature of a grown visible set and of an over-cull one frame earlier)
    and a fall is the feature working.
-3. **The row returns as Auto, not as a plain toggle.** Both
-   `MesheliumConfig.java:154-156` and the settings-screen comment already
-   call for this: arm occlusion when `sectionsResident x 0.27 us` exceeds
-   twice the measured pass cost, which is a number the drawer already
-   tracks. Deciding this per scene instead of per build is the proper fix,
-   and shipping a bare toggle again would be shipping the same mistake with
-   a better constant.
+3. **Auto keys on a payoff signal, not on render distance.** As first
+   written, this condition prescribed `sectionsResident x 0.27 us` against
+   twice the pass cost - the exact rule this document WITHDRAWS in the
+   curve section above (resident count is dead as a signal; winners and
+   losers overlap completely). The operative trigger is the one the curve
+   fitted instead: bfsOnly-mode terrain draw cost, `opaqueA + translucent`
+   from the GPU timers, readable in both modes, threshold near 0.65 ms at
+   1080p, with hysteresis on the flip because a mode change flushes
+   phase-A stamp state and flapping is expensive. The rd crossover slider
+   stays as the floor and as the fallback whenever the timers are not
+   live. (2026-08-17 correction of this section's premise: the row itself
+   has shipped as Auto/On/Off with an rd crossover since 1.1.0 and
+   `MODRINTH.md` describes it accurately. The open item is only this KEY,
+   never the row's existence.)
 
-When those clear, update `MesheliumConfig.java:124-157`, delete the
-no-occlusion-row comment block at `MesheliumOptionsScreen.java:359-374`,
-and add the measured rows to [`PERFORMANCE.md`](PERFORMANCE.md) in the same
-change, per house rule 6.
+Status audit, 2026-08-17, checked against the tree: "both scenes" and the
+1440p leg are met by the 20-leg curve plus the archived
+resolution-crossover runs (a STANDING 1440p suite leg is still worth
+adding; today it is a per-run `-Pmeshelium.res` request). The pixel-parity
+detector ships as shots 40/41 and 50/51. `phaseBQuietStatsFrames` is
+computed and reported by the bench but no test ASSERTS on it, and no
+moving-camera parity leg exists; those two are the remaining detector
+gaps. The line references in older editions of this section are stale:
+the config now lives at `MesheliumConfig.java:390-471` (mode enum,
+defaults, crossover) and `:705-716` (resolver), and the live UI row at
+`MesheliumOptionsScreen.java:506-567`; the "no-occlusion-row comment
+block" this section once said to delete is already gone.
+
+When the payoff key lands: update those two sites, rewrite the
+settings-screen comment that still argues against section COUNT (nobody
+proposes count; the key is measured draw COST, which separates the same
+cells cleanly AND moves with scene the way the underground caveat
+demands), update `MesheliumBootSmokeTest.assertShippedDefaults` in the
+same change (it pins AUTO plus a crossover of at least 48, i.e. the
+current semantics), and add the measured rows to
+[`PERFORMANCE.md`](PERFORMANCE.md), per house rule 6. Sequencing rule
+from the 2026-08-16 session: land the phase-B skip FIRST if it survives
+its bench, because it moves every constant this threshold would be
+fitted to.
 
 ## Evidence base
 

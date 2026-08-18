@@ -100,6 +100,13 @@ abstract class LevelRendererMixin {
     @Unique
     private static boolean meshelium$frameStateHookBroken;
 
+    // 2026-08-18 attribution wave brackets (ARMED-gated, JIT-dead otherwise).
+    @Unique
+    private static long meshelium$levelRenderT0;
+
+    @Unique
+    private static long meshelium$compileT0;
+
     /**
      * Wave-4 frame-state capture: {@code LevelRenderer.render} HEAD hands
      * the drawer this frame's {@code CameraRenderState} (public matrices,
@@ -131,6 +138,13 @@ abstract class LevelRendererMixin {
         // normal run; the recorder is pure JDK, GL-path-safe.
         if (MesheliumBenchRecorder.ARMED) {
             MesheliumBenchRecorder.onRenderFrame();
+        }
+        // 2026-08-18 attribution wave: the stage-row frame boundary lives at
+        // the SAME hook as the bench recorder's frame delta, so rows tile
+        // deltas exactly; levelRender brackets this whole method.
+        if (MesheliumCpuStages.ARMED) {
+            MesheliumCpuStages.beginFrame();
+            meshelium$levelRenderT0 = System.nanoTime();
         }
         if (meshelium$frameStateHookBroken
                 || MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS
@@ -333,6 +347,15 @@ abstract class LevelRendererMixin {
             )
     )
     private void meshelium$afterTerrainUpload(CallbackInfo ci) {
+        // compileUpload closes here regardless of the gate: the window is
+        // vanilla's own compileSections + uploadTerrainBuffersToGpu (inline
+        // compiles and staging drains live in it), interesting on vanilla
+        // legs too. The pump below stays gate-guarded as before.
+        if (MesheliumCpuStages.ARMED && meshelium$compileT0 != 0) {
+            MesheliumCpuStages.record(MesheliumCpuStages.STAGE_COMPILE_UPLOAD,
+                    System.nanoTime() - meshelium$compileT0);
+            meshelium$compileT0 = 0;
+        }
         if (meshelium$pumpHookBroken || MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS) {
             return;
         }
@@ -353,6 +376,51 @@ abstract class LevelRendererMixin {
             MesheliumClient.LOGGER.error(
                     "Meshelium terrain pump hook failed outside the pump's own guard; "
                             + "disabling the hook for this session", t);
+        }
+    }
+
+    /**
+     * 2026-08-18 attribution wave: stamp the start of vanilla's
+     * compileSections + uploadTerrainBuffersToGpu window (javap-verified:
+     * {@code private void compileSections(CameraRenderState)}). The close
+     * lives in {@link #meshelium$afterTerrainUpload} — together they light
+     * the one untimed render-thread window where inline compiles and
+     * staging drains live, the storm suspect of the frame-gap analysis.
+     */
+    @Inject(
+            method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
+                    + "Lnet/minecraft/client/DeltaTracker;Z"
+                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                    + "Lorg/joml/Matrix4fc;"
+                    + "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
+                    + "Lorg/joml/Vector4f;Z)V",
+            at = @At(
+                    value = "INVOKE",
+                    target = "Lnet/minecraft/client/renderer/LevelRenderer;compileSections("
+                            + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;)V"
+            )
+    )
+    private void meshelium$beforeCompileSections(CallbackInfo ci) {
+        if (MesheliumCpuStages.ARMED) {
+            meshelium$compileT0 = System.nanoTime();
+        }
+    }
+
+    /** 2026-08-18 attribution wave: close the whole-render-span bracket. */
+    @Inject(
+            method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
+                    + "Lnet/minecraft/client/DeltaTracker;Z"
+                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
+                    + "Lorg/joml/Matrix4fc;"
+                    + "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
+                    + "Lorg/joml/Vector4f;Z)V",
+            at = @At("RETURN")
+    )
+    private void meshelium$afterRender(CallbackInfo ci) {
+        if (MesheliumCpuStages.ARMED && meshelium$levelRenderT0 != 0) {
+            MesheliumCpuStages.record(MesheliumCpuStages.STAGE_LEVEL_RENDER,
+                    System.nanoTime() - meshelium$levelRenderT0);
+            meshelium$levelRenderT0 = 0;
         }
     }
 }

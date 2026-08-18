@@ -83,6 +83,12 @@ layout(set = 0, binding = 1, std140) uniform MesheliumScene {
                             // camera-relative space, unnormalized (the
                             // p-vertex test is scale-invariant)
     ivec4 CameraChunk;      // xyz = camera section coords (blockPos >> 4)
+    vec4 CullMisc;          // x = plant-cull distance squared (blocks²),
+                            // y = sub-pixel-cull distance squared (mesh
+                            // stage only), zw = viewport size in pixels
+                            // (mesh stage only); a slider at 0 uploads
+                            // 3.4e38, which every real distance compares
+                            // under, so the gate keeps everything
 };
 
 // The wave-3 section-record buffer (MesheliumTerrainGpu.sectionBuffer): 256
@@ -297,7 +303,21 @@ void main() {
                 if (rel.z >= 0 && delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
                 fr += delta;
                 delta = ranges.w & 0xFFFFu;                         // UNASSIGNED
-                if (delta > 0u) putBin(idx, lastIndex, base + fr, delta, t);
+                // Cull Tiny Plants Beyond (default OFF): the UNASSIGNED
+                // bucket is the cross-model geometry (grass tufts,
+                // flowers) — no merge plane, no camera-side gate above,
+                // and sub-pixel long before any distance a player can set.
+                // lo (above) is the section's camera-relative min corner
+                // minus the 0.5 inflation, so lo + 8.5 is its center; the
+                // bucket is kept while the center's distance squared stays
+                // within CullMisc.x. With the slider at 0 the CPU uploads
+                // 3.4e38 and every finite distance passes, making this
+                // line behave exactly like the unconditional emit it
+                // replaced (bins, counts and payload bit-identical).
+                vec3 plantCullCenter = lo + 8.5;
+                if (delta > 0u && dot(plantCullCenter, plantCullCenter) <= CullMisc.x) {
+                    putBin(idx, lastIndex, base + fr, delta, t);
+                }
 
                 if (lastIndex > 0u) {
                     payload.sections[t].posAndCount = (lastIndex << 8u) | posKey;
