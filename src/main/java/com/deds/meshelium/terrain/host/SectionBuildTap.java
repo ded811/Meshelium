@@ -55,6 +55,10 @@ public final class SectionBuildTap {
      * doTask ip 166-249) and 0-quad decodes park nothing.
      */
     public static void onCompileReturn(SectionPos pos, SectionCompiler.Results results) {
+        // 2026-08-18 attribution wave: count every EXECUTED compile task
+        // (empties included; resorts never reach the tap, so they are
+        // excluded structurally) — the build-storm series' raw feed.
+        com.deds.meshelium.MesheliumCpuStages.noteTapCompile();
         PARKED.remove(); // drop any orphan from an earlier failed build
         if (results == null || results.renderedLayers.isEmpty()) {
             // Wave-11: an EMPTY compile is still a statement about the

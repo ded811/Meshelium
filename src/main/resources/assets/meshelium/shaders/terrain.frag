@@ -28,7 +28,9 @@
 
 // Wave-5 layout (grown for the task stage's frustum planes + camera chunk;
 // must match terrain.task/terrain.mesh and TerrainDrawer.uploadScene
-// byte-for-byte — this stage still reads SceneMisc only).
+// as a 192-byte PREFIX of the 208-byte scene UBO (the tail vec4 is the
+// distance-cull thresholds only the task/mesh stages read; a bound slice
+// larger than the declared block is legal — this stage reads SceneMisc only).
 layout(set = 0, binding = 1, std140) uniform MesheliumScene {
     mat4 ModelViewMat;
     vec4 SceneMisc;  // xy = block atlas size in texels (TextureSize)

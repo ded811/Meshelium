@@ -387,6 +387,39 @@ public final class MesheliumConfig {
      */
     public boolean arenaTrim = true;
 
+    /** Shared range of the two distance-gated culls below (0 = off). */
+    public static final int MIN_DETAIL_CULL_CHUNKS = 0;
+    public static final int MAX_DETAIL_CULL_CHUNKS = 96;
+
+    /**
+     * Cull Tiny Plants Beyond: past this many chunks, the task shader skips
+     * a section's cross-model bucket, the one holding grass tufts, flowers
+     * and the rest of the X-shaped geometry. Those quads have no face to
+     * merge and are far smaller than a pixel long before any distance a
+     * player would set here, so skipping them should be invisible; whether
+     * it is WORTH anything is UNMEASURED, which is exactly why this is a
+     * slider and not a default (the owner's rule: an optimization nobody is
+     * certain of ships as a setting to play with). <b>0 = off, the shipped
+     * default</b>: the scene UBO carries a sentinel distance no section can
+     * reach and the shader gate keeps every bucket, bit-identical to the
+     * code before the gate existed. Read every frame by
+     * {@code TerrainDrawer.uploadScene}, so the slider is live.
+     */
+    public int plantCullChunks = 0;
+
+    /**
+     * Cull Sub-Pixel Detail Beyond: past this many chunks, the mesh shader
+     * measures each quad's four projected corners and drops the quad when
+     * its whole screen bounding box rounds to a single pixel, by emitting
+     * it degenerate (zero-area triangles rasterise to nothing). Same
+     * status and same discipline as {@link #plantCullChunks}: plausible,
+     * UNMEASURED, therefore a slider. <b>0 = off, the shipped default</b>,
+     * carried as the same shader-side sentinel, so the armed test never
+     * runs and the emitted vertices are the pre-existing math exactly.
+     * Read every frame by {@code TerrainDrawer.uploadScene}.
+     */
+    public int subPixelCullChunks = 0;
+
     /** How occlusion culling decides whether to run. */
     public enum OcclusionMode {
         /** On at or above {@link #occlusionAutoMinRenderDistance}. */
@@ -725,6 +758,18 @@ public final class MesheliumConfig {
         return propertyOr("meshelium.tune.arenaTrim", get().arenaTrim);
     }
 
+    /** {@link #plantCullChunks}, clamped (the file is hand-editable). */
+    public static int plantCullChunks() {
+        return Math.max(MIN_DETAIL_CULL_CHUNKS,
+                Math.min(MAX_DETAIL_CULL_CHUNKS, get().plantCullChunks));
+    }
+
+    /** {@link #subPixelCullChunks}, clamped (the file is hand-editable). */
+    public static int subPixelCullChunks() {
+        return Math.max(MIN_DETAIL_CULL_CHUNKS,
+                Math.min(MAX_DETAIL_CULL_CHUNKS, get().subPixelCullChunks));
+    }
+
     /** {@code meshelium.fogMode} ?? {@link #fogMode}. */
     public static FogMode fogMode() {
         String property = System.getProperty("meshelium.fogMode");
@@ -911,6 +956,8 @@ public final class MesheliumConfig {
         // learned, so the torture test now walks every row-backed field.
         this.greedyMeshing = d.greedyMeshing;
         this.arenaTrim = d.arenaTrim;
+        this.plantCullChunks = d.plantCullChunks;
+        this.subPixelCullChunks = d.subPixelCullChunks;
         // Retention has no rows any more (Bobby owns that job since
         // 2026-08-11) but the fields are still live behind the config, so a
         // reset must cover them or "reset to defaults" would quietly leave

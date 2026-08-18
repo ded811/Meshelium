@@ -88,7 +88,8 @@ layout(set = 0, binding = 0, std140) uniform OccRegions {
 #endif
 
 // Meshelium's per-frame scene UBO (wave-5 layout, shared slice with the
-// terrain pipelines — must match TerrainDrawer.uploadScene byte-for-byte).
+// terrain pipelines — a 192-byte PREFIX of TerrainDrawer.uploadScene's
+// 208-byte layout; the tail vec4 is task/mesh-only cull thresholds).
 layout(set = 0, binding = 1, std140) uniform MesheliumScene {
     mat4 ModelViewMat;
     vec4 SceneMisc;

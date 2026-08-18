@@ -232,8 +232,26 @@ public final class TerrainDrawer {
     /** MaskSlot sentinel: no mask uploaded, task stage treats all visible. */
     static final int NO_MASK_SLOT = 0xFFFFFFFF;
 
-    /** Bytes of the wave-5 scene UBO (layout in {@link #uploadScene}). */
-    static final int SCENE_BYTES = 192;
+    /**
+     * Bytes of the scene UBO (layout in {@link #uploadScene}): the wave-5
+     * 192 plus one vec4 of distance-gated-cull thresholds. terrain.task and
+     * terrain.mesh declare all 208; terrain.frag and the two occlusion
+     * rasters still declare the 192-byte prefix, which stays legal because
+     * the bound slice always covers the largest declared block.
+     */
+    static final int SCENE_BYTES = 208;
+
+    /**
+     * The "off" value {@link #uploadScene} writes for a distance-gated cull
+     * whose slider sits at 0: larger than any reachable camera distance
+     * squared (the render-distance ceiling keeps sections within ~2000
+     * blocks, under 4e6 blocks squared), so both shader gates compare every
+     * real section under it and behave exactly like the ungated code.
+     * Deliberately not Float.MAX_VALUE: 3.4e38 is exactly representable
+     * with headroom, so a stray doubling in a shader cannot overflow it to
+     * infinity and flip a comparison.
+     */
+    static final float CULL_OFF_DIST2 = 3.4e38f;
 
     /**
      * Wave-7: default quads per TRANSLUCENT draw. One workgroup emits the
@@ -322,19 +340,32 @@ public final class TerrainDrawer {
     public static final String PROPERTY_FRONT_TO_BACK = "meshelium.tune.frontToBack";
 
     /**
-     * The ledger-17 EXPERIMENT (default OFF, re-read every frame):
-     * translucent slices dispatched as ONE multi-workgroup draw per
+     * Translucent slices dispatched as ONE multi-workgroup draw per
      * section instead of one single-workgroup draw per ≤cap-quad slice.
-     * Correct ONLY IF VK_EXT_mesh_shader rasterizes workgroups of one
-     * dispatch in ascending gl_WorkGroupID order — which the spec text
-     * does not clearly promise (VANILLA-FRAME-PATH.md ledger 17). The
-     * coordinator runs the translucent parity scene (shots 60/61) with
-     * this ON: pixel-identical ⇒ RDNA4 orders inter-workgroup primitives
-     * by dispatch order in practice (recorded as a FINDING, not a spec
-     * guarantee — the default stays OFF either way until the spec
-     * question resolves).
+     * DEFAULT ON since 1.3.0, every vendor (~1.3 ms/frame at rd 64):
+     * VK_EXT_mesh_shader guarantees the ordering this relies on for
+     * directly-launched workgroups — spec text and the proposal's
+     * "sequential order based on their flattened workgroup index" are
+     * quoted at the resolver that reads this property. FALSE forces the
+     * split-draw path in the unlikely event a driver fails to honour its
+     * own specification; shots 60/61 stay the parity backstop.
      */
     public static final String PROPERTY_TRANSLUCENT_MULTI_WG = "meshelium.translucentMultiWG";
+
+    /**
+     * The phase-B CPU skip (DEFAULT ON since 2026-08-17, re-read every
+     * frame; {@code -Dmeshelium.occlusion.phaseBCpuSkip=false} forces the
+     * old always-record path): when the occlusion inputs are provably
+     * unchanged since a read-back verdict that showed zero phase-B draws,
+     * the pass-4 recording is elided on the CPU. Decision logic,
+     * induction argument and hazard story live on
+     * {@code phaseBCpuSkipDecide}. Measured the night it was built:
+     * frame p50 -11.0% at rd 64 / 1440p static (96% of frames skipped),
+     * -7.9% mean at rd 32 / 1080p with occlusion forced, tail clean both
+     * times, and still 96-97% engaged under tick-quantised spin
+     * (docs/OCCLUSION-FILLRATE-DESIGN.md attempt 3, PERFORMANCE.md).
+     */
+    public static final String PROPERTY_PHASE_B_CPU_SKIP = "meshelium.occlusion.phaseBCpuSkip";
 
     // ------------------------------------------------------------------
     // Wave-12 CPU candidates. Property constants live on MesheliumConfig
@@ -729,6 +760,27 @@ public final class TerrainDrawer {
     private static volatile long occOverflowRegions;
     private static volatile long lastReadStatsFrame = -1;
 
+    // ---- phase-B CPU skip state (render thread; volatiles are test probes) ----
+    /**
+     * Stats frame of the most recent occlusion-input change seen by the
+     * skip's own trackers (camera/frustum/scene-matrix/extent key, epoch,
+     * commit backlog, occlusion-frame gap). {@code lastDispatchChangeStatsFrame}
+     * is folded in at decision time, so C = max of the two; armed iff
+     * {@code lastReadStatsFrame >= C + 2 && lastPhaseBStatsFrame <= C}.
+     */
+    private static volatile long pbSkipInputChangeStatsFrame;
+    private static volatile long phaseBCpuSkipFrames;
+    private static boolean pbSkipKeyValid;
+    private static long pbSkipPosX, pbSkipPosY, pbSkipPosZ;
+    private static long pbSkipFrusX, pbSkipFrusY, pbSkipFrusZ;
+    private static final float[] pbSkipFrusMatrix = new float[16];
+    private static final float[] pbSkipViewRot = new float[16];
+    private static final float[] pbSkipProj = new float[16];
+    private static final float[] pbSkipScratch = new float[16];
+    private static int pbSkipExtentW = -1, pbSkipExtentH = -1;
+    private static long pbSkipEpoch = Long.MIN_VALUE;
+    private static long pbSkipLastOccSerial = Long.MIN_VALUE;
+
     /**
      * Per-stats-frame history rings for the camera-cut assertion (client
      * thread writes AND reads — gametest predicates run on the client
@@ -1053,6 +1105,20 @@ public final class TerrainDrawer {
         return lastReadStatsFrame;
     }
 
+    /** Frames whose phase-B recording the CPU skip elided (cumulative). */
+    public static long phaseBCpuSkipFrames() {
+        return phaseBCpuSkipFrames;
+    }
+
+    /**
+     * Stats frame of the most recent phase-B-skip input change — the C
+     * of the skip predicate, dispatch-signature tracker folded in. Test
+     * probe (client thread).
+     */
+    public static long phaseBSkipInputChangeStatsFrame() {
+        return Math.max(pbSkipInputChangeStatsFrame, lastDispatchChangeStatsFrame);
+    }
+
     /**
      * Phase-B section count of stats frame {@code f}, or -1 when that
      * frame's readback hasn't landed / has been overwritten (ring of
@@ -1374,6 +1440,10 @@ public final class TerrainDrawer {
         lastDispatchChangeStatsFrame = -1;
         lastReadStatsFrame = -1;
         prevOcclusionSignature = 0;
+        pbSkipKeyValid = false;
+        pbSkipInputChangeStatsFrame = 0;
+        pbSkipEpoch = Long.MIN_VALUE;
+        pbSkipLastOccSerial = Long.MIN_VALUE;
         Arrays.fill(phaseBFrames, -1);
         Arrays.fill(changeFrames, -1);
         changeCursor = 0;
@@ -1429,6 +1499,10 @@ public final class TerrainDrawer {
         lastDispatchChangeStatsFrame = -1;
         lastReadStatsFrame = -1;
         prevOcclusionSignature = 0;
+        pbSkipKeyValid = false;
+        pbSkipInputChangeStatsFrame = 0;
+        pbSkipEpoch = Long.MIN_VALUE;
+        pbSkipLastOccSerial = Long.MIN_VALUE;
         Arrays.fill(phaseBFrames, -1);
         Arrays.fill(changeFrames, -1);
         changeCursor = 0;
@@ -1821,6 +1895,11 @@ public final class TerrainDrawer {
         // ---- 2. lagged GPU stats readback (before this frame records) ----
         pullGpuStats(true);
 
+        // ---- 2b. phase-B CPU skip decision (needs this frame's readback
+        // fold above AND the signature bookkeeping before it; consumed at
+        // pass 4) ----
+        boolean phaseBCpuSkip = phaseBCpuSkipDecide(cam, frustum, depthView);
+
         // ---- 3. per-frame list + transient uploads (before any pass
         // opens, wave-2 note) ----
         CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
@@ -1908,8 +1987,13 @@ public final class TerrainDrawer {
         // (revealed terrain arrives a frame late) and exists so the prize of
         // a correct conditional-rendering skip can be re-measured in the
         // same session that evaluates it. Never a setting.
+        //
+        // phaseBCpuSkip (decided at 2b) rides the same guard and IS exact:
+        // it elides the recording only when the pass provably draws zero
+        // sections. Passes 1-3, the stamp timeline, the stats transfer and
+        // the translucent carry all run unchanged either way.
         boolean phaseBSkipUnsafe = Boolean.getBoolean("meshelium.occlusion.phaseBSkipUnsafe");
-        if (!phaseBSkipUnsafe)
+        if (!phaseBSkipUnsafe && !phaseBCpuSkip)
         try (RenderPass pass = encoder.createRenderPass(() -> "meshelium terrain phase B",
                 colorView, Optional.empty(), depthView, OptionalDouble.empty())) {
             VulkanRenderPass backendPass = (VulkanRenderPass) ((RenderPassAccessor) pass).meshelium$backend();
@@ -2065,6 +2149,129 @@ public final class TerrainDrawer {
         phaseBFrames[i] = readFrame;
         phaseBCounts[i] = s[2];
         lastReadStatsFrame = readFrame;
+    }
+
+    /**
+     * The phase-B CPU skip (default OFF, {@link #PROPERTY_PHASE_B_CPU_SKIP},
+     * re-read every frame like the other draw-path properties).
+     *
+     * <p>Attempt 2 (the conditional-rendering predicate) proved the skip
+     * itself is exact — phase B emptied with zero artifacts and the
+     * camera-cut gate green — and then the RDNA4 driver charged 8-11 ms
+     * stalls for the mechanism. Attempt 3 moves the DECISION to the CPU,
+     * where nothing can charge for it. Induction over the stamp protocol:
+     * stamped(t) is a deterministic function of phase-A depth (which is
+     * stamped(t-1) rendered), the dispatch list, the section records, the
+     * scene matrices and the raster extent. If every one of those is
+     * bit-identical since a frame whose read-back verdict showed zero
+     * phase-B draws, phase B draws zero again this frame, and not
+     * recording its dispatches is exact, not approximate.</p>
+     *
+     * <p>Every doubt reads as a change, in the raw-bits discipline
+     * {@link #cachedCullFresh} established (NaN and rounding drift
+     * disarm, the safe direction): camera position and cull-frustum
+     * camera bits, the frustum matrix AND the scene UBO's two factor
+     * matrices (the product could theoretically collide), the raster
+     * extent (an aspect-preserving resize keeps every matrix bit
+     * unchanged and still moves raster coverage), the snapshot epoch
+     * (every residency mutation bumps it, and the pump runs before the
+     * draw, so this frame's uploads are already visible here), a
+     * non-empty region-commit backlog (a requeued commitDirty can land
+     * records with no same-frame epoch bump), the dispatch-signature
+     * tracker, a gap in occlusion frames (bfs/off interlude, ownership
+     * loss), and world resets (the readback trackers restart at -1, so
+     * the predicate cannot hold until fresh verdicts land). Mutually
+     * exclusive with the GPU predicate — when that is active the pass
+     * already skips itself.</p>
+     *
+     * <p>Failure containment, the property that makes this shippable
+     * where full static-frame reuse was not: passes 1-3, the stamp
+     * timeline, the stats transfer and the translucent carry all run
+     * unchanged on skip frames, so a wrong skip (none is known reachable)
+     * costs one frame of late reveal and phase A heals it next frame —
+     * never a hole that stays.</p>
+     */
+    private static boolean phaseBCpuSkipDecide(CameraRenderState cam, Frustum frustum,
+            GpuTextureView depthView) {
+        // Absent means ON (the multiWG rule: measured winners are
+        // defaults, the property is the escape hatch).
+        String cpuSkipProp = System.getProperty(PROPERTY_PHASE_B_CPU_SKIP);
+        if (cpuSkipProp != null && !Boolean.parseBoolean(cpuSkipProp)) {
+            pbSkipKeyValid = false;
+            return false;
+        }
+        if (occlusion.phaseBPredicateActive()) {
+            return false;
+        }
+        boolean changed = !pbSkipKeyValid;
+        long posX = Double.doubleToRawLongBits(cam.pos.x);
+        long posY = Double.doubleToRawLongBits(cam.pos.y);
+        long posZ = Double.doubleToRawLongBits(cam.pos.z);
+        long frusX = Double.doubleToRawLongBits(frustum.getCamX());
+        long frusY = Double.doubleToRawLongBits(frustum.getCamY());
+        long frusZ = Double.doubleToRawLongBits(frustum.getCamZ());
+        if (posX != pbSkipPosX || posY != pbSkipPosY || posZ != pbSkipPosZ
+                || frusX != pbSkipFrusX || frusY != pbSkipFrusY || frusZ != pbSkipFrusZ) {
+            changed = true;
+            pbSkipPosX = posX;
+            pbSkipPosY = posY;
+            pbSkipPosZ = posZ;
+            pbSkipFrusX = frusX;
+            pbSkipFrusY = frusY;
+            pbSkipFrusZ = frusZ;
+        }
+        // |= not ||=: every compare must also refresh its stored key.
+        changed |= pbSkipMatrixChanged(((FrustumAccessor) frustum).meshelium$matrix(), pbSkipFrusMatrix);
+        changed |= pbSkipMatrixChanged(cam.viewRotationMatrix, pbSkipViewRot);
+        changed |= pbSkipMatrixChanged(cam.projectionMatrix, pbSkipProj);
+        int extentW = depthView.texture().getWidth(0);
+        int extentH = depthView.texture().getHeight(0);
+        if (extentW != pbSkipExtentW || extentH != pbSkipExtentH) {
+            changed = true;
+            pbSkipExtentW = extentW;
+            pbSkipExtentH = extentH;
+        }
+        if (cachedEpoch != pbSkipEpoch) {
+            changed = true;
+            pbSkipEpoch = cachedEpoch;
+        }
+        if (!TerrainResidency.gpuCommitBacklogEmpty()) {
+            changed = true;
+        }
+        if (frameSerial != pbSkipLastOccSerial + 1) {
+            changed = true;
+        }
+        pbSkipLastOccSerial = frameSerial;
+        pbSkipKeyValid = true;
+        if (changed) {
+            pbSkipInputChangeStatsFrame = statsFrames;
+        }
+        long c = Math.max(pbSkipInputChangeStatsFrame, lastDispatchChangeStatsFrame);
+        // The induction base is LAGGED by construction (readback is the
+        // only way the CPU ever learns a phase-B count): at least one
+        // fully-post-change verdict read back (>= c + 2 leaves a one-frame
+        // margin over the strict > c) and no read frame after the change
+        // showed a phase-B draw. -1 sentinels: lastReadStatsFrame -1 never
+        // arms; lastPhaseBStatsFrame -1 with reads after c means every
+        // slot read since standup showed zero, which IS evidence.
+        boolean skip = lastReadStatsFrame >= c + 2 && lastPhaseBStatsFrame <= c;
+        if (skip) {
+            phaseBCpuSkipFrames++;
+        }
+        return skip;
+    }
+
+    /** Raw-bits compare AND refresh of one stored matrix key: true iff moved. */
+    private static boolean pbSkipMatrixChanged(Matrix4f m, float[] prev) {
+        ccReadMatrix(m, pbSkipScratch);
+        boolean changed = false;
+        for (int i = 0; i < 16; i++) {
+            if (Float.floatToRawIntBits(pbSkipScratch[i]) != Float.floatToRawIntBits(prev[i])) {
+                changed = true;
+            }
+            prev[i] = pbSkipScratch[i];
+        }
+        return changed;
     }
 
     // ------------------------------------------------------------------
@@ -2964,12 +3171,16 @@ public final class TerrainDrawer {
 
     /**
      * Meshelium's scene UBO out of vanilla's per-submit transient memory —
-     * std140, {@link #SCENE_BYTES} bytes since wave 5:
+     * std140, {@link #SCENE_BYTES} bytes:
      * <pre>
      *   0   mat4 ModelViewMat   (CameraRenderState.viewRotationMatrix)
      *  64   vec4 SceneMisc      (xy = block atlas size in texels)
      *  80   vec4 FrustumPlanes[6]
      * 176   ivec4 CameraChunk   (xyz = camera section coords)
+     * 192   vec4 CullMisc       (x/y = plant / sub-pixel cull distance
+     *                            squared in blocks, or {@link #CULL_OFF_DIST2}
+     *                            when that slider is at 0; zw = viewport
+     *                            size in pixels)
      * </pre>
      * The planes are the Gribb-Hartmann rows of the RENDER matrices
      * ProjMat*ModelViewMat, extracted with JOML FrustumIntersection.set's
@@ -3001,6 +3212,26 @@ public final class TerrainDrawer {
             scene.putInt(176, cam.blockPos.getX() >> 4);
             scene.putInt(180, cam.blockPos.getY() >> 4);
             scene.putInt(184, cam.blockPos.getZ() >> 4);
+
+            // The two distance-gated culls, re-read from the config every
+            // frame so the Advanced sliders are LIVE (pipelines are created
+            // once per session, so a compile-time macro could not serve
+            // them). A slider at 0 uploads CULL_OFF_DIST2 and the shader
+            // gates keep everything, bit-identical to the ungated code.
+            float plantDist = MesheliumConfig.plantCullChunks() * 16.0f;
+            float subPixelDist = MesheliumConfig.subPixelCullChunks() * 16.0f;
+            scene.putFloat(192, plantDist <= 0.0f ? CULL_OFF_DIST2 : plantDist * plantDist);
+            scene.putFloat(196, subPixelDist <= 0.0f ? CULL_OFF_DIST2
+                    : subPixelDist * subPixelDist);
+            // Viewport for the sub-pixel test: every terrain pass draws
+            // into the main render target (the opaque path checks exactly
+            // that before owning a frame), and vanilla's pass ctor sets
+            // the viewport to the full attachment, so the target's size IS
+            // the viewport. RenderTarget.width/height are public ints
+            // (javap, 26.2 merged jar).
+            RenderTarget mainTarget = Minecraft.getInstance().gameRenderer.mainRenderTarget();
+            scene.putFloat(200, (float) mainTarget.width);
+            scene.putFloat(204, (float) mainTarget.height);
 
             return encoder.transientMemory().uploadGpu(scene, 256, GpuBuffer.USAGE_UNIFORM);
         }

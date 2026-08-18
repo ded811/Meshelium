@@ -200,6 +200,9 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
             assertHiddenWallOcclusion(context, singleplayer);
             assertCameraCutPhaseB(context, singleplayer);
 
+            // ---- 1.4.0: the phase-B CPU skip (occlusion still armed) ----
+            assertPhaseBCpuSkip(context, singleplayer);
+
             // Occlusion arming ends here: everything after this point runs
             // at the shipped 1.0.0 default, which is occlusion OFF.
             context.runOnClient(client ->
@@ -1219,6 +1222,84 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
         assertNoErrors();
     }
 
+    /**
+     * The 1.4.0 phase-B CPU skip legs (armed via live property, re-read
+     * per frame). Three claims, each the sharp edge of a design hazard:
+     * <ol>
+     *   <li>a converged static scene actually ARMS the skip, and no
+     *       phase-B draw verdict lands from inside the skipping window
+     *       (the skip is exact, not a suppression);</li>
+     *   <li>a world edit with the camera bit-still DISARMS it through
+     *       the epoch/backlog trackers — the reveal-artifact scenario
+     *       attempt 1 refused to ship — and no skip fires while the
+     *       post-change guard window (readback depth + margin) is
+     *       open;</li>
+     *   <li>after re-convergence it re-arms, and a 180-degree cut under
+     *       the armed skip still lands phase B within the wave-6 bound
+     *       (delegates to {@link #assertCameraCutPhaseB}).</li>
+     * </ol>
+     */
+    private static void assertPhaseBCpuSkip(ClientGameTestContext context,
+            TestSingleplayerContext singleplayer) {
+        context.runOnClient(client ->
+                System.setProperty(TerrainDrawer.PROPERTY_PHASE_B_CPU_SKIP, "true"));
+        try {
+            quiesce(context);
+
+            // (1) arm: converged + static => the skip must engage, and keep
+            // engaging (30 frames rules out a single lucky alignment).
+            long skipsBefore = TerrainDrawer.phaseBCpuSkipFrames();
+            context.waitFor(client ->
+                    TerrainDrawer.phaseBCpuSkipFrames() > skipsBefore + 30, DRAW_TIMEOUT_TICKS);
+            long quietProbe = TerrainDrawer.lastPhaseBStatsFrame();
+            long changeAtArm = TerrainDrawer.phaseBSkipInputChangeStatsFrame();
+            if (quietProbe > changeAtArm) {
+                throw new AssertionError("phase-B draws read back (stats frame " + quietProbe
+                        + ") after the last input change (" + changeAtArm
+                        + ") while the CPU skip was engaged - the predicate armed on a lie");
+            }
+
+            // (2) the sharpest edge: a world edit, camera bit-still. The
+            // block goes in BEHIND the current view on purpose - the epoch
+            // guard is view-independent, so even an off-screen mutation
+            // must disarm the skip before this frame records.
+            long editStatsFrame = TerrainDrawer.statsFrames();
+            singleplayer.getServer().runCommand(
+                    "execute as @p at @s run setblock ~ ~-3 ~8 minecraft:glowstone");
+            context.waitFor(client ->
+                    TerrainDrawer.phaseBSkipInputChangeStatsFrame() >= editStatsFrame,
+                    DRAW_TIMEOUT_TICKS);
+            long skipsAtChange = TerrainDrawer.phaseBCpuSkipFrames();
+            context.waitFor(client ->
+                    TerrainDrawer.lastReadStatsFrame()
+                            >= TerrainDrawer.phaseBSkipInputChangeStatsFrame() + 2
+                            || TerrainDrawer.phaseBCpuSkipFrames() != skipsAtChange,
+                    DRAW_TIMEOUT_TICKS);
+            if (TerrainDrawer.phaseBCpuSkipFrames() != skipsAtChange
+                    && TerrainDrawer.lastReadStatsFrame()
+                            < TerrainDrawer.phaseBSkipInputChangeStatsFrame() + 2) {
+                throw new AssertionError("the CPU skip fired inside the post-change guard "
+                        + "window (change at stats frame "
+                        + TerrainDrawer.phaseBSkipInputChangeStatsFrame()
+                        + ", last read " + TerrainDrawer.lastReadStatsFrame() + ")");
+            }
+
+            // (3) re-arms once the edit's verdicts are read back quiet...
+            long skipsBeforeRearm = TerrainDrawer.phaseBCpuSkipFrames();
+            quiesce(context);
+            context.waitFor(client ->
+                    TerrainDrawer.phaseBCpuSkipFrames() > skipsBeforeRearm, DRAW_TIMEOUT_TICKS);
+            // ...and the camera-cut latency bound holds with the skip armed
+            // (the cut disarms same-frame by key mismatch, so phase B runs
+            // on the cut frame itself, exactly as without the skip).
+            assertCameraCutPhaseB(context, singleplayer);
+        } finally {
+            context.runOnClient(client ->
+                    System.clearProperty(TerrainDrawer.PROPERTY_PHASE_B_CPU_SKIP));
+        }
+        assertNoErrors();
+    }
+
     // ------------------------------------------------------------------
     // Wave-7 assertions
     // ------------------------------------------------------------------
@@ -1440,15 +1521,19 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
         assertNoErrors();
     }
 
-    /** Deterministic scene: fixed light, no weather, no wandering mobs. */
+    /**
+     * Deterministic scene: fixed light, no weather, no wandering mobs.
+     * 26.2 names (GameRuleRegistryFix table): the old camelCase rules fail
+     * to parse, so until 1.4.0 this freeze silently froze nothing but time.
+     */
     private static void freezeWorld(TestSingleplayerContext singleplayer) {
         var server = singleplayer.getServer();
         server.runCommand("time set noon");
-        server.runCommand("gamerule doDaylightCycle false");
+        server.runCommand("gamerule minecraft:advance_time false");
         server.runCommand("weather clear");
-        server.runCommand("gamerule doWeatherCycle false");
-        server.runCommand("gamerule doMobSpawning false");
-        server.runCommand("gamerule randomTickSpeed 0");
+        server.runCommand("gamerule minecraft:advance_weather false");
+        server.runCommand("gamerule minecraft:spawn_mobs false");
+        server.runCommand("gamerule minecraft:random_tick_speed 0");
         server.runCommand("kill @e[type=!minecraft:player]");
     }
 

@@ -43,7 +43,7 @@ the rest of your game and your computer keep.
 ## What you need
 
 - **Minecraft 26.2** with **Fabric** and [Fabric API](https://modrinth.com/mod/fabric-api)
-- Windows or Linux
+- Windows or Linux. Sorry, no Mac: Macs don't do mesh shaders on Vulkan yet
 - A graphics card with mesh shaders. Meshelium asks your driver for the feature
   rather than checking a list of models, so anything that reports it will work.
   In practice that means **AMD** RX 6000 or newer, **NVIDIA** RTX 20xx or newer,
@@ -86,8 +86,9 @@ keeps a haze but moves it out with your render distance. Minecraft Default puts
 it back exactly as the game has it.
 
 **Occlusion Culling** asks your graphics card which terrain is hidden behind
-other terrain and skips it. Asking costs a little every frame, so it only wins
-when plenty really is hidden. Measured here, it pays when you are on the ground
+other terrain and skips it. Asking costs a little while you are moving and
+almost nothing while you stand still, so it wins when plenty really is
+hidden. Measured here, it pays when you are on the ground
 looking out across a long view, and costs a little from a high camera looking
 down, where almost nothing is behind anything. Left on **Auto** it switches
 itself on at 48 chunks. If you mostly play at ground level, try lowering that.
@@ -101,7 +102,12 @@ identical so there is less to draw. It helps most with Smooth Lighting off,
 where it removes about one face in six, and the picture stays exactly the
 same; it ships off while it proves itself. **Duplicate Terrain Memory** is
 what frees Minecraft's unused second copy of the world; leave it on Freed
-unless another mod needs Minecraft's own terrain buffers.
+unless another mod needs Minecraft's own terrain buffers. **Cull Tiny
+Plants Beyond** and **Cull Sub-Pixel Detail Beyond** are two distance
+sliders that skip drawing things too small to see at range, from grass
+tufts down to any face smaller than one pixel on your screen. Both ship
+Off and apply instantly, so drag until you notice the picture change and
+back off a step.
 
 Everything applies as soon as you change it, apart from the backend popup, which
 waits for the next launch. Switching Meshelium off and on, changing Duplicate

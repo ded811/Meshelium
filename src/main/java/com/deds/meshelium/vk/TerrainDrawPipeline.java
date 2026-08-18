@@ -279,19 +279,26 @@ public final class TerrainDrawPipeline {
         long arenaBlockBytes = com.deds.meshelium.MesheliumScaling.arenaBlockBytes();
         long quadsPerBlock = arenaBlockBytes / com.deds.meshelium.terrain.TerrainVertexCodec.QUAD_STRIDE;
         int blockShift = Long.numberOfTrailingZeros(quadsPerBlock);
-        Map<String, String> macros = Map.of(
-                "MESHELIUM_ARENA_BLOCKS", Integer.toString(arenaBlocks),
-                "MESHELIUM_ARENA_BLOCK_SHIFT", Integer.toString(blockShift),
-                "MESHELIUM_ARENA_BLOCK_MASK", Long.toUnsignedString(quadsPerBlock - 1) + "u",
-                "MESHELIUM_WG_SIZE", Integer.toString(workgroupQuads),
-                "MESHELIUM_TASK_WG_SIZE", Integer.toString(taskWgSections),
-                "MESHELIUM_VIS_UVEC4S", Integer.toString(visMaskRegions * 2),
-                "MESHELIUM_TASK_CULL", taskCull ? "1" : "0",
-                "MESHELIUM_TRANSLUCENT", translucent ? "1" : "0",
-                "MESHELIUM_TRANS_QUADS", Integer.toString(Math.max(transQuads, 1)),
+        Map<String, String> macros = Map.ofEntries(
+                Map.entry("MESHELIUM_ARENA_BLOCKS", Integer.toString(arenaBlocks)),
+                Map.entry("MESHELIUM_ARENA_BLOCK_SHIFT", Integer.toString(blockShift)),
+                Map.entry("MESHELIUM_ARENA_BLOCK_MASK", Long.toUnsignedString(quadsPerBlock - 1) + "u"),
+                Map.entry("MESHELIUM_WG_SIZE", Integer.toString(workgroupQuads)),
+                Map.entry("MESHELIUM_TASK_WG_SIZE", Integer.toString(taskWgSections)),
+                Map.entry("MESHELIUM_VIS_UVEC4S", Integer.toString(visMaskRegions * 2)),
+                Map.entry("MESHELIUM_TASK_CULL", taskCull ? "1" : "0"),
+                Map.entry("MESHELIUM_TRANSLUCENT", translucent ? "1" : "0"),
+                Map.entry("MESHELIUM_TRANS_QUADS", Integer.toString(Math.max(transQuads, 1))),
                 // Wave-10: flips terrain.task's binding-8 declaration to an
                 // unsized read-only SSBO (extended render distance).
-                "MESHELIUM_LISTS_SSBO", extendedLists ? "1" : "0");
+                Map.entry("MESHELIUM_LISTS_SSBO", extendedLists ? "1" : "0"),
+                // Measurement-only diagnostic (parity-breaking by design,
+                // never a setting): stubs the mesh stage's lightmap fetches
+                // to white so one A/B run bounds the whole lightmap cost
+                // group before any shipping dedup code exists. Per-session
+                // like the workgroup knobs (pipelines cache at creation).
+                Map.entry("MESHELIUM_LIGHT_STUB",
+                        Boolean.getBoolean("meshelium.bench.lightStub") ? "1" : "0"));
         long taskModule = 0L;
         long meshModule = 0L;
         long fragModule = 0L;

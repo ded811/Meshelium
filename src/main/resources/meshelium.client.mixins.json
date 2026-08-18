@@ -13,6 +13,8 @@
 		"GpuDeviceAccessor",
 		"LevelExtractorMixin",
 		"LevelRendererMixin",
+		"MinecraftFrameMixin",
+		"VulkanCommandEncoderMixin",
 		"SectionRenderDispatcherCensusAccessor",
 		"SectionUberBuffersAccessor",
 		"UberGpuBufferAccessor",

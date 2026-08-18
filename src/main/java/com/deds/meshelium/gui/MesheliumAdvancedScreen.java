@@ -11,6 +11,7 @@ import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 
 import net.minecraft.ChatFormatting;
+import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
 import net.minecraft.client.gui.components.MultiLineTextWidget;
@@ -22,6 +23,9 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
+
+import java.util.function.IntConsumer;
+import java.util.function.IntSupplier;
 
 /**
  * The rows almost nobody should need to touch.
@@ -101,7 +105,7 @@ public class MesheliumAdvancedScreen extends Screen {
             this.layout.addChild(locked, s -> s.paddingTop(2).paddingBottom(2));
         }
 
-        // First row, because it is the only one here that changes frame rate.
+        // First rows, because they are the ones here that change frame rate.
         // The tick watches this field for the edge and reloads the terrain, so
         // nothing needs doing beyond writing it: sections already compiled are
         // never recompiled on their own, and a setting that appears to do
@@ -116,6 +120,33 @@ public class MesheliumAdvancedScreen extends Screen {
         greedy.setTooltip(tip("meshelium.options.tooltip.greedy_meshing",
                 "meshelium.options.applies.rebuild"));
         this.layout.addChild(greedy, s -> s.paddingTop(4));
+
+        // The two distance-gated culls. Both default Off because neither
+        // win is measured yet (the owner's rule: an optimization nobody is
+        // certain of ships as a slider to play with, not a default). Both
+        // are LIVE: the scene UBO re-reads the config every frame, so
+        // dragging either one changes the very next frame, no rebuild.
+        CullDistanceSlider plantCull = new CullDistanceSlider(
+                "meshelium.options.plant_cull.label",
+                () -> MesheliumConfig.get().plantCullChunks,
+                chunks -> {
+                    config.plantCullChunks = chunks;
+                    config.save();
+                }, !this.gateLocked);
+        plantCull.setTooltip(tip("meshelium.options.tooltip.plant_cull",
+                "meshelium.options.applies.now"));
+        this.layout.addChild(plantCull);
+
+        CullDistanceSlider subPixelCull = new CullDistanceSlider(
+                "meshelium.options.detail_cull.label",
+                () -> MesheliumConfig.get().subPixelCullChunks,
+                chunks -> {
+                    config.subPixelCullChunks = chunks;
+                    config.save();
+                }, !this.gateLocked);
+        subPixelCull.setTooltip(tip("meshelium.options.tooltip.detail_cull",
+                "meshelium.options.applies.now"));
+        this.layout.addChild(subPixelCull);
 
         // Wave-16: the quiet-time tail trim. Lives here rather than the
         // main screen for the same reason Duplicate Terrain Memory does -
@@ -207,6 +238,60 @@ public class MesheliumAdvancedScreen extends Screen {
     private static Component withSemantics(MutableComponent description, String semanticsKey) {
         return description.append(Component.literal("\n\n"))
                 .append(Component.translatable(semanticsKey).withStyle(ChatFormatting.GRAY));
+    }
+
+    /**
+     * A chunk-distance slider whose 0 stop reads Off. Continuous over
+     * 0..{@value MesheliumConfig#MAX_DETAIL_CULL_CHUNKS} like the main
+     * screen's Auto-crossover slider, because the value is a distance a
+     * player tunes by feel, not a count that must land on a lattice. One
+     * class serves both cull rows; only the label key and the field they
+     * write differ.
+     */
+    private final class CullDistanceSlider extends AbstractSliderButton {
+        private final String labelKey;
+        private final IntConsumer apply;
+        private int displayed;
+
+        CullDistanceSlider(String labelKey, IntSupplier current, IntConsumer apply,
+                boolean active) {
+            super(0, 0, WIDGET_WIDTH, 20, Component.empty(), cullFraction(current.getAsInt()));
+            this.labelKey = labelKey;
+            this.apply = apply;
+            this.active = active;
+            this.displayed = current.getAsInt();
+            updateMessage();
+        }
+
+        @Override
+        protected void updateMessage() {
+            Component shown = this.displayed <= MesheliumConfig.MIN_DETAIL_CULL_CHUNKS
+                    ? Component.translatable("meshelium.options.cull.off")
+                    : Component.translatable("meshelium.options.cull.chunks",
+                            Component.literal(Integer.toString(this.displayed)));
+            setMessage(Component.translatable(this.labelKey, shown));
+        }
+
+        @Override
+        protected void applyValue() {
+            int span = MesheliumConfig.MAX_DETAIL_CULL_CHUNKS
+                    - MesheliumConfig.MIN_DETAIL_CULL_CHUNKS;
+            int chunks = MesheliumConfig.MIN_DETAIL_CULL_CHUNKS
+                    + (int) Math.round(this.value * span);
+            if (chunks != this.displayed) {
+                this.displayed = chunks;
+                this.apply.accept(chunks);
+            }
+            updateMessage();
+        }
+    }
+
+    /** Slider fraction (0..1) for a cull distance in chunks. */
+    private static double cullFraction(int chunks) {
+        int span = MesheliumConfig.MAX_DETAIL_CULL_CHUNKS
+                - MesheliumConfig.MIN_DETAIL_CULL_CHUNKS;
+        double f = (chunks - MesheliumConfig.MIN_DETAIL_CULL_CHUNKS) / (double) span;
+        return Math.max(0.0, Math.min(1.0, f));
     }
 
     @Override

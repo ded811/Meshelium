@@ -42,7 +42,7 @@ These are our numbers on our computer: one graphics card, one world, one spot. Y
 
 - **Minecraft 26.2** with the **Fabric** loader
 - [**Fabric API**](https://modrinth.com/mod/fabric-api), the helper mod almost every mod wants. Put it in your mods folder too
-- Windows or Linux. Sorry, no Mac
+- Windows or Linux. Sorry, no Mac: Macs don't do mesh shaders on Vulkan yet
 - A graphics card that supports mesh shaders, which means **AMD** RX 6000 or newer, **NVIDIA** GTX 16xx or newer, or **Intel** Arc. Newer laptop and handheld chips count too, including the Steam Deck
 - If your card is older than that, Meshelium switches itself off, tells you why, and your game keeps working normally
 
@@ -80,7 +80,13 @@ Everything is in **Options > Video Settings > Meshelium Settings...**, and every
 
 **Distance Fog** defaults to **Off**, which is a change worth explaining. Minecraft fades distant terrain to fog at a fixed 1024 blocks, and that number does not care how far you can see. In vanilla it is invisible, because vanilla stops at 32 chunks and the fog sits far past the horizon. At 120 chunks it eats the outer 56: the game loads them, builds them, draws them, and then paints them flat grey. Off drops that haze and keeps only the short fade right at the edge, which is the part that hides chunks appearing, so the horizon still softens rather than ending in a wall. Match View Distance keeps a haze but moves it out with your view, and never makes fog thicker than Minecraft would, so below 64 chunks it changes nothing.
 
-Behind **Advanced** are five things you will probably never need to touch. **Greedy Meshing** merges neighbouring block faces that look identical so there is less to draw, worth the most with Smooth Lighting off, and the picture stays the same; it ships off while it proves itself. **Idle Memory Trim** is on: after half a minute of standing still it hands unused terrain memory back to your graphics card, several hundred megabytes at long distances. **Duplicate Terrain Memory** should stay on Freed; it stops Minecraft holding a second copy of the world that nothing draws, worth gigabytes past 64 chunks. Set it to Kept only if another mod needs Minecraft's own terrain buffers. **Debug Stat Logging** writes numbers to the log and changes nothing you can see. **Backend Popup** re-arms the first-run Vulkan prompt.
+Behind **Advanced** are a handful of things you will probably never
+need to touch, plus two sliders worth playing with. **Cull Tiny Plants
+Beyond** and **Cull Sub-Pixel Detail Beyond** skip drawing things too
+small to see at range, from distant grass tufts down to any face
+smaller than one pixel on your screen; both ship Off and apply
+instantly, so drag until you notice the picture change and back off a
+step. **Greedy Meshing** merges neighbouring block faces that look identical so there is less to draw, worth the most with Smooth Lighting off, and the picture stays the same; it ships off while it proves itself. **Idle Memory Trim** is on: after half a minute of standing still it hands unused terrain memory back to your graphics card, several hundred megabytes at long distances. **Duplicate Terrain Memory** should stay on Freed; it stops Minecraft holding a second copy of the world that nothing draws, worth gigabytes past 64 chunks. Set it to Kept only if another mod needs Minecraft's own terrain buffers. **Debug Stat Logging** writes numbers to the log and changes nothing you can see. **Backend Popup** re-arms the first-run Vulkan prompt.
 
 ## Performance may vary
 
