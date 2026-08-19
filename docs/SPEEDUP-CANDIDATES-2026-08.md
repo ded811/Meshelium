@@ -77,6 +77,30 @@ work, no memory, exactly today's behavior. Every level defaults off
 per the uncertainty rule until the owner tunes look-to-frames in
 person. 1.5.0 caps first with the two-tier leaves.
 
+TO-DO CARRIED FORWARD (2026-08-19): the Cull Ground Cover Beyond
+slider (petals/leaf litter as flat fractional-plane horizontal cutout
+decals, own ring because they read as ground color at range) was
+built, suite-green, and REVERTED from 1.5.1 because the owner's live
+test showed no visible effect. Investigate before rebuilding: whether
+real petal/litter quads actually decode as planar POS_Y fractional-
+plane cells (dump a section containing them through the probe), and
+whether the applies-as-builds semantics simply never rebuilt the
+sections the owner was looking at (no walker DEMOTION triggers when a
+slider is RAISED from Off - already-built distant sections keep their
+decals until something else dirties them; the promote direction may
+need a walker arm too). The reverted implementation lives intact in
+commit f5465b7.
+
+Owner additions 2026-08-19 (same conversation): the cache SOURCE is a
+player setting with at least these modes - visited-only (cache fills
+only from chunks the player has actually been sent; nothing invented)
+vs background-generate (seed-driven fill). And TWO separate radii:
+the LOD RENDER radius (how far cached terrain draws, up to 512) and
+the GENERATION radius (how far background fill works, e.g. 120) -
+beyond the generation radius only visited terrain ever appears. Plus
+the earlier requirements: per-world/per-server cache folder, size
+readout, clear-cache button, seed input field for multiplayer.
+
 ## Track 1: smoothness - own the visibility bookkeeping (ecosystem-corroborated)
 
 Sodium 0.7 (merged 2026-05) moved occlusion BFS and render-list

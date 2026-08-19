@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.5.1
+
+**Fixed: Solid Leaves was solidifying things that are not leaves.**
+
+With Solid Leaves Beyond turned up, grass block sides smeared green,
+and flowers, kelp, tall grass and vines stretched into blobs. The
+setting now decides by geometry: only full see-through faces with
+nothing behind them, which is leaves and full glass blocks, build
+solid. Thin details, plants and the grass-side overlay keep their
+normal look at every distance. Solid Leaves ships off, so nothing
+changed unless you had moved that slider.
+
 ## 1.5.0
 
 **Turning your camera is much smoother now.**

@@ -16,8 +16,10 @@ import net.minecraft.core.SectionPos;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The two build-thread ends of the wave-3b tap (section-build doc Q3.1):
@@ -68,9 +70,11 @@ public final class SectionBuildTap {
      */
     static final byte TIER_SMART = 1;
     /**
-     * Solid Leaves Beyond: Smart's pair filter AND every surviving cutout
-     * rewritten to the solid material ({@link #solidifyCutouts}) — the
-     * way Fast graphics draws leaves everywhere, made distance-gated.
+     * Solid Leaves Beyond: Smart's pair filter AND every surviving
+     * full-block cutout face rewritten to the solid material
+     * ({@link #solidifyCutouts}) — the way Fast graphics draws leaves
+     * everywhere, made distance-gated. Crosses, insets and decals keep
+     * their cutout look (the rewrite's eligibility rules).
      */
     static final byte TIER_SOLID = 2;
 
@@ -263,12 +267,25 @@ public final class SectionBuildTap {
     /**
      * The census key for one unit cell boundary: facing axis, the plane
      * coordinate along it, and the two in-plane cell coordinates. Facing
-     * SIGN deliberately absent — the whole point is matching a POS face
-     * against the NEG face on the same boundary — and so are material and
-     * UV, because Fast-style opacity culls the pair whatever sprites it
-     * carries ({@code GreedyMeshProbe.BoundaryKey}, verbatim).
+     * SIGN deliberately absent — the pair filter matches a POS face
+     * against the NEG face on the same boundary, and the solidify
+     * eligibility test wants a decal flagged whichever way the opaque
+     * face under it points — and so are material and UV, because
+     * Fast-style opacity culls the pair whatever sprites it carries
+     * ({@code GreedyMeshProbe.BoundaryKey}, verbatim).
      */
     private record BoundaryKey(int axis, int plane, int a, int b) {}
+
+    /** The sign-free boundary key of a face {@link #unitCell} accepted. */
+    private static BoundaryKey boundaryKey(QuadFacing facing, long[] cell) {
+        int axis = switch (facing) {
+            case POS_X, NEG_X -> 0;
+            case POS_Y, NEG_Y -> 1;
+            case POS_Z, NEG_Z -> 2;
+            case UNASSIGNED -> -1; // unreachable: unitCell rejected it
+        };
+        return new BoundaryKey(axis, (int) cell[2], (int) cell[0], (int) cell[1]);
+    }
 
     /**
      * Remove BOTH quads of every opposite-facing coplanar cutout pair —
@@ -311,16 +328,10 @@ public final class SectionBuildTap {
             if (cell == null) {
                 continue; // crosses and non-unit faces: nothing to pair
             }
-            int axis = switch (q.facing()) {
-                case POS_X, NEG_X -> 0;
-                case POS_Y, NEG_Y -> 1;
-                case POS_Z, NEG_Z -> 2;
-                case UNASSIGNED -> -1; // unreachable: unitCell rejected it
-            };
             boolean positive = q.facing() == QuadFacing.POS_X
                     || q.facing() == QuadFacing.POS_Y
                     || q.facing() == QuadFacing.POS_Z;
-            BoundaryKey key = new BoundaryKey(axis, (int) cell[2], (int) cell[0], (int) cell[1]);
+            BoundaryKey key = boundaryKey(q.facing(), cell);
             ArrayDeque<Integer> opposite = (positive ? unpairedNeg : unpairedPos).get(key);
             if (opposite != null && !opposite.isEmpty()) {
                 removed[opposite.pollFirst()] = true;
@@ -348,7 +359,7 @@ public final class SectionBuildTap {
     // ------------------------------------------------------------------
 
     /**
-     * Rewrite every remaining non-translucent cutout quad to the solid
+     * Rewrite every remaining full-block cutout face to the solid
      * material — alpha cutoff 0, everything else carried over verbatim
      * (facing, mip, vertices, and a merged quad's tile repeat). This is
      * the whole Solid tier once the pair filter has run: with the cutoff
@@ -356,11 +367,38 @@ public final class SectionBuildTap {
      * covers its pixels the way Fast graphics covers them everywhere,
      * and distant woods become occluders.
      *
+     * <p>Eligibility is GEOMETRIC, the pair filter's own discipline —
+     * "cutout material" alone is not license to fill pixels, because the
+     * cutout pass carries plenty of geometry whose transparent texels are
+     * structural. A quad is rewritten only if ALL three hold:</p>
+     *
+     * <ul>
+     * <li><b>axis-aligned facing</b> — crosses (flowers, tall grass,
+     * kelp) are UNASSIGNED, and filling one paints its whole diagonal
+     * rectangle;</li>
+     * <li><b>{@link #unitCell} passes</b> — vines, cactus sides and
+     * panes sit inset from the lattice or span less than a full face,
+     * and filling them stretches sprite pixels over geometry the sprite
+     * never covered;</li>
+     * <li><b>no opaque face on its boundary</b> — a grass or snow side
+     * overlay is a decal exactly coplanar with the solid face it
+     * decorates, and filling the decal z-fights that face as a stretched
+     * smear of the overlay's edge texels.</li>
+     * </ul>
+     *
+     * <p>A quad failing any test passes through UNCHANGED — still drawn
+     * cutout, so it looks right, it just is not solidified. The rule-3
+     * set is built by {@link #solidBoundaryKeys} in one pass over the
+     * list, lazily on the FIRST geometrically eligible cutout, so the
+     * whole transform stays O(quads) and a section with no cutouts (or
+     * only ineligible ones) never allocates it.</p>
+     *
      * <p>MUST run AFTER {@link #filterCutoutInteriorPairs}: the pair
      * matcher keys on the cutout material this rewrite erases. Runs
      * BEFORE the merge for the same reason the filter does — the merge
      * groups by material, and solidified quads should merge as the
-     * solids they now are.</p>
+     * solids they now are (and a merged run is no longer a unit face,
+     * which would blind every geometric test here).</p>
      *
      * <p>Counts stay consistent by construction: nothing is added or
      * removed, translucent quads are structurally untouchable (the guard
@@ -368,16 +406,27 @@ public final class SectionBuildTap {
      * buckets, translucent prefix and AABB come out identical to the
      * unrewritten list's — only the packed material bits differ. Pure
      * list transform, worker thread; returns the INPUT LIST ITSELF when
-     * the section has no cutout quads, so the no-leaves common case
-     * costs one scan and no copy ({@code filterCutoutInteriorPairs}'s
-     * contract, kept deliberately).</p>
+     * nothing is rewritten, so the no-leaves common case costs one scan
+     * and no copy ({@code filterCutoutInteriorPairs}'s contract, kept
+     * deliberately).</p>
      */
     public static List<TerrainQuad> solidifyCutouts(List<TerrainQuad> quads) {
+        Set<BoundaryKey> solidBoundaries = null;
         List<TerrainQuad> out = null;
         for (int i = 0; i < quads.size(); i++) {
             TerrainQuad q = quads.get(i);
             if (q.translucent() || q.alphaCutoffIndex() == 0) {
                 continue; // not cutout material: carried over untouched
+            }
+            long[] cell = unitCell(q);
+            if (cell == null) {
+                continue; // crosses, insets, non-unit faces: the cutout look is structural
+            }
+            if (solidBoundaries == null) {
+                solidBoundaries = solidBoundaryKeys(quads);
+            }
+            if (solidBoundaries.contains(boundaryKey(q.facing(), cell))) {
+                continue; // a decal on an opaque face (grass/snow side overlays)
             }
             if (out == null) {
                 out = new ArrayList<>(quads);
@@ -386,6 +435,29 @@ public final class SectionBuildTap {
                     q.v0(), q.v1(), q.v2(), q.v3(), q.repeatU(), q.repeatV()));
         }
         return out == null ? quads : out;
+    }
+
+    /**
+     * Every boundary an OPAQUE unit face occupies, keyed sign-free — the
+     * set {@link #solidifyCutouts}'s rule 3 tests decals against. One
+     * pass, solid material only (cutoff 0, not translucent), and only
+     * faces {@link #unitCell} accepts: a decal's host face is by nature
+     * a full block face, so an inset or non-unit solid can never be one
+     * and has no business suppressing a rewrite.
+     */
+    private static Set<BoundaryKey> solidBoundaryKeys(List<TerrainQuad> quads) {
+        Set<BoundaryKey> keys = new HashSet<>();
+        for (int i = 0; i < quads.size(); i++) {
+            TerrainQuad q = quads.get(i);
+            if (q.translucent() || q.alphaCutoffIndex() != 0) {
+                continue; // not solid material
+            }
+            long[] cell = unitCell(q);
+            if (cell != null) {
+                keys.add(boundaryKey(q.facing(), cell));
+            }
+        }
+        return keys;
     }
 
     /**
