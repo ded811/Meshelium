@@ -1223,6 +1223,99 @@ lock per frame, and the ~10,000 disarm frames inside tonight's spin
 legs moved no tail. If a future session builds a per-frame-look leg,
 run it before trusting this paragraph further.
 
+#### Fast Leaves Beyond, built and measured (2026-08-18)
+
+The census became a feature the same night: an Advanced slider
+(default Off, harness override -Dmeshelium.fastLeavesChunks — renamed
+later the same day, before anything shipped: this tier is now **Smart
+Leaves Beyond** (`smartLeavesChunks`, override
+-Dmeshelium.smartLeavesChunks) because the outer faces keep their
+see-through look, and a second **Solid Leaves Beyond** tier
+(`solidLeavesChunks`, override -Dmeshelium.solidLeavesChunks) was added
+that additionally rewrites surviving cutouts to the solid material past
+its own ring, Fast-graphics-everywhere style; Solid implies Smart, and
+the shared walker demotes a section's built tier as the camera or
+either slider brings it inside a ring). Beyond
+the ring, newly built sections drop every opposite-facing coplanar
+cutout pair before encoding - the faces hidden inside tree canopies
+that Fast graphics culls everywhere. A budgeted walker (64/pump)
+re-dirties Fast-built sections crossing inside (ring - 1), so
+approaching trees regain full detail; turning the slider down or off
+drains through the same path. Same-session pair, forest-rd64 / 1440p,
+slider 32:
+
+| | frame mean | frame p50 | frame p99 |
+|---|---|---|---|
+| Off | 1.653 ms | 1.354 ms | 8.594 ms |
+| 32 chunks | **1.338 ms (-19%)** | 1.214 ms (-10%) | **3.169 ms (-63%)** |
+
+The tail collapse is the story: leaves dominate forest section
+geometry, so smaller builds mean smaller build storms - this slider
+is a SMOOTHNESS feature wearing a frame-rate hat. The bench screenshot
+at the scenic camera is visually indistinguishable from Off (the
+removed faces were interior). The owner's in-person quality verdict
+at ground level remains the gate for any recommended default.
+
+#### The incremental draw snapshot, built and measured (2026-08-18)
+
+The night-two conviction became code: the full per-epoch snapshot walk
+(2 MB allocated and refilled nearly every streaming frame) is replaced
+by two persistent ping-pong buffers fed a slot-delta log appended under
+the existing LOCK at every one of the fifteen audited mutation sites,
+with full rebuild as the fallback for dispose, log overflow, free-list
+growth and pinned regrow. The three SNAPSHOT-DOSSIER docs are the
+correctness record; the tombstone, the swap-remove third-party [18]
+fanout and the slot-steal victim record all came from there. Full
+armed suite green first run, all torture legs.
+
+Same-session verdict, plains-rd64 / 1440p, spin 3°/tick:
+
+| p50 ms | pre-fix (night two) | post-fix | change |
+|---|---|---|---|
+| mesheliumOpaque while turning | 2.831 | **0.504** | -82% |
+| frame while turning | 6.807 | **3.468** | **-49%** |
+| frame static | 1.966 | 2.030 | noise (GPU-paced) |
+
+The pre-fix column is hours older (same day, same rig); the effect is
+14x the documented cross-session drift and the stage bracket is a
+direct measurement, so the comparison stands with the caveat noted.
+The turning frame HALVED.
+
+Honest residue: the GC-logged spin leg still shows 155 pauses (was
+176), max 773 ms - our biggest garbage feeder is dead, but the
+surviving stream is vanilla's own extract churn (a RenderRegionCache
+3x3x3 block snapshot per scheduled dirty section), which is exactly
+the budgeted-rebuild-scheduler's target. The monster-frame class
+therefore survives until A2 lands; the median smoothness win is
+banked now.
+
+#### The fast-graphics census (2026-08-18): the owner's idea prices huge
+
+The owner proposed a "fast graphics past a distance" slider. For
+terrain the dominant Fancy-vs-Fast difference is leaves: Fancy emits
+BOTH faces at every leaf-against-leaf boundary, Fast makes leaves
+opaque and mesh-time culling removes the interior. The census (new
+probe pass + self-locating forest scenes, seed 4242) counted the
+opposite-facing coplanar cutout pairs that opacity would delete:
+
+| scene | cutout quads | interior pairs | removable | of cutout | of ALL quads |
+|---|---|---|---|---|---|
+| forest-rd32 | 946,556 | 244,723 | 489,446 | 51.7% | 24.6% |
+| forest-rd64 | 1,547,962 | 388,561 | 777,122 | 50.2% | **21.0%** |
+
+Half the cutout layer, a fifth to a quarter of ALL geometry - four to
+seven times the whole shipped greedy-meshing win, and it is vanilla's
+own Fast-graphics semantics, so the distant look is a known quantity.
+A ring at 32 chunks covers ~75 percent of rd64's columns, so the
+distance-gated version keeps most of the prize while leaving near
+trees Fancy. Two designs still owed before building: the interior-pair
+filter at decode time (the census's matcher, made a mesher rule), and
+the ring-crossing re-dirty (sections built Fast stay Fast when
+approached until rebuilt - a shell-crossing dirty walk fixes that).
+The quality gate is the owner's, per the LOD decision: this ships as
+a slider they tune in person, default Off. Census floor note: pairs
+straddling section borders are missed, so the true number is higher.
+
 #### The aligned frame (night two, 2026-08-18): 100 percent attribution
 
 The attribution wave (row boundary moved to render HEAD; new brackets

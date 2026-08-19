@@ -53,6 +53,12 @@ import java.util.Map;
  * unit faces sharing one horizontal plane, the one geometry whose relative
  * draw order provably cannot matter - so the decision to ever merge that
  * layer starts from a number rather than a hunch.</p>
+ *
+ * <p>Same footing for the cutout layer: the interior-pair census counts the
+ * opposite-facing coplanar face pairs that Fancy leaves emit at every
+ * leaf-against-leaf boundary and that Fast-style opacity would cull at mesh
+ * time, so a "fast graphics past a distance" mode gets priced before anyone
+ * designs one.</p>
  */
 public final class GreedyMeshProbe {
 
@@ -131,6 +137,16 @@ public final class GreedyMeshProbe {
     private record WaterKey(QuadFacing facing, int plane, int cutoff, boolean mip,
                             int u0, int v0, int u1, int v1, int orient) {}
 
+    /**
+     * The census key for a cutout interior pair: one unit cell boundary,
+     * identified by its facing axis, the plane coordinate along it, and
+     * the in-plane cell. Facing SIGN is deliberately absent - the census
+     * exists to match a POS face against the NEG face on the same
+     * boundary - and so are material and UV, because Fast-style opacity
+     * would cull the pair whatever sprites it carries.
+     */
+    private record BoundaryKey(int axis, int plane, int a, int b) {}
+
     private GreedyMeshProbe() {
     }
 
@@ -200,6 +216,13 @@ public final class GreedyMeshProbe {
      */
     private static final java.util.concurrent.atomic.LongAdder PLANE_PURE_SECTIONS =
             new java.util.concurrent.atomic.LongAdder();
+    /** {@link #cutoutInteriorCensus}: the faces Fast-style leaves would cull. */
+    private static final java.util.concurrent.atomic.LongAdder CUTOUT_QUADS =
+            new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder CUTOUT_PAIRS =
+            new java.util.concurrent.atomic.LongAdder();
+    private static final java.util.concurrent.atomic.LongAdder CUTOUT_MIP_PAIRS =
+            new java.util.concurrent.atomic.LongAdder();
     private static final java.util.concurrent.atomic.AtomicLong NANOS =
             new java.util.concurrent.atomic.AtomicLong();
 
@@ -255,6 +278,10 @@ public final class GreedyMeshProbe {
                     PLANE_PURE_SECTIONS.increment();
                 }
             }
+            long[] cutout = cutoutInteriorCensus(quads);
+            CUTOUT_QUADS.add(cutout[0]);
+            CUTOUT_PAIRS.add(cutout[1]);
+            CUTOUT_MIP_PAIRS.add(cutout[2]);
         } catch (Throwable t) {
             return; // same containment as the model pass
         }
@@ -319,6 +346,13 @@ public final class GreedyMeshProbe {
         double waterOfTranslucent = translucentQuads == 0
                 ? 0.0 : 100.0 * (waterCells - waterMerged) / translucentQuads;
         double waterOfAll = 100.0 * (waterCells - waterMerged) / quads;
+        long cutoutQuads = CUTOUT_QUADS.sum();
+        long cutoutPairs = CUTOUT_PAIRS.sum();
+        long cutoutMipPairs = CUTOUT_MIP_PAIRS.sum();
+        long cutoutRemovable = cutoutPairs * 2;
+        double cutoutOfCutout = cutoutQuads == 0
+                ? 0.0 : 100.0 * cutoutRemovable / cutoutQuads;
+        double cutoutOfAll = 100.0 * cutoutRemovable / quads;
         return String.format(
                 "meshelium greedy probe: %d sections, %d quads -> %d SHIPPED (%.1f%% fewer overall); "
                         + "model says %d (%.1f%% overall, %.1f%% of the %d eligible, %s). "
@@ -330,6 +364,9 @@ public final class GreedyMeshProbe {
                         + "TRANSLUCENT FLAT WATER over %d cells (%d tops, %d undersides, %d uniform) "
                         + "-> %d rectangles (%.1f%% fewer of translucent, %.1f%% fewer overall), "
                         + "PLANE-PURE sections %d of %d wet. "
+                        + "CUTOUT INTERIOR PAIRS over %d cutout quads: %d pairs = %d quads "
+                        + "removable (%.1f%% of cutout, %.1f%% of all), "
+                        + "mipped %d pairs = %d quads. "
                         + "Cost %.2f ms/section",
                 sections, quads, shipped, shippedOfAll,
                 after, ofAll, ofEligible, eligible, agreement,
@@ -340,6 +377,9 @@ public final class GreedyMeshProbe {
                 waterCells, waterTops, waterUndersides, WATER_UNIFORM.sum(),
                 waterMerged, waterOfTranslucent, waterOfAll,
                 PLANE_PURE_SECTIONS.sum(), WET_SECTIONS.sum(),
+                cutoutQuads, cutoutPairs, cutoutRemovable,
+                cutoutOfCutout, cutoutOfAll,
+                cutoutMipPairs, cutoutMipPairs * 2,
                 NANOS.get() / 1.0e6 / sections);
     }
 
@@ -465,6 +505,76 @@ public final class GreedyMeshProbe {
             rectangles += greedyRectangles(group);
         }
         return new long[] {tops, undersides, uniformCells, rectangles, translucent};
+    }
+
+    /**
+     * The interior-face shape of the cutout layer: what Fast-style leaf
+     * opacity would cull, measured rather than assumed.
+     *
+     * <p>Fancy leaves are cutout, and a cutout neighbour does not occlude,
+     * so every leaf-against-leaf boundary emits BOTH interior faces. Fast
+     * makes leaves opaque and those faces never leave the mesher. A "fast
+     * graphics past a distance" mode is priced by exactly those quads, and
+     * this counts them: OPPOSITE-FACING COPLANAR PAIRS of cutout unit
+     * faces, a POS and a NEG face occupying the same unit cell boundary.
+     * Nothing here culls anything.</p>
+     *
+     * <p>Cutout means a nonzero alpha cutoff on a non-translucent quad:
+     * the decoder stamps SOLID with cutoff index 0, CUTOUT with 2 and
+     * TRANSLUCENT with 1 ({@code VanillaMeshDecoder.materialCutoffIndex}),
+     * so the translucency flag has to carry half the test. Crosses (grass
+     * tufts, flowers) are cutout too, but they are UNASSIGNED facing with
+     * no boundary cell, and {@link #unitCell} already rejects them: only
+     * axis-aligned faces can be interior. Detection is one HashMap pass
+     * over the section, the {@link WaterKey} pattern, O(quads): bucket by
+     * {@link BoundaryKey} and take {@code min(pos, neg)} per bucket, which
+     * also counts stacked duplicates correctly. Pairs whose two faces
+     * straddle a SECTION boundary are missed, because decode is per
+     * section, so the number is a floor like every other figure here.</p>
+     *
+     * <p>Returns {cutoutQuads, pairs, mipPairs}: all cutout-material quads
+     * seen, the opposite-facing coplanar pairs among them, and the pairs
+     * BOTH of whose faces carry the mip bit (leaves are mipped cutout; the
+     * 26.2 decoder mips everything, so the two pair counts diverge only if
+     * a producer ever clears the bit).</p>
+     */
+    private static long[] cutoutInteriorCensus(List<TerrainQuad> quads) {
+        long cutoutQuads = 0;
+        // {POS, NEG, mipped POS, mipped NEG} per unit cell boundary.
+        Map<BoundaryKey, int[]> boundaries = new HashMap<>();
+        for (TerrainQuad q : quads) {
+            if (q.translucent() || q.alphaCutoffIndex() == 0) {
+                continue;
+            }
+            cutoutQuads++;
+            long[] cell = unitCell(q);
+            if (cell == null) {
+                continue; // crosses and non-unit faces: nothing to pair
+            }
+            int axis = switch (q.facing()) {
+                case POS_X, NEG_X -> 0;
+                case POS_Y, NEG_Y -> 1;
+                case POS_Z, NEG_Z -> 2;
+                case UNASSIGNED -> -1; // unreachable: unitCell rejected it
+            };
+            boolean positive = q.facing() == QuadFacing.POS_X
+                    || q.facing() == QuadFacing.POS_Y
+                    || q.facing() == QuadFacing.POS_Z;
+            int[] counts = boundaries.computeIfAbsent(
+                    new BoundaryKey(axis, (int) cell[2], (int) cell[0], (int) cell[1]),
+                    k -> new int[4]);
+            counts[positive ? 0 : 1]++;
+            if (q.mip()) {
+                counts[positive ? 2 : 3]++;
+            }
+        }
+        long pairs = 0;
+        long mipPairs = 0;
+        for (int[] c : boundaries.values()) {
+            pairs += Math.min(c[0], c[1]);
+            mipPairs += Math.min(c[2], c[3]);
+        }
+        return new long[] {cutoutQuads, pairs, mipPairs};
     }
 
     /**

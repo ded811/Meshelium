@@ -6,6 +6,7 @@ package com.deds.meshelium.gametest.client;
 
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumGate;
+import com.deds.meshelium.gui.MesheliumAdvancedScreen;
 import com.deds.meshelium.gui.MesheliumOptionsScreen;
 import com.deds.meshelium.gui.MesheliumPopupScreen;
 import com.deds.meshelium.vk.HelloMeshletRenderer;
@@ -199,7 +200,8 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
      * the OptionsList — visible without scrolling), clicks through to
      * {@link MesheliumOptionsScreen}, asserts the gate-lock probe and the
      * status header (locked backends MUST say "NOT RENDERING", a healthy
-     * Vulkan title says "READY"), and walks Done → Done back to the
+     * Vulkan title says "READY"), runs the B2 Advanced-screen leg
+     * ({@link #assertAdvancedScreen}), and walks Done → Done back to the
      * title.
      *
      * <p>Note the GL run reaches this AFTER the popup leg pressed
@@ -258,6 +260,13 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
             assertCapChangeRefreshesParentSlider(context, videoSettings[0], sliderBefore[0]);
         }
 
+        // B2 (2026-08-18): the Advanced screen, both backends. Its rows
+        // live in a scroll container between a header and a Done footer
+        // now, so the leg proves every row still EXISTS and Done is still
+        // INSIDE the window — a future row overflow scrolls instead of
+        // hiding settings, and a footer regression fails the suite.
+        assertAdvancedScreen(context, expectLocked);
+
         context.clickScreenButton("gui.done"); // Meshelium screen -> back to Video Settings
         context.runOnClient(client -> {
             if (!(client.gui.screen() instanceof VideoSettingsScreen)) {
@@ -267,6 +276,157 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         });
         context.clickScreenButton("gui.done"); // Video Settings footer -> title
         context.waitForScreen(TitleScreen.class);
+    }
+
+    /**
+     * B2 (2026-08-18): the Advanced screen leg, entered from the Meshelium
+     * options screen the caller is standing on. The screen's rows moved
+     * into a vanilla ScrollableLayout between a title header and a Done
+     * footer, precisely so a growing row count can never clip settings off
+     * the window again. So what this leg pins is (a) every expected row
+     * widget EXISTS in the widget tree, wherever the scroll container put
+     * it, and (b) Done sits INSIDE the window bounds, because the footer
+     * is the piece that keeps the way out reachable at every GUI scale. A
+     * future row overflow then scrolls (visible in the B2 screenshot the
+     * coordinator reads) instead of silently hiding settings from the
+     * owner, and a footer regression fails the suite loudly.
+     *
+     * <p>The row walk goes through the real event-handler tree
+     * ({@code children()}, recursively) rather than {@code renderables},
+     * for the same reason {@link #pressOptionsListButton} does: widgets
+     * inside a scroll container are children of the CONTAINER widget, not
+     * of the screen ({@code ScrollableLayout.visitChildren} hands layouts
+     * its Container only, and {@code Container.refreshChildren} pulls the
+     * rows in as its own children — javap-cited, 26.2 jar). The two
+     * clickScreenButton calls stay on fabric's walker because both
+     * buttons ARE direct renderables: [Advanced...] on the main screen's
+     * flat stack, Done in this screen's footer.</p>
+     *
+     * <p>Ends back on the SAME live Meshelium screen instance it started
+     * from (the Advanced screen's onClose contract — never a fresh
+     * parent), so the caller's subsequent Done walk is unaffected.</p>
+     */
+    private static void assertAdvancedScreen(ClientGameTestContext context,
+            boolean expectLocked) {
+        MesheliumOptionsScreen[] parentBefore = new MesheliumOptionsScreen[1];
+        context.runOnClient(client -> {
+            if (!(client.gui.screen() instanceof MesheliumOptionsScreen live)) {
+                throw new AssertionError("the Advanced leg must start on the Meshelium "
+                        + "screen, got " + client.gui.screen());
+            }
+            parentBefore[0] = live;
+        });
+        context.clickScreenButton("meshelium.options.advanced");
+        context.waitForScreen(MesheliumAdvancedScreen.class);
+        context.runOnClient(client -> {
+            Screen screen = client.gui.screen();
+            if (!(screen instanceof MesheliumAdvancedScreen)) {
+                throw new AssertionError("[Advanced...] did not open the Advanced screen, "
+                        + "got " + screen);
+            }
+            java.util.List<net.minecraft.client.gui.components.AbstractWidget> widgets =
+                    new java.util.ArrayList<>();
+            collectWidgets(screen, widgets);
+            // Every row, in screen order. CycleButton messages read
+            // "Name: Value" and the cull sliders "Label: Off", so the
+            // match is contains() on the part every state shares: the
+            // resolved name, and for the two sliders the label pattern
+            // resolved with an empty argument (leaving exactly the shared
+            // prefix, "Cull Tiny Plants Beyond: ").
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.greedy_meshing").getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.plant_cull.label",
+                    Component.literal("")).getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.detail_cull.label",
+                    Component.literal("")).getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.smart_leaves.label",
+                    Component.literal("")).getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.solid_leaves.label",
+                    Component.literal("")).getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.arena_trim").getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.suppress_vanilla").getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.debug_stats").getString(), screen);
+            requireRowWidget(widgets, Component.translatable(
+                    "meshelium.options.popup").getString(), screen);
+            // The banners, by the same census the screen itself runs: the
+            // locked banner exactly when the gate locked this run, the
+            // dev-override banner exactly when a -D flag locks a row HERE.
+            if (expectLocked) {
+                requireRowWidget(widgets, Component.translatable(
+                        "meshelium.options.advanced.locked").getString(), screen);
+            }
+            if (System.getProperty("meshelium.debugStats") != null
+                    || System.getProperty("meshelium.greedyMeshing") != null) {
+                requireRowWidget(widgets, Component.translatable(
+                        "meshelium.options.dev_override").getString(), screen);
+            }
+            // Done: found AND inside the window. The old flat stack failed
+            // exactly here — centerInRectangle pushed half the overflow
+            // past the bottom edge at large GUI scales, unreachable.
+            net.minecraft.client.gui.components.AbstractWidget done = null;
+            String doneLabel = Component.translatable("gui.done").getString();
+            for (net.minecraft.client.gui.components.AbstractWidget widget : widgets) {
+                if (widget instanceof Button
+                        && widget.getMessage().getString().equals(doneLabel)) {
+                    done = widget;
+                }
+            }
+            if (done == null) {
+                throw new AssertionError("no Done button anywhere on the Advanced screen");
+            }
+            if (done.getX() < 0 || done.getY() < 0
+                    || done.getX() + done.getWidth() > screen.width
+                    || done.getY() + done.getHeight() > screen.height) {
+                throw new AssertionError("Done at (" + done.getX() + "," + done.getY()
+                        + ") size " + done.getWidth() + "x" + done.getHeight()
+                        + " is outside the " + screen.width + "x" + screen.height
+                        + " window - the footer no longer pins the way out on screen");
+            }
+        });
+        context.takeScreenshot(TestScreenshotOptions.of("B2_meshelium_advanced_screen"));
+
+        context.clickScreenButton("gui.done"); // Advanced -> the LIVE parent
+        context.waitForScreen(MesheliumOptionsScreen.class);
+        context.runOnClient(client -> {
+            if (client.gui.screen() != parentBefore[0]) {
+                throw new AssertionError("Done on the Advanced screen must return the SAME "
+                        + "live Meshelium screen it was opened from (its widgets, tick loop "
+                        + "and capAtOpen snapshot), got " + client.gui.screen());
+            }
+        });
+    }
+
+    /** Depth-first over the REAL event tree: screen, scroll container, rows. */
+    private static void collectWidgets(ContainerEventHandler container,
+            java.util.List<net.minecraft.client.gui.components.AbstractWidget> out) {
+        for (GuiEventListener child : container.children()) {
+            if (child instanceof net.minecraft.client.gui.components.AbstractWidget widget) {
+                out.add(widget);
+            }
+            if (child instanceof ContainerEventHandler nested) {
+                collectWidgets(nested, out);
+            }
+        }
+    }
+
+    /** Fails with the missing label unless some widget's message contains it. */
+    private static void requireRowWidget(
+            java.util.List<net.minecraft.client.gui.components.AbstractWidget> widgets,
+            String label, Screen screen) {
+        for (net.minecraft.client.gui.components.AbstractWidget widget : widgets) {
+            if (widget.getMessage().getString().contains(label)) {
+                return;
+            }
+        }
+        throw new AssertionError("no widget labelled '" + label + "' on " + screen
+                + " - a row went missing from the Advanced screen");
     }
 
     /**

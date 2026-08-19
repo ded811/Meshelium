@@ -222,18 +222,26 @@ final class RegionStore {
      * the tail slot's 32-byte record moves into the hole with its
      * self-reference bits 18-25 rewritten, the vacated tail slot is zeroed,
      * and an emptied region releases its id and queues GPU tombstoning.
+     *
+     * @return the owner of the tail section the compaction moved into the
+     *         hole — a THIRD PARTY whose compacted slot (and so its draw-
+     *         snapshot {@code [18]} global index) just changed; the caller
+     *         must re-log that entry or its stale index gates translucents
+     *         against a never-written stamp. Null when nothing moved (the
+     *         removed slot WAS the tail, owner mismatch, region gone).
      */
-    void remove(long regionKey, int posKey, Object owner) {
+    Object remove(long regionKey, int posKey, Object owner) {
         Region region = byKey.get(regionKey);
         if (region == null || region.ownerByPos[posKey] != owner) {
-            return; // slot was stolen by a newer mesh, or region already gone
+            return null; // slot was stolen by a newer mesh, or region already gone
         }
         int slot = region.pos2id[posKey];
         if (slot < 0) {
-            return;
+            return null;
         }
         int last = region.count - 1;
         ByteBuffer mirror = region.mirror;
+        Object movedOwner = null;
         if (slot != last) {
             // Move the tail record into the hole…
             for (int i = 0; i < SectionRecord.SECTION_SIZE; i += 4) {
@@ -248,6 +256,7 @@ final class RegionStore {
             mirror.putInt(headerYOffset, py);
 
             int movedPos = region.id2pos[last];
+            movedOwner = region.ownerByPos[movedPos]; // before any unmapping
             region.pos2id[movedPos] = (short) slot;
             region.id2pos[slot] = (short) movedPos;
         }
@@ -271,6 +280,7 @@ final class RegionStore {
         } else {
             dirtyRegions.add(region);
         }
+        return movedOwner;
     }
 
     /**

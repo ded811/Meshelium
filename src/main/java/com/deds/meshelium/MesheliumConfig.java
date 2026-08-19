@@ -420,6 +420,54 @@ public final class MesheliumConfig {
      */
     public int subPixelCullChunks = 0;
 
+    /**
+     * Smart Leaves Beyond: past this many chunks, NEW section builds drop
+     * both faces of every opposite-facing coplanar cutout pair — the
+     * leaf-against-leaf interior faces Fast graphics never meshes at all,
+     * measured by the fast-graphics census at 50-52% of forest cutout
+     * quads, 21-25% of ALL quads (docs/PERFORMANCE.md;
+     * {@code GreedyMeshProbe.cutoutInteriorCensus} is the matcher this
+     * filter inverts). The see-through look is KEPT: only faces buried
+     * inside canopies go, which is what earns the name — the Solid tier
+     * below is the one that trades transparency away. Unlike the two
+     * shader-side culls above this is a BUILD-time filter, so it applies
+     * to sections as they compile: the build tap filters beyond
+     * (ring + 1), the residency walker re-dirties tiered sections back
+     * down inside (ring − 1) — the one-chunk dead band is hysteresis so
+     * a camera idling on the ring cannot make a section oscillate.
+     * <b>0 = off, the shipped default</b> (the owner's rule again: an
+     * unmeasured win ships as a slider): nothing is filtered and the
+     * walker has nothing to restore. Turning it down or off live
+     * re-dirties affected sections through vanilla at a budgeted rate,
+     * so the world transitions over a few seconds. (Shipped nowhere
+     * under its 2026-08-18 working name "Fast Leaves Beyond"; renamed
+     * before 1.5.0 when the tier split made "Fast" ambiguous.)
+     */
+    // Default 16, owner-set 2026-08-19 after judging the look in person
+    // ("i really like how our leaves look now at a distance") — the
+    // uncertainty rule's in-person quality gate, cleared. At 16 chunks a
+    // canopy's interior faces are strictly invisible from outside; the
+    // slider still goes to 0 for anyone who wants vanilla-exact builds.
+    public int smartLeavesChunks = 16;
+
+    /**
+     * Solid Leaves Beyond: past this many chunks, NEW section builds
+     * rewrite every remaining cutout quad to the solid material (alpha
+     * cutoff 0) — see-through blocks like leaves build fully opaque, the
+     * way Fast graphics draws them everywhere, and distant woods become
+     * occluders that hide what is behind them. Solid IMPLIES Smart: the
+     * pair filter above runs first, so the interior faces are gone AND
+     * the survivors are opaque. Same build-time mechanics as
+     * {@link #smartLeavesChunks}: gate beyond (ring + 1), the walker
+     * restores inside (ring − 1) — a section crossing from Solid range
+     * into Smart range rebuilds down one tier, not straight to full
+     * detail. <b>0 = off, the shipped default</b>: this one is honest
+     * about CHANGING how distant terrain looks, so it will never be
+     * anything but an explicit player choice (the mission's no-silent-LOD
+     * rule, CLAUDE.md 2026-08-18).
+     */
+    public int solidLeavesChunks = 0;
+
     /** How occlusion culling decides whether to run. */
     public enum OcclusionMode {
         /** On at or above {@link #occlusionAutoMinRenderDistance}. */
@@ -770,6 +818,32 @@ public final class MesheliumConfig {
                 Math.min(MAX_DETAIL_CULL_CHUNKS, get().subPixelCullChunks));
     }
 
+    /**
+     * {@link #smartLeavesChunks}, clamped (the file is hand-editable).
+     * The system property outranks the config for the same reason
+     * bfsOnly's does: the bench world boots a default config, and an A/B
+     * leg needs the knob without a settings screen. Never shipped set.
+     */
+    public static int smartLeavesChunks() {
+        Integer override = Integer.getInteger("meshelium.smartLeavesChunks");
+        int chunks = override != null ? override : get().smartLeavesChunks;
+        return Math.max(MIN_DETAIL_CULL_CHUNKS,
+                Math.min(MAX_DETAIL_CULL_CHUNKS, chunks));
+    }
+
+    /**
+     * {@link #solidLeavesChunks}, clamped (the file is hand-editable).
+     * Same property-outranks-config pattern as
+     * {@link #smartLeavesChunks()}, for the same A/B-leg reason. Never
+     * shipped set.
+     */
+    public static int solidLeavesChunks() {
+        Integer override = Integer.getInteger("meshelium.solidLeavesChunks");
+        int chunks = override != null ? override : get().solidLeavesChunks;
+        return Math.max(MIN_DETAIL_CULL_CHUNKS,
+                Math.min(MAX_DETAIL_CULL_CHUNKS, chunks));
+    }
+
     /** {@code meshelium.fogMode} ?? {@link #fogMode}. */
     public static FogMode fogMode() {
         String property = System.getProperty("meshelium.fogMode");
@@ -958,6 +1032,8 @@ public final class MesheliumConfig {
         this.arenaTrim = d.arenaTrim;
         this.plantCullChunks = d.plantCullChunks;
         this.subPixelCullChunks = d.subPixelCullChunks;
+        this.smartLeavesChunks = d.smartLeavesChunks;
+        this.solidLeavesChunks = d.solidLeavesChunks;
         // Retention has no rows any more (Bobby owns that job since
         // 2026-08-11) but the fields are still live behind the config, so a
         // reset must cover them or "reset to defaults" would quietly leave

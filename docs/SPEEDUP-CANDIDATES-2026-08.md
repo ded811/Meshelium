@@ -61,6 +61,22 @@ Real-play pain, in order:
 So the roadmap splits three ways: SMOOTHNESS (CPU), SCALE (LOD +
 memory), RAW FPS (GPU slices).
 
+## OWNER DECISIONS, 2026-08-19 (the 1.6.0 far-field mandate)
+
+The surface-mesh far field is 1.6.0's flagship: beyond render distance
+chunks never load as chunks - own store of EXPOSED SURFACES ONLY, 3-4
+player-configurable levels (each: distance slider + per-feature
+toggles, configured LIVE in settings), target 512 chunks, candidate
+level features: surface-only extraction, half-scale (2x2x2) remesh,
+texture simplification slider down to flat color (mip clamping),
+2x2 shading rate, flat/sheet oceans, solid leaves, column-heightfield
+horizon tier. Accuracy explicitly does NOT matter at these distances
+(owner). HARD REQUIREMENT: the whole far-field system must have a
+MASTER OFF switch - off means zero cost: no storage, no background
+work, no memory, exactly today's behavior. Every level defaults off
+per the uncertainty rule until the owner tunes look-to-frames in
+person. 1.5.0 caps first with the two-tier leaves.
+
 ## Track 1: smoothness - own the visibility bookkeeping (ecosystem-corroborated)
 
 Sodium 0.7 (merged 2026-05) moved occlusion BFS and render-list

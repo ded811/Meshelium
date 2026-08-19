@@ -1,4 +1,43 @@
-# Incremental draw snapshot - design note (2026-08-18, unbuilt)
+# Incremental draw snapshot - design note (2026-08-18)
+
+## v2 DECISIONS (post-dossier; the three SNAPSHOT-DOSSIER-*.md files
+## are the implementation bible - every claim below is cited there)
+
+1. **Log record kinds: WRITE(slot) and TOMBSTONE(slot) only**, plus a
+   FULL_REBUILD sentinel. Golden fact: packed ints [0..17] are
+   immutable post-admission; only [18]/[19] ever change - so WRITE
+   (recompute all 20 ints from the live entry at APPLY time) covers
+   every mutation kind. Handles (arena backing/blocks, section
+   records) are re-captured on EVERY publish, so S11-S14 need no
+   records at all.
+2. **The swap-remove fanout** (dossier-mutations section 3):
+   RegionStore.remove compacts the tail section into the hole,
+   changing the MOVED third-party entry's [18]. RS.remove gains a
+   moved-owner callback; residency appends WRITE(movedSlot). Fires on
+   every ownsSlot death path. The slot-steal victim (TR:1628) gets
+   WRITE(prevSlot) under the same S1 bump.
+3. **Tombstone = zero all 20 ints, then [18] = -2** (verified against
+   all five consumer skip conditions, dossier-lifecycle section 2).
+   GPU side needs nothing. sectionCount early-outs become
+   liveSlotCount.
+4. **snapshotSlot is per-Resident-OBJECT** (per arena copy), assigned
+   at TR:1595, freed at the five death sites; the handover window
+   legitimately holds two slots for one position.
+5. **Publish point = drawSnapshot under LOCK** (unchanged seam):
+   apply log entries newer than the back buffer's index, re-capture
+   handles + regionData/retainedMasks (still small full snapshots),
+   swap. Worker-thread mutations after the drain are next frame's -
+   today's staleness contract verbatim, fence-lag safety unchanged.
+6. **translucentSlotByPos must apply its inserts/removes from exactly
+   the log range of the adopted swap, atomically with adopting it**
+   (the one cross-swap ABA hazard, dossier-lifecycle section 4).
+   rebuildRegionMap keys by regionId, never snapshot order.
+7. **Free-list starts at 32k slots, grows through the full-rebuild
+   fallback** (exhaustion = fallback event, like log overflow and
+   dispose). rd120+retention ceiling ~112k entries -> 2^17 max.
+8. **assert retained.put() == null** at TR:1081/1099 (the silent-leak
+   edge the dossier flagged).
+
 
 The frame-gap analysis convicted `TerrainResidency.drawSnapshot` +
 `TerrainDrawer.rebuildRegionMap` as the #1 real-play smoothness lever:
