@@ -210,6 +210,8 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
 
             // ---- wave-7 assertions ----
             assertTranslucentParity(context, singleplayer);
+            // ---- 1.5.2: the FOV-reveal heal (occlusion re-armed inside) ----
+            assertFovRevealHealsTranslucent(context, singleplayer);
             assertResortsApplyWithoutReencode(context, singleplayer);
 
             // ---- wave-11: retained terrain (the infinite-horizon leg;
@@ -1456,6 +1458,87 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
             // Leave the option as found: later assertions in this class run
             // against the default graphics path and must not inherit this.
             context.runOnClient(client -> client.options.improvedTransparency().set(restore[0]));
+        }
+    }
+
+    /**
+     * The 1.5.2 FOV-reveal heal: with occlusion armed and the camera
+     * pinned over the wave-7 water tank, a sudden FOV widen must not leave
+     * the translucent layer behind at the new screen edges (the owner's
+     * black-water report: the occlusion opaque path draws the revealed
+     * seafloor instantly from region records + the cull frustum, while
+     * translucent membership comes from vanilla's {@code visibleSections},
+     * rebuilt only in {@code LevelExtractor.applyFrustum} — which fires on
+     * {@code consumeFrustumUpdate()} or a 2-degree ROTATION bucket, never
+     * on a projection change; bytecode extract ip 256-279).
+     *
+     * <p>The act deliberately widens WITHOUT touching the fov option:
+     * Speed V drives {@code Camera.fovModifier} toward its 1.5 clamp
+     * ({@code getFieldOfViewModifier} reads the MOVEMENT_SPEED attribute —
+     * no movement required; {@code tickFov} eases 50% per tick), so the
+     * effective fov ramps 30 → 45 while {@code options.fov()} stays 30.
+     * On this path VANILLA HAS NO HEAL AT ALL — {@code invalidateIfNeeded}
+     * compares only the option int (the slider's ~1 s async-full-rebuild
+     * self-heal), the world is frozen (no chunk deltas → no partial-update
+     * flag) and the camera never rotates — so {@code visibleSections}
+     * growth within the bounded window is proof the drawer's
+     * projection-change nudge ran {@code applyFrustum}: the fix is the
+     * only remaining writer of {@code needsFrustumUpdate}. Shots 70/71
+     * give the coordinator the before/after pair (71 must show water, not
+     * dark floor, at the widened edges).</p>
+     */
+    private static void assertFovRevealHealsTranslucent(ClientGameTestContext context,
+            TestSingleplayerContext singleplayer) {
+        var server = singleplayer.getServer();
+        // Occlusion armed: the reveal artifact is only CONSPICUOUS there
+        // (bfs mode feeds BOTH layers from visibleSections — consistent
+        // lag, vanilla-identical). Same arming idiom as the wave-6 legs.
+        context.runOnClient(client ->
+                System.setProperty(TerrainDrawer.PROPERTY_BFS_ONLY, "false"));
+        int[] fovBefore = new int[1];
+        context.runOnClient(client -> fovBefore[0] = client.options.fov().get());
+        try {
+            long occBefore = TerrainDrawer.occlusionFrames();
+            context.waitFor(client -> TerrainDrawer.occlusionFrames() > occBefore,
+                    DRAW_TIMEOUT_TICKS);
+
+            // Re-pin the tank view, then NARROW so the widen has room. The
+            // narrow is itself a projection change (heal + vanilla's own
+            // option-triggered rebuild both fire); let everything settle
+            // before the baseline so the leg measures only the widen.
+            server.runCommand("execute as @p at @s run tp @s ~ ~ ~ 180 20");
+            context.runOnClient(client -> client.options.fov().set(30));
+            context.waitTicks(60);
+            quiesce(context);
+
+            int[] visBaseline = new int[1];
+            context.runOnClient(client ->
+                    visBaseline[0] = client.levelRenderer.visibleSections().size());
+            long nudgesBefore = TerrainDrawer.frustumHealNudges();
+            context.takeScreenshot(TestScreenshotOptions.of("70_meshelium_fov30_baseline"));
+
+            // The widen: option untouched, camera untouched, world frozen
+            // (trailing true hides the swirl particles — shot 71 stays a
+            // clean terrain pair).
+            server.runCommand("effect give @p minecraft:speed 600 4 true");
+
+            // Bounded heal: detection on the first ramp frame the drawer
+            // owns, applyFrustum at the next extract — the 100-tick bound
+            // is generous for a ~10-tick ramp and hard-fails without the
+            // fix (nothing else can touch the flag on this path).
+            context.waitFor(client -> TerrainDrawer.frustumHealNudges() > nudgesBefore, 100);
+            context.waitFor(client ->
+                    client.levelRenderer.visibleSections().size() > visBaseline[0], 100);
+            context.waitFor(client -> TerrainDrawer.lastTranslucentSections() > 0,
+                    DRAW_TIMEOUT_TICKS);
+            context.takeScreenshot(TestScreenshotOptions.of("71_meshelium_fov_reveal_healed"));
+            assertNoErrors();
+        } finally {
+            server.runCommand("effect clear @p");
+            context.runOnClient(client -> {
+                client.options.fov().set(fovBefore[0]);
+                System.clearProperty(TerrainDrawer.PROPERTY_BFS_ONLY);
+            });
         }
     }
 
