@@ -321,8 +321,15 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
      * <p>The Solid tier's half then runs the SAME survivors through
      * {@code SectionBuildTap.solidifyCutouts} — filter strictly first,
      * the tap's order, because the pair matcher keys on the cutout
-     * material the rewrite erases — and pins the rewrite all the way
-     * into the packed stream's material bits.</p>
+     * material the rewrite erases — and pins the rewrite's GEOMETRIC
+     * eligibility: the lone cutout sits on the very boundary the solid
+     * face occupies (the grass-side-overlay shape), so nothing may
+     * change and the same list instance must come back. A second list
+     * then carries one quad per eligibility rule — a cross (UNASSIGNED
+     * facing), an inset vine face (off the lattice), a same-facing decal
+     * on an opaque face — plus the one plain leaf face that passes all
+     * three, and only the leaf may solidify, pinned all the way into the
+     * packed stream's material bits.</p>
      */
     private static void leafTierFilters() {
         TerrainQuad water = xFace(QuadFacing.POS_X, 1, 3, 5, true, 1, 201);  // translucent
@@ -380,55 +387,89 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
                 "a bare pair filters to empty; the tap must fall back to the unfiltered list");
 
         // ---- The Solid tier, on the SAME survivors (solid implies Smart,
-        // and the order is load-bearing: the pair is already gone, so the
-        // rewrite can only ever see faces a viewer could reach). The lone
-        // cutout comes out cutoff 0; the translucent probe and the
-        // already-solid face come through as the same objects.
-        List<TerrainQuad> solidified = SectionBuildTap.solidifyCutouts(out);
-        check(solidified != out, "a surviving cutout forces a fresh list");
-        checkEq(3, solidified.size(), "solidify never adds or removes");
-        check(solidified.get(0) == water, "the translucent quad is untouched, same object");
-        check(solidified.get(1) == solid, "an already-solid quad is untouched, same object");
-        TerrainQuad rewritten = solidified.get(2);
-        check(rewritten != lonely, "the cutout was rewritten to a copy");
+        // and the order is load-bearing: the pair is already gone before
+        // the rewrite looks). Eligibility is geometric, and NOTHING here
+        // passes it: the water is translucent, the solid is already
+        // solid, and the lone cutout sits on the very boundary the solid
+        // face occupies — a decal on an opaque face, the grass-side-
+        // overlay shape (here opposite-facing; the key is sign-free) —
+        // so rewriting it would fill a coplanar smear over the face
+        // beneath. Unchanged means the input list itself comes back.
+        check(SectionBuildTap.solidifyCutouts(out) == out,
+                "a cutout coplanar with an opaque face is a decal: nothing to rewrite, same list");
+
+        // ---- One quad per eligibility rule, plus the one that passes
+        // all three. Only the plain leaf face — axis facing, unit cell,
+        // no opaque face on its boundary — may solidify; the cross, the
+        // inset vine and the decal keep their cutout material, because
+        // for them the transparent texels are structural.
+        TerrainQuad cross = crossQuad(21);                                       // no axis facing
+        TerrainQuad vine = xFace(QuadFacing.POS_X, 4.0625f, 3, 5, false, 2, 22); // off the lattice
+        TerrainQuad backing = xFace(QuadFacing.POS_X, 5, 3, 5, false, 0, 23);    // opaque host face
+        TerrainQuad decal = xFace(QuadFacing.POS_X, 5, 3, 5, false, 2, 24);      // coplanar overlay
+        TerrainQuad leaf = xFace(QuadFacing.POS_X, 6, 3, 5, false, 2, 25);       // passes all three
+        List<TerrainQuad> tiers = List.of(cross, vine, backing, decal, leaf);
+        List<TerrainQuad> solidified = SectionBuildTap.solidifyCutouts(tiers);
+        check(solidified != tiers, "an eligible cutout forces a fresh list");
+        checkEq(5, solidified.size(), "solidify never adds or removes");
+        check(solidified.get(0) == cross, "a cross survives untouched: UNASSIGNED facing");
+        check(solidified.get(1) == vine, "an inset face survives untouched: not a unit cell");
+        check(solidified.get(2) == backing, "an already-solid quad is untouched, same object");
+        check(solidified.get(3) == decal,
+                "a same-facing decal on an opaque face survives untouched");
+        TerrainQuad rewritten = solidified.get(4);
+        check(rewritten != leaf, "the leaf face was rewritten to a copy");
         checkEq(0, rewritten.alphaCutoffIndex(), "the copy carries the solid material, cutoff 0");
         check(!rewritten.translucent(), "and stays in the opaque pass");
-        check(rewritten.facing() == lonely.facing() && rewritten.mip() == lonely.mip()
-                        && rewritten.repeatU() == lonely.repeatU()
-                        && rewritten.repeatV() == lonely.repeatV(),
+        check(rewritten.facing() == leaf.facing() && rewritten.mip() == leaf.mip()
+                        && rewritten.repeatU() == leaf.repeatU()
+                        && rewritten.repeatV() == leaf.repeatV(),
                 "facing, mip and tile repeat carried over verbatim");
         for (int i = 0; i < 4; i++) {
-            check(rewritten.vertex(i) == lonely.vertex(i),
+            check(rewritten.vertex(i) == leaf.vertex(i),
                     "vertex " + i + " carried over by reference");
         }
 
         // The rewrite must reach the packed stream with every count
         // intact: re-encode and read each quad's material byte (i1 bits
-        // 16-23, the codecBitExactness layout). The water keeps cutoff
-        // index 1 + mip = 0b101; the rewritten loner and the solid are
-        // both cutoff 0 + mip = 0b100. Buckets, prefix and stream order
-        // are unchanged from the filtered encode above, because solidify
-        // moves no quad between buckets.
+        // 16-23, the codecBitExactness layout). Stream order is buckets
+        // 0..6, no translucent prefix here: the four POS_X quads in
+        // input order, then the cross in UNASSIGNED. Cutout 0.5 + mip =
+        // 0b110, solid + mip = 0b100 — the leaf is the only cutout that
+        // crossed, and solidify moves no quad between buckets.
         EncodedSectionMesh solidMesh = SectionMeshEncoder.encode(solidified);
-        checkEq(3, solidMesh.quadCount(), "solidified quad count");
-        checkEq(1, solidMesh.offsets()[QuadFacingBuckets.TRANSLUCENT_SLOT],
-                "translucent prefix survives the rewrite untouched");
-        checkEq(1, solidMesh.bucketCount(QuadFacing.POS_X.ordinal()),
-                "the rewritten loner stays in POS_X");
-        checkEq(1, solidMesh.bucketCount(QuadFacing.NEG_X.ordinal()),
-                "the solid stays in NEG_X");
+        checkEq(5, solidMesh.quadCount(), "solidified quad count");
+        checkEq(0, solidMesh.offsets()[QuadFacingBuckets.TRANSLUCENT_SLOT],
+                "no translucent quads in the eligibility list");
+        checkEq(4, solidMesh.bucketCount(QuadFacing.POS_X.ordinal()),
+                "the X-boundary quads stay in POS_X");
+        checkEq(1, solidMesh.bucketCount(QuadFacing.UNASSIGNED.ordinal()),
+                "the cross stays in UNASSIGNED");
         ByteBuffer solidGeo = solidMesh.geometry();
-        int[] expectedMaterials = {0b101, 0b100, 0b100}; // water, loner, solid
-        for (int q = 0; q < expectedMaterials.length; q++) {
+        int[] solidTags = {22, 23, 24, 25, 21}; // vine, backing, decal, leaf, cross
+        int[] expectedMaterials = {0b110, 0b100, 0b110, 0b100, 0b110};
+        for (int q = 0; q < solidTags.length; q++) {
+            checkEq(solidTags[q], solidGeo.getInt(q * 64 + 12) & 0xFFFF,
+                    "solidified stream slot " + q);
             checkEq(expectedMaterials[q], (solidGeo.getInt(q * 64 + 4) >> 16) & 0xFF,
                     "material byte of stream slot " + q);
         }
 
-        // No cutouts left: the input list itself comes back, no copy —
-        // the no-leaves common case costs one scan (the filter's own
-        // contract, shared deliberately).
+        // Every remaining cutout is ineligible: the input list itself
+        // comes back, no copy — the no-leaves common case costs one scan
+        // (the filter's own contract, shared deliberately).
         check(SectionBuildTap.solidifyCutouts(solidified) == solidified,
-                "nothing to rewrite: solidify returns the input list itself");
+                "nothing left to rewrite: solidify returns the input list itself");
+    }
+
+    /** A flower-cross diagonal in cell x4..5 z5..6: UNASSIGNED facing, cutout, u-tagged. */
+    private static TerrainQuad crossQuad(int uTag) {
+        float u = uTag / 32768.0f;
+        return new TerrainQuad(QuadFacing.UNASSIGNED, false, 2, true,
+                new TerrainVertex(4.15f, 3f, 5.15f, u, 0f, 0xFF808080, 32, 200),
+                new TerrainVertex(4.15f, 4f, 5.15f, u, 0f, 0xFF808080, 32, 200),
+                new TerrainVertex(4.85f, 4f, 5.85f, u, 1f, 0xFF808080, 32, 200),
+                new TerrainVertex(4.85f, 3f, 5.85f, u, 1f, 0xFF808080, 32, 200));
     }
 
     /** A unit X-boundary face at plane {@code x}, cell y..y+1, z..z+1, u-tagged. */
