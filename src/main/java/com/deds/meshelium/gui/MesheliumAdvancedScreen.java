@@ -15,9 +15,9 @@ import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.CycleButton;
 import net.minecraft.client.gui.components.MultiLineTextWidget;
-import net.minecraft.client.gui.components.StringWidget;
+import net.minecraft.client.gui.components.ScrollableLayout;
 import net.minecraft.client.gui.components.Tooltip;
-import net.minecraft.client.gui.layouts.FrameLayout;
+import net.minecraft.client.gui.layouts.HeaderAndFooterLayout;
 import net.minecraft.client.gui.layouts.LinearLayout;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.CommonComponents;
@@ -52,6 +52,31 @@ import java.util.function.IntSupplier;
  *
  * <p>It also has no {@code tick()}: nothing on it is live state. The two
  * status lines that do need refreshing stay on the main screen.</p>
+ *
+ * <h2>2026-08-18: header, footer, and a scrolling middle</h2>
+ * <p>The rows live in a vanilla {@link ScrollableLayout} between a title
+ * header and a Done footer ({@link HeaderAndFooterLayout}), the exact
+ * structure vanilla's RestrictionsScreen and ExperimentsScreen use
+ * (bytecode-cited; both wrap a plain layout in
+ * {@code new ScrollableLayout(minecraft, rows, layout.getContentHeight())}
+ * and re-clamp the max height in {@code repositionElements()}). The flat
+ * centered stack this replaces could not survive a large GUI scale: with
+ * ~11 rows, {@code FrameLayout.centerInRectangle} centres an over-tall
+ * stack, so the overflow went half above the window and half below, both
+ * unreachable. The owner approved scrolling for exactly this case ("if
+ * you end up making a ton more settings in advanced, just scrolling down
+ * is fine"), and more rows are coming.</p>
+ *
+ * <p>What the idiom buys, all verified against the 26.2 jar: the Done
+ * button sits in the footer, so it can never scroll away; the scroll
+ * container is an {@code AbstractContainerWidget}, so the mouse wheel and
+ * the scrollbar both work and tab/arrow navigation descends into the rows
+ * ({@code Container.setFocused} scrolls the keyboard-focused row into
+ * view); and when the rows FIT, the container is exactly as tall as they
+ * are and the screen looks like the centered stack it always was, which
+ * keeps it visually of a piece with the main Meshelium screen. Row order
+ * is unchanged; every widget keeps its width, tooltip and enabled-state
+ * logic from before the conversion.</p>
  */
 @Environment(EnvType.CLIENT)
 public class MesheliumAdvancedScreen extends Screen {
@@ -60,7 +85,9 @@ public class MesheliumAdvancedScreen extends Screen {
     private static final int BANNER_WIDTH = 340;
 
     private final Screen parent;
-    private final LinearLayout layout = LinearLayout.vertical().spacing(2);
+    private final HeaderAndFooterLayout layout = new HeaderAndFooterLayout(this);
+    /** The scrolling middle band; built in {@link #init()} (it needs minecraft). */
+    private ScrollableLayout scrollArea;
 
     /**
      * True when the backend gate means none of this can take effect. Read
@@ -80,7 +107,13 @@ public class MesheliumAdvancedScreen extends Screen {
     protected void init() {
         MesheliumConfig config = MesheliumConfig.get();
 
-        this.layout.addChild(new StringWidget(this.getTitle(), this.font));
+        this.layout.addTitleHeader(this.getTitle(), this.font);
+
+        // The rows, in the same order as ever, in their own vertical stack.
+        // Cells centre horizontally like the main screen's, so the
+        // 200-wide rows sit centred under a 340-wide banner when one shows.
+        LinearLayout rows = LinearLayout.vertical().spacing(2);
+        rows.defaultCellSetting().alignHorizontallyCenter();
 
         // The dev-override census is per screen, following the precedent on
         // the main screen: a -D flag must not raise a banner over rows the
@@ -93,7 +126,7 @@ public class MesheliumAdvancedScreen extends Screen {
                     Component.translatable("meshelium.options.dev_override"), this.font);
             banner.setMaxWidth(BANNER_WIDTH);
             banner.setCentered(true);
-            this.layout.addChild(banner, s -> s.paddingTop(2).paddingBottom(2));
+            rows.addChild(banner, s -> s.paddingTop(2).paddingBottom(2));
         }
 
         if (this.gateLocked) {
@@ -102,7 +135,7 @@ public class MesheliumAdvancedScreen extends Screen {
                             .withStyle(ChatFormatting.YELLOW), this.font);
             locked.setMaxWidth(BANNER_WIDTH);
             locked.setCentered(true);
-            this.layout.addChild(locked, s -> s.paddingTop(2).paddingBottom(2));
+            rows.addChild(locked, s -> s.paddingTop(2).paddingBottom(2));
         }
 
         // First rows, because they are the ones here that change frame rate.
@@ -119,7 +152,7 @@ public class MesheliumAdvancedScreen extends Screen {
         greedy.active = !this.gateLocked && !greedyOverridden;
         greedy.setTooltip(tip("meshelium.options.tooltip.greedy_meshing",
                 "meshelium.options.applies.rebuild"));
-        this.layout.addChild(greedy, s -> s.paddingTop(4));
+        rows.addChild(greedy, s -> s.paddingTop(4));
 
         // The two distance-gated culls. Both default Off because neither
         // win is measured yet (the owner's rule: an optimization nobody is
@@ -135,7 +168,7 @@ public class MesheliumAdvancedScreen extends Screen {
                 }, !this.gateLocked);
         plantCull.setTooltip(tip("meshelium.options.tooltip.plant_cull",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(plantCull);
+        rows.addChild(plantCull);
 
         CullDistanceSlider subPixelCull = new CullDistanceSlider(
                 "meshelium.options.detail_cull.label",
@@ -146,7 +179,38 @@ public class MesheliumAdvancedScreen extends Screen {
                 }, !this.gateLocked);
         subPixelCull.setTooltip(tip("meshelium.options.tooltip.detail_cull",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(subPixelCull);
+        rows.addChild(subPixelCull);
+
+        // The two leaf-detail tiers: BUILD-time filters, unlike the two
+        // shader culls above, so their apply semantics are their own key —
+        // new builds pick a change up immediately and the residency walker
+        // rebuilds tiered sections when the camera or a slider moves them
+        // inside a ring, budgeted, over a few seconds. applies.now would
+        // be a lie here and applies.rebuild promises a reload that raising
+        // a slider deliberately never does. Smart first, Solid directly
+        // under it: reading order is escalation order (Smart keeps the
+        // look, Solid trades it), and the pair shares one walker.
+        CullDistanceSlider smartLeaves = new CullDistanceSlider(
+                "meshelium.options.smart_leaves.label",
+                () -> MesheliumConfig.get().smartLeavesChunks,
+                chunks -> {
+                    config.smartLeavesChunks = chunks;
+                    config.save();
+                }, !this.gateLocked);
+        smartLeaves.setTooltip(tip("meshelium.options.tooltip.smart_leaves",
+                "meshelium.options.applies.new_builds"));
+        rows.addChild(smartLeaves);
+
+        CullDistanceSlider solidLeaves = new CullDistanceSlider(
+                "meshelium.options.solid_leaves.label",
+                () -> MesheliumConfig.get().solidLeavesChunks,
+                chunks -> {
+                    config.solidLeavesChunks = chunks;
+                    config.save();
+                }, !this.gateLocked);
+        solidLeaves.setTooltip(tip("meshelium.options.tooltip.solid_leaves",
+                "meshelium.options.applies.new_builds"));
+        rows.addChild(solidLeaves);
 
         // Wave-16: the quiet-time tail trim. Lives here rather than the
         // main screen for the same reason Duplicate Terrain Memory does -
@@ -161,7 +225,7 @@ public class MesheliumAdvancedScreen extends Screen {
         trim.active = !this.gateLocked;
         trim.setTooltip(tip("meshelium.options.tooltip.arena_trim",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(trim);
+        rows.addChild(trim);
 
         // Named states rather than On/Off, matching the master switch:
         // "Duplicate Terrain Memory: OFF" is unreadable, because OFF could
@@ -185,7 +249,7 @@ public class MesheliumAdvancedScreen extends Screen {
         suppress.active = !this.gateLocked;
         suppress.setTooltip(tip("meshelium.options.tooltip.suppress_vanilla",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(suppress);
+        rows.addChild(suppress);
 
         CycleButton<Boolean> stats = CycleButton.onOffBuilder(config.debugStats)
                 .create(Component.translatable("meshelium.options.debug_stats"), (b, value) -> {
@@ -196,7 +260,7 @@ public class MesheliumAdvancedScreen extends Screen {
         stats.active = !this.gateLocked && !statsOverridden;
         stats.setTooltip(tip("meshelium.options.tooltip.debug_stats",
                 "meshelium.options.applies.now"));
-        this.layout.addChild(stats);
+        rows.addChild(stats);
 
         // Active on EVERY backend, unlike the rows above: this one is about
         // the non-Vulkan case, so a gate-locked screen is exactly when a
@@ -215,10 +279,24 @@ public class MesheliumAdvancedScreen extends Screen {
         popup.setTooltip(Tooltip.create(withSemantics(
                 Component.translatable("meshelium.options.tooltip.popup"),
                 "meshelium.options.applies.restart")));
-        this.layout.addChild(popup);
+        rows.addChild(popup);
 
-        this.layout.addChild(Button.builder(CommonComponents.GUI_DONE, b -> this.onClose())
-                .width(WIDGET_WIDTH).build(), s -> s.paddingTop(6));
+        // The scrolling middle: the rows wrapped in vanilla's own scroll
+        // container (RestrictionsScreen's exact recipe, including seeding
+        // the max height with the header/footer band so the very first
+        // arrange cannot overshoot). When the rows fit, the container is
+        // exactly their height and nothing scrolls; when they do not, the
+        // wheel, the scrollbar and keyboard focus all do.
+        this.scrollArea = new ScrollableLayout(this.minecraft, rows,
+                this.layout.getContentHeight());
+        this.layout.addToContents(this.scrollArea);
+
+        // Done lives in the footer, OUTSIDE the scroll container, so no
+        // future row count can ever push the way out of the screen out of
+        // reach. That was the flat stack's failure mode at large GUI
+        // scales, and it clipped rows off both edges unreachably.
+        this.layout.addToFooter(Button.builder(CommonComponents.GUI_DONE, b -> this.onClose())
+                .width(WIDGET_WIDTH).build());
 
         this.layout.visitWidgets(this::addRenderableWidget);
         this.repositionElements();
@@ -294,10 +372,18 @@ public class MesheliumAdvancedScreen extends Screen {
         return Math.max(0.0, Math.min(1.0, f));
     }
 
+    /**
+     * RestrictionsScreen's sequence, verbatim: arrange the rows so their
+     * height is fresh, re-clamp the scroll container to the band between
+     * header and footer (getContentHeight() reads the LIVE screen height,
+     * so a resize mid-screen re-fits), then let the header-and-footer
+     * layout place everything.
+     */
     @Override
     protected void repositionElements() {
+        this.scrollArea.arrangeElements();
+        this.scrollArea.setMaxHeight(this.layout.getContentHeight());
         this.layout.arrangeElements();
-        FrameLayout.centerInRectangle(this.layout, this.getRectangle());
     }
 
     @Override

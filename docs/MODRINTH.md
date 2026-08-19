@@ -107,7 +107,12 @@ Plants Beyond** and **Cull Sub-Pixel Detail Beyond** are two distance
 sliders that skip drawing things too small to see at range, from grass
 tufts down to any face smaller than one pixel on your screen. Both ship
 Off and apply instantly, so drag until you notice the picture change and
-back off a step.
+back off a step. **Smart Leaves Beyond** skips the leaf faces buried
+inside tree canopies past a distance, keeping the see-through look; it
+ships on at 16 chunks because the buried faces cannot be seen from
+outside, trees regain full detail as you approach, and 0 turns it off.
+**Solid Leaves Beyond** goes further: past your chosen distance leaves
+build fully solid, the way Fast graphics draws them; it ships Off.
 
 Everything applies as soon as you change it, apart from the backend popup, which
 waits for the next launch. Switching Meshelium off and on, changing Duplicate

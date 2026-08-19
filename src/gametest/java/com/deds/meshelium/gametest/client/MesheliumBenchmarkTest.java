@@ -196,6 +196,19 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
     /** The resolved deep-ocean column, for the knob block. */
     private static volatile int oceanCameraX;
     private static volatile int oceanCameraZ;
+
+    /**
+     * Forest scenes: the camera hangs over tree canopy at y=105 with the
+     * scenic yaw and pitch of {@link #CAMERA_TP} - trees read fine from
+     * that height for a census. Resolved at scene setup exactly like the
+     * ocean pose and for the same reason: where the nearest forest is
+     * belongs to the seed (see {@link #resolveForestCamera}), and the
+     * resolved coordinates go into the report's knob block.
+     */
+    private static volatile String forestCameraTp;
+    /** The resolved forest column, for the knob block. */
+    private static volatile int forestCameraX;
+    private static volatile int forestCameraZ;
     private static final int WARMUP_FRAMES = 120;
     private static final int MEASURED_FRAMES = 600;
     private static final int READY_TIMEOUT_TICKS = 1200;
@@ -246,7 +259,16 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             // plains rivers cannot stand in for. See oceanCameraTp for why
             // the pose is resolved at runtime rather than hard-coded.
             entry("ocean-rd32", 32),
-            entry("ocean-rd64", 64));
+            entry("ocean-rd64", 64),
+            // Forest canopy, the cutout extreme: leaves are the dominant
+            // Fancy-vs-Fast difference, and under Fancy every
+            // leaf-against-leaf boundary emits both interior faces.
+            // Exists to carry the cutout interior-pair census that prices
+            // the "fast graphics past a distance" slider. Like the ocean
+            // pose, the spot belongs to the seed and is resolved at
+            // runtime (see forestCameraTp).
+            entry("forest-rd32", 32),
+            entry("forest-rd64", 64));
 
     /**
      * Waits for a capture to fill, sweeping the camera if the spin knob is
@@ -324,6 +346,13 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             }
             return oceanCameraTp;
         }
+        if (scene.startsWith("forest-")) {
+            if (forestCameraTp == null) {
+                throw new AssertionError("forest camera requested before the "
+                        + "forest lookup ran");
+            }
+            return forestCameraTp;
+        }
         return CAMERA_TP;
     }
 
@@ -351,6 +380,33 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         oceanCameraZ = found.getZ();
         oceanCameraTp = "tp @p " + (oceanCameraX + 0.5) + " 105.0 "
                 + (oceanCameraZ + 0.5) + " 45 25";
+    }
+
+    /**
+     * Finds the nearest tree-heavy biome to world spawn and pins the
+     * forest pose over it: {@link #resolveOceanCamera}'s protocol with a
+     * canopy predicate. Any of forest, dark_forest or jungle will do -
+     * the census wants leaf-against-leaf boundaries, not one species - so
+     * a single query takes the nearest of the three. No match in range is
+     * a hard failure for the same reason as the ocean's: benching plains
+     * under a "forest-" label would be worse than no number at all.
+     */
+    private static void resolveForestCamera(TestServerContext server) {
+        BlockPos found = server.computeOnServer(mc -> {
+            var level = mc.overworld();
+            var hit = level.findClosestBiome3d(biome -> biome.is(Biomes.FOREST)
+                            || biome.is(Biomes.DARK_FOREST) || biome.is(Biomes.JUNGLE),
+                    level.getRespawnData().pos(), 6400, 32, 64);
+            return hit == null ? null : hit.getFirst();
+        });
+        if (found == null) {
+            throw new AssertionError("no forest/dark_forest/jungle within 6400 blocks "
+                    + "of spawn for seed " + SEED + " - refusing to bench the wrong scene");
+        }
+        forestCameraX = found.getX();
+        forestCameraZ = found.getZ();
+        forestCameraTp = "tp @p " + (forestCameraX + 0.5) + " 105.0 "
+                + (forestCameraZ + 0.5) + " 45 25";
     }
 
     @Override
@@ -446,11 +502,15 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             // worldgen-sized budget.
             settleWorldgen(context);
 
-            // Ocean scenes resolve their pose before any command references
-            // it; the settles around the tp below then absorb the worldgen
-            // the far teleport triggers, exactly as they do for every scene.
+            // Ocean and forest scenes resolve their pose before any command
+            // references it; the settles around the tp below then absorb the
+            // worldgen the far teleport triggers, exactly as they do for
+            // every scene.
             if (scene.startsWith("ocean-")) {
                 resolveOceanCamera(server);
+            }
+            if (scene.startsWith("forest-")) {
+                resolveForestCamera(server);
             }
 
             // Deterministic freezes (the parity protocol's set) + the
@@ -677,6 +737,12 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             knobs.put("oceanCameraX", oceanCameraX);
             knobs.put("oceanCameraZ", oceanCameraZ);
         }
+        if (scene.startsWith("forest-")) {
+            // Same contract as the ocean's: the forest column the run
+            // actually measured over (see forestCameraTp).
+            knobs.put("forestCameraX", forestCameraX);
+            knobs.put("forestCameraZ", forestCameraZ);
+        }
         root.put("knobs", knobs);
         // WHAT THE BASELINE ACTUALLY IS. Every "plain Minecraft" figure this
         // project published before 1.1 was vanilla running on Minecraft's
@@ -858,6 +924,12 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
         // without this column is the 854x480 mistake with a new axis.
         c.put("phaseBCpuSkipFrames", TerrainDrawer.phaseBCpuSkipFrames());
         c.put("tapCompiles", MesheliumCpuStages.tapCompiles());
+        // The incremental snapshot's health: publishes must dwarf
+        // fullRebuilds on any steady leg, or the delta log is not doing
+        // its job and the frame is quietly paying the old full walk.
+        c.put("snapshotPublishes", TerrainResidency.snapshotPublishes());
+        c.put("snapshotFullRebuilds", TerrainResidency.snapshotFullRebuilds());
+        c.put("snapshotLogRecords", TerrainResidency.snapshotLogRecords());
         c.put("translucentFrames", TerrainDrawer.translucentFrames());
         c.put("gpuTimerFramesRead", MesheliumGpuTimers.framesRead());
         c.put("gpuTimerNotReady", MesheliumGpuTimers.framesNotReadyCount());

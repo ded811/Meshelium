@@ -13,6 +13,7 @@ import com.deds.meshelium.fabric.mixin.FrustumAccessor;
 import com.deds.meshelium.fabric.mixin.RenderPassAccessor;
 import com.deds.meshelium.fabric.mixin.VulkanRenderPassAccessor;
 import com.deds.meshelium.terrain.QuadFacing;
+import com.deds.meshelium.terrain.host.SectionBuildTap;
 import com.deds.meshelium.terrain.host.TerrainResidency;
 
 import com.mojang.blaze3d.buffers.GpuBuffer;
@@ -828,7 +829,7 @@ public final class TerrainDrawer {
     /** Region ids whose boxes rastered this frame (list slot >= 0). */
     private static final it.unimi.dsi.fastutil.ints.IntOpenHashSet occRasteredRegions =
             new it.unimi.dsi.fastutil.ints.IntOpenHashSet();
-    /** Section coords → snapshot index, translucent-prefix slot owners only. */
+    /** Section coords → snapshot slot, translucent-prefix slot owners only. */
     private static final Long2IntOpenHashMap translucentSlotByPos = new Long2IntOpenHashMap();
     static {
         translucentSlotByPos.defaultReturnValue(-1);
@@ -837,9 +838,9 @@ public final class TerrainDrawer {
     private static float[] transOrigins = new float[3 * 512];
     private static int[] transMeta = new int[3 * 512];
     // Wave-11 retained-translucent pre-pass scratch (render thread only).
-    /** Distance-sorted keys {d² bits << 32 | snapshot index}. */
+    /** Distance-sorted keys {d² bits << 32 | snapshot slot}. */
     private static long[] retTransKeys = new long[64];
-    /** Snapshot indices already drawn by the pre-pass (visible loop skips). */
+    /** Snapshot slots already drawn by the pre-pass (visible loop skips). */
     private static boolean[] transDrawnMark = new boolean[512];
     /** The marked indices, for O(marked) clearing after the frame. */
     private static final it.unimi.dsi.fastutil.ints.IntArrayList transDrawnList =
@@ -1569,6 +1570,19 @@ public final class TerrainDrawer {
     public static void beginFrame(CameraRenderState cameraRenderState) {
         camera = cameraRenderState;
         frameSerial++;
+        // Smart/Solid Leaves Beyond: publish the camera section where the
+        // build workers and the residency walker can read it — the CPU twin of
+        // the CameraChunk ivec4 uploadScene writes per frame from the same
+        // blockPos >> 4. The volatile lives on the HOST side
+        // (SectionBuildTap) because neither the tap nor TerrainResidency
+        // may reference this LWJGL-importing class; the drawer already
+        // reaches into that package freely.
+        if (cameraRenderState != null && cameraRenderState.initialized
+                && cameraRenderState.blockPos != null) {
+            SectionBuildTap.publishCameraSection(
+                    cameraRenderState.blockPos.getX() >> 4,
+                    cameraRenderState.blockPos.getZ() >> 4);
+        }
     }
 
     /**
@@ -2496,15 +2510,20 @@ public final class TerrainDrawer {
         if (regionMasks.length < regionCount * 8) {
             regionMasks = new int[Math.max(regionCount * 8, regionMasks.length * 2)];
         }
-        // Wave-7: coords → snapshot index for every section with a
+        // Wave-7: coords → snapshot slot for every section with a
         // translucent prefix that OWNS its region slot ([18] >= 0). A
         // slotless resident (its slot stolen by a newer mesh in the
         // promotion-lag window) is EXCLUDED so a section can never
         // double-blend — the slot owner is also what the GPU records
         // already point at, so opaque and translucent stay consistent.
+        // Rebuilt fully on EVERY snapshot adoption (the incremental
+        // design's v1 choice: atomic-with-the-swap by construction, so a
+        // stale slot value can never dereference a reused slot — the ABA
+        // rule, dossier-lifecycle §4), from the NEW buffer's live slots;
+        // tombstoned slots fail both filter tests ([4] == 0, [18] == −2).
         translucentSlotByPos.clear();
         int[] d = snap.data();
-        int n = snap.sectionCount();
+        int n = snap.maxSlot() + 1;
         for (int s = 0; s < n; s++) {
             int o = s * TerrainResidency.DrawSnapshot.STRIDE;
             if (d[o + 4] > 0 && d[o + 18] >= 0) { // bucketStarts[0] == translucent count
@@ -2532,12 +2551,19 @@ public final class TerrainDrawer {
         double camZ = cam.pos.z;
 
         int[] d = snap.data();
-        int n = snap.sectionCount();
+        int n = snap.maxSlot() + 1; // slot-indexed since the incremental snapshot
         int runCountTotal = 0;
         int visibleSections = 0;
 
         for (int s = 0; s < n; s++) {
             int o = s * TerrainResidency.DrawSnapshot.STRIDE;
+            if (d[o + 18] == -2) {
+                // Tombstoned slot. This path never read [18] before, but
+                // the skip must land BEFORE the AABB + frustum work below
+                // or dead slots cost 100x their one-branch price — and a
+                // zeroed entry's origin box could even pass the frustum.
+                continue;
+            }
             int sx = d[o];
             int sy = d[o + 1];
             int sz = d[o + 2];
@@ -2863,7 +2889,7 @@ public final class TerrainDrawer {
             TranslucentPhaseProbe.prologueRest(probeT0 - probeViews);
         }
         int retainedTransDrawn = 0;
-        int snapCount = snap.sectionCount();
+        int snapCount = snap.maxSlot() + 1; // slot-indexed; the filter below skips tombstones
         if (transDrawnMark.length < snapCount) {
             transDrawnMark = new boolean[Math.max(snapCount, transDrawnMark.length * 2)];
         }
@@ -2871,7 +2897,7 @@ public final class TerrainDrawer {
         for (int s = 0; s < snapCount; s++) {
             int o = s * TerrainResidency.DrawSnapshot.STRIDE;
             if (d[o + 19] == 0 || d[o + 4] <= 0 || d[o + 18] < 0) {
-                continue; // live, no translucent prefix, or slotless
+                continue; // live, no translucent prefix, slotless, or a dead slot
             }
             double bx = d[o] << 4;
             double by = d[o + 1] << 4;

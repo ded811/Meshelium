@@ -24,6 +24,7 @@ import com.deds.meshelium.terrain.TerrainQuad;
 import com.deds.meshelium.terrain.TerrainVertex;
 import com.deds.meshelium.terrain.TerrainVertexCodec;
 import com.deds.meshelium.terrain.TranslucentPrefix;
+import com.deds.meshelium.terrain.host.SectionBuildTap;
 
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
@@ -57,6 +58,7 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
         idProviderBehaviour();
         greedyMergeTileAxes();
         greedyMergeCornerShading();
+        leafTierFilters();
         resetCoversEveryField();
         arenaBasics();
         arenaPendingRelease();
@@ -292,6 +294,152 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
 
     private static TerrainVertex floorVertex(int x, int z, float u, float v) {
         return new TerrainVertex(x, 1.0f, z, u, v, 0xFF808080, 32, 200);
+    }
+
+    // ==================================================================
+    // Smart/Solid Leaves Beyond: the pair filter and the solidify rewrite
+    // ==================================================================
+
+    /**
+     * The census matcher turned removal filter
+     * ({@code SectionBuildTap.filterCutoutInteriorPairs}): a POS and a NEG
+     * cutout face on the same unit boundary both go; everything the
+     * matcher excludes survives, with each exclusion carried by a quad
+     * built to fail EXACTLY one test. The translucent probe sits on the
+     * very boundary the pair occupies (only its translucency saves it),
+     * the solid face is coplanar-opposite the lone cutout (only its
+     * cutoff-0 material saves that pairing), and the lone cutout's plane
+     * is one block over from the pair's (only the plane keeps it out of
+     * their bucket).
+     *
+     * <p>The bookkeeping half re-encodes the SURVIVORS and checks every
+     * count the GPU walk consumes — this is the "filter before encode"
+     * seam's pin: the encoder derives buckets, prefix and starts from the
+     * list it is handed, so a filtered list yields internally consistent
+     * metadata by construction, and this asserts it stayed that way.</p>
+     *
+     * <p>The Solid tier's half then runs the SAME survivors through
+     * {@code SectionBuildTap.solidifyCutouts} — filter strictly first,
+     * the tap's order, because the pair matcher keys on the cutout
+     * material the rewrite erases — and pins the rewrite all the way
+     * into the packed stream's material bits.</p>
+     */
+    private static void leafTierFilters() {
+        TerrainQuad water = xFace(QuadFacing.POS_X, 1, 3, 5, true, 1, 201);  // translucent
+        TerrainQuad interiorPos = xFace(QuadFacing.POS_X, 1, 3, 5, false, 2, 1);
+        TerrainQuad solid = xFace(QuadFacing.NEG_X, 2, 3, 5, false, 0, 7);   // cutoff 0
+        TerrainQuad interiorNeg = xFace(QuadFacing.NEG_X, 1, 3, 5, false, 2, 2);
+        TerrainQuad lonely = xFace(QuadFacing.POS_X, 2, 3, 5, false, 2, 3);  // no partner
+
+        List<TerrainQuad> in = List.of(water, interiorPos, solid, interiorNeg, lonely);
+        List<TerrainQuad> out = SectionBuildTap.filterCutoutInteriorPairs(in);
+        checkEq(3, out.size(), "exactly the interior pair is removed");
+        check(out.get(0) == water && out.get(1) == solid && out.get(2) == lonely,
+                "survivors keep input order: the translucent probe, the solid, the lone cutout");
+        check(SectionBuildTap.filterCutoutInteriorPairs(out) == out,
+                "nothing left to pair: the filter returns the input list itself");
+
+        // Counts and prefix bookkeeping stay consistent because they are
+        // DERIVED from the filtered list — assert the derivation.
+        EncodedSectionMesh mesh = SectionMeshEncoder.encode(out);
+        checkEq(3, mesh.quadCount(), "filtered quad count");
+        checkEq(3 * 64, mesh.geometryBytes(), "filtered geometry bytes");
+        checkEq(1, mesh.offsets()[QuadFacingBuckets.TRANSLUCENT_SLOT],
+                "translucent prefix count survives the filter untouched");
+        checkEq(1, mesh.bucketCount(QuadFacing.POS_X.ordinal()), "POS_X bucket holds the loner");
+        checkEq(1, mesh.bucketCount(QuadFacing.NEG_X.ordinal()), "NEG_X bucket holds the solid");
+        for (QuadFacing f : new QuadFacing[] {QuadFacing.POS_Y, QuadFacing.POS_Z,
+                QuadFacing.NEG_Y, QuadFacing.NEG_Z, QuadFacing.UNASSIGNED}) {
+            checkEq(0, mesh.bucketCount(f.ordinal()), "bucket " + f + " is empty");
+        }
+        // Stream order (prefix, then buckets 0..6) via the u-tags, the
+        // sectionEncoderBucketing technique: water, loner, solid.
+        int[] expectedTags = {201, 3, 7};
+        ByteBuffer geo = mesh.geometry();
+        for (int q = 0; q < expectedTags.length; q++) {
+            checkEq(expectedTags[q], geo.getInt(q * 64 + 12) & 0xFFFF,
+                    "filtered stream slot " + q);
+        }
+
+        // min(pos, neg) per boundary: two POS against one NEG remove ONE
+        // pair, first-unmatched-first, and the odd face out survives.
+        TerrainQuad dupPosA = xFace(QuadFacing.POS_X, 1, 8, 5, false, 2, 11);
+        TerrainQuad dupPosB = xFace(QuadFacing.POS_X, 1, 8, 5, false, 2, 12);
+        TerrainQuad dupNeg = xFace(QuadFacing.NEG_X, 1, 8, 5, false, 2, 13);
+        List<TerrainQuad> stacked = SectionBuildTap.filterCutoutInteriorPairs(
+                List.of(dupPosA, dupPosB, dupNeg));
+        checkEq(1, stacked.size(), "min(2 POS, 1 NEG) = one pair removed");
+        check(stacked.get(0) == dupPosB, "the earliest unmatched POS paired off first");
+
+        // A pair with nothing else collapses to the empty list. The pure
+        // filter is allowed to say so; it is the TAP's job to refuse the
+        // empty result and keep such a section Fancy (an empty encode is
+        // a deleted section, which the walker could never restore).
+        check(SectionBuildTap.filterCutoutInteriorPairs(
+                        List.of(interiorPos, interiorNeg)).isEmpty(),
+                "a bare pair filters to empty; the tap must fall back to the unfiltered list");
+
+        // ---- The Solid tier, on the SAME survivors (solid implies Smart,
+        // and the order is load-bearing: the pair is already gone, so the
+        // rewrite can only ever see faces a viewer could reach). The lone
+        // cutout comes out cutoff 0; the translucent probe and the
+        // already-solid face come through as the same objects.
+        List<TerrainQuad> solidified = SectionBuildTap.solidifyCutouts(out);
+        check(solidified != out, "a surviving cutout forces a fresh list");
+        checkEq(3, solidified.size(), "solidify never adds or removes");
+        check(solidified.get(0) == water, "the translucent quad is untouched, same object");
+        check(solidified.get(1) == solid, "an already-solid quad is untouched, same object");
+        TerrainQuad rewritten = solidified.get(2);
+        check(rewritten != lonely, "the cutout was rewritten to a copy");
+        checkEq(0, rewritten.alphaCutoffIndex(), "the copy carries the solid material, cutoff 0");
+        check(!rewritten.translucent(), "and stays in the opaque pass");
+        check(rewritten.facing() == lonely.facing() && rewritten.mip() == lonely.mip()
+                        && rewritten.repeatU() == lonely.repeatU()
+                        && rewritten.repeatV() == lonely.repeatV(),
+                "facing, mip and tile repeat carried over verbatim");
+        for (int i = 0; i < 4; i++) {
+            check(rewritten.vertex(i) == lonely.vertex(i),
+                    "vertex " + i + " carried over by reference");
+        }
+
+        // The rewrite must reach the packed stream with every count
+        // intact: re-encode and read each quad's material byte (i1 bits
+        // 16-23, the codecBitExactness layout). The water keeps cutoff
+        // index 1 + mip = 0b101; the rewritten loner and the solid are
+        // both cutoff 0 + mip = 0b100. Buckets, prefix and stream order
+        // are unchanged from the filtered encode above, because solidify
+        // moves no quad between buckets.
+        EncodedSectionMesh solidMesh = SectionMeshEncoder.encode(solidified);
+        checkEq(3, solidMesh.quadCount(), "solidified quad count");
+        checkEq(1, solidMesh.offsets()[QuadFacingBuckets.TRANSLUCENT_SLOT],
+                "translucent prefix survives the rewrite untouched");
+        checkEq(1, solidMesh.bucketCount(QuadFacing.POS_X.ordinal()),
+                "the rewritten loner stays in POS_X");
+        checkEq(1, solidMesh.bucketCount(QuadFacing.NEG_X.ordinal()),
+                "the solid stays in NEG_X");
+        ByteBuffer solidGeo = solidMesh.geometry();
+        int[] expectedMaterials = {0b101, 0b100, 0b100}; // water, loner, solid
+        for (int q = 0; q < expectedMaterials.length; q++) {
+            checkEq(expectedMaterials[q], (solidGeo.getInt(q * 64 + 4) >> 16) & 0xFF,
+                    "material byte of stream slot " + q);
+        }
+
+        // No cutouts left: the input list itself comes back, no copy —
+        // the no-leaves common case costs one scan (the filter's own
+        // contract, shared deliberately).
+        check(SectionBuildTap.solidifyCutouts(solidified) == solidified,
+                "nothing to rewrite: solidify returns the input list itself");
+    }
+
+    /** A unit X-boundary face at plane {@code x}, cell y..y+1, z..z+1, u-tagged. */
+    private static TerrainQuad xFace(QuadFacing facing, float x, int y, int z,
+            boolean translucent, int cutoff, int uTag) {
+        float u = uTag / 32768.0f;
+        return new TerrainQuad(facing, translucent, cutoff, true,
+                new TerrainVertex(x, y, z, u, 0f, 0xFF808080, 32, 200),
+                new TerrainVertex(x, y + 1, z, u, 0f, 0xFF808080, 32, 200),
+                new TerrainVertex(x, y + 1, z + 1, u, 1f, 0xFF808080, 32, 200),
+                new TerrainVertex(x, y, z + 1, u, 1f, 0xFF808080, 32, 200));
     }
 
     // ==================================================================

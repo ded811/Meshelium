@@ -14,6 +14,9 @@ import com.deds.meshelium.terrain.TerrainVertexCodec;
 
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+
 import java.util.ArrayDeque;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
@@ -146,7 +149,7 @@ public final class TerrainResidency {
     private static final Object LOCK = new Object();
 
     private record PendingUpload(int sx, int sy, int sz, EncodedSectionMesh encoded,
-            TranslucentState translucent) {}
+            TranslucentState translucent, byte builtTier) {}
 
     /**
      * Wave-7 CPU source of truth for one section's translucent PREFIX:
@@ -177,6 +180,15 @@ public final class TerrainResidency {
         final long regionKey;
         final int posKey;
         boolean ownsSlot = true;
+        /**
+         * Stable index into the slot-indexed draw-snapshot buffers: taken
+         * from the free-list at the SINGLE construction site, freed at the
+         * five death sites (release-free, retained supersede, dig-out,
+         * eviction, dispose). Per arena COPY, not per position — the
+         * handover window legitimately holds two slots for one section
+         * (the old retained copy and its freshly uploaded successor).
+         */
+        final int snapshotSlot;
         // Wave-4 additive draw data (read-only after construction): section
         // coords + the 7 facing-bucket [relative start, count] pairs from
         // the encoder — what the CPU draw-list builder needs, so the drawer
@@ -186,6 +198,22 @@ public final class TerrainResidency {
         final int[] bucketCounts;
         /** Wave-7 translucent prefix state; null for fully-opaque sections. */
         final TranslucentState translucent;
+        /**
+         * Smart/Solid Leaves Beyond: the leaf-detail tier this arena copy
+         * was built at ({@code SectionBuildTap.TIER_NONE}/{@code
+         * TIER_SMART}/{@code TIER_SOLID} — SMART had its cutout interior
+         * pairs filtered out, SOLID additionally had its surviving
+         * cutouts rewritten opaque; the build tap stamps the tier that
+         * actually CHANGED the list). The pump's ring-crossing walker
+         * re-dirties a section through vanilla once its distance would
+         * only earn a LOWER tier than this, and RESETS the field to
+         * TIER_NONE as it collects, so a section is re-dirtied exactly
+         * once per tiered build however long its replacement takes to
+         * arrive. Mutable under LOCK like {@link #ownsSlot}; deliberately
+         * NOT part of the snapshot entry — nothing drawable changes when
+         * it moves.
+         */
+        byte builtTier;
         /**
          * Wave-11: 0 = live (vanilla's mesh still holds this copy);
          * non-zero = the monotonic-clock millisecond this entry was
@@ -199,7 +227,7 @@ public final class TerrainResidency {
 
         Resident(int arenaAddr, int quadCount, long regionKey, int posKey,
                 int sx, int sy, int sz, int[] bucketStarts, int[] bucketCounts,
-                TranslucentState translucent) {
+                TranslucentState translucent, int snapshotSlot) {
             this.arenaAddr = arenaAddr;
             this.quadCount = quadCount;
             this.regionKey = regionKey;
@@ -210,6 +238,7 @@ public final class TerrainResidency {
             this.bucketStarts = bucketStarts;
             this.bucketCounts = bucketCounts;
             this.translucent = translucent;
+            this.snapshotSlot = snapshotSlot;
         }
     }
 
@@ -274,6 +303,76 @@ public final class TerrainResidency {
      * one lock + one long compare.
      */
     private static long drawEpoch;
+
+    // ------------------------------------------------------------------
+    // Incremental draw snapshot (2026-08-18; design + binding decisions in
+    // docs/DRAW-SNAPSHOT-INCREMENTAL.md, evidence in the three
+    // SNAPSHOT-DOSSIER files). All state under LOCK.
+    // ------------------------------------------------------------------
+
+    /** One side of the ping-pong pair {@link #drawSnapshot} publishes. */
+    private static final class SnapshotBuffer {
+        /** Packed entries, SLOT-indexed ({@code snapshotSlot * STRIDE}). */
+        int[] data = new int[0];
+        /** Absolute change-log index this buffer's contents reflect. */
+        long appliedLogIndex;
+        /**
+         * Route this buffer's next turn as back buffer through the full
+         * rebuild (fresh buffer, log overflow, free-list growth, dispose,
+         * pinned regrow, an invariant break). The old full walk IS the
+         * fallback, so the worst case equals the pre-incremental cost.
+         */
+        boolean needsFullRebuild = true;
+    }
+
+    /**
+     * Slot capacity at standup: an rd 64 spin peaks ~27k concurrent
+     * entries and free-list reuse pins the high-water mark at the PEAK,
+     * not the churn, so 32k fits with headroom at 2.6 MB per buffer.
+     * Exhaustion doubles through the full-rebuild fallback — rare by
+     * construction (world load, render-distance raise); the rd 120 +
+     * retention ceiling is ~112k entries (dossier-lifecycle §3).
+     */
+    private static final int SNAPSHOT_SLOTS_INITIAL = 1 << 15;
+    /** Change-log ring at standup; grows ×2 up to {@link #SNAPSHOT_LOG_MAX}. */
+    private static final int SNAPSHOT_LOG_INITIAL = 1 << 12;
+    /**
+     * Past this the log stops growing and overflow routes through the
+     * full rebuild. Sized so turning-frame streaming (order 10² records
+     * per pump, two publishes of retention) never comes close; only
+     * release storms overflow — releaseAllBuffers frees every section in
+     * ONE frame — and those are exactly the designed fallback moments.
+     */
+    private static final int SNAPSHOT_LOG_MAX = 1 << 16;
+
+    /** Slot capacity of both buffers and the owner index. */
+    private static int snapshotSlotCap = SNAPSHOT_SLOTS_INITIAL;
+    /** Slots ever assigned this era; the published {@code maxSlot} + 1. */
+    private static int snapshotSlotHighWater;
+    /** Slot → its live Resident (null = free/dead) — the WRITE-apply join. */
+    private static Resident[] snapshotSlotOwner = new Resident[SNAPSHOT_SLOTS_INITIAL];
+    /**
+     * Freed slots awaiting reuse. Unlike arena addresses, slot reuse needs
+     * NO fence delay: both buffers replay the tombstone-then-rewrite
+     * records in append order (dossier-lifecycle §4).
+     */
+    private static final IntArrayList snapshotFreeSlots = new IntArrayList();
+    /**
+     * The change log: one int per record — WRITE(slot) travels as the
+     * slot itself, TOMBSTONE(slot) as its complement (always negative).
+     * A ring over ABSOLUTE indices; entries older than both buffers'
+     * {@code appliedLogIndex} are dead and get overwritten.
+     */
+    private static int[] snapshotLog = new int[SNAPSHOT_LOG_INITIAL];
+    /** Absolute index one past the newest record (monotonic across worlds). */
+    private static long snapshotLogEnd;
+    private static SnapshotBuffer snapshotFront = new SnapshotBuffer();
+    private static SnapshotBuffer snapshotBack = new SnapshotBuffer();
+    // Incremental-snapshot counters (under LOCK) — the bench's proof that
+    // delta publishes dominate and the fallback stays rare.
+    private static long snapshotPublishes;
+    private static long snapshotFullRebuilds;
+    private static long snapshotLogRecords;
 
     // Wave-11 retention state (all under LOCK).
     /** Quads held by RETAINED entries (excluded from {@link #quadsResident}). */
@@ -488,6 +587,11 @@ public final class TerrainResidency {
         // itself (the hint compares identities; no onWorldPinned needed).
         com.deds.meshelium.MesheliumScaling.growPinned(target);
         pinnedGrows++;
+        // Full-rebuild-class ERA event (S14, mutations dossier): the grow
+        // dropped the drawer's snapshot-sized resources AND its cached
+        // snapshot/epoch (TerrainDrawer.onPinnedRegrow), so the next
+        // consumer arrives with no prior state — republish from the maps.
+        forceSnapshotRebuildLocked();
         drawEpoch++;
     }
 
@@ -704,7 +808,7 @@ public final class TerrainResidency {
     // ------------------------------------------------------------------
 
     /**
-     * Immutable per-frame view of every resident section, flattened for the
+     * Per-frame view of every resident section, flattened for the
      * render thread's draw-list builder: {@link #STRIDE} ints per section —
      * {@code [sx, sy, sz, arenaQuadAddr, bucketStartRel[0..6],
      * bucketCount[0..6], globalSectionIndex]} (the last is wave 7's, see
@@ -713,6 +817,17 @@ public final class TerrainResidency {
      * RELATIVE to the section's allocation; absolute arena quad index =
      * {@code arenaQuadAddr + startRel}. The translucent prefix is excluded
      * by construction ({@code startRel[0] == translucentCount}).
+     *
+     * <p><b>Incremental rework (2026-08-18):</b> {@code data} is
+     * SLOT-indexed — an entry lives at {@code snapshotSlot * STRIDE} for
+     * its whole lifetime — and dead slots are TOMBSTONED: all 20 ints
+     * zero, then {@code [18]} = −2 (distinct from the live-but-slotless
+     * −1). Consumers iterate slots {@code 0..maxSlot} and skip tombstones;
+     * {@code liveSlotCount} (returned by {@link #sectionCount()}) carries
+     * the emptiness test. The backing array belongs to a persistent
+     * ping-pong pair: it is REWRITTEN two publishes later, so a holder
+     * must adopt every fresh {@link #drawSnapshot} return — the drawer,
+     * the sole consumer, does (docs/SNAPSHOT-DOSSIER-ALIASING.md).</p>
      *
      * <p>{@code arenaBackingHandle} is the {@code ArenaBacking} opaque
      * handle (the terrain VkBuffer on the Vulkan path), captured under the
@@ -743,8 +858,8 @@ public final class TerrainResidency {
      * takes its own array because the arena keeps mutating its list under
      * the residency lock while the drawer reads outside it.
      */
-    public record DrawSnapshot(long epoch, int sectionCount, int[] data, long arenaBackingHandle,
-            long[] arenaBlockHandles,
+    public record DrawSnapshot(long epoch, int liveSlotCount, int maxSlot, int[] data,
+            long arenaBackingHandle, long[] arenaBlockHandles,
             int regionCount, int[] regionData, long sectionRecordsHandle, int[] retainedMasks) {
 
 
@@ -754,8 +869,9 @@ public final class TerrainResidency {
          * globalSectionIndex, retainedFlag]}. Wave-7 additive: {@code [18]
          * globalSectionIndex} = {@code regionId*256 + compactedSlot} when
          * this resident OWNS its region slot (the stamp-buffer index the
-         * translucent occlusion gate uses), or −1 (slot stolen by a newer
-         * mesh / region gone) — slotless residents are excluded from the
+         * translucent occlusion gate uses), −1 (slot stolen by a newer
+         * mesh / region gone), or −2 (TOMBSTONE — the slot is dead and the
+         * whole entry zeroed) — slotless residents are excluded from the
          * translucent draw so the promotion-lag window can never
          * double-blend one section (the opaque paths draw from the GPU
          * records, which already point at the slot owner). The translucent
@@ -792,47 +908,83 @@ public final class TerrainResidency {
          * occlusion region-raster box; see {@code RegionStore.snapshotRegions}).
          */
         public static final int REGION_STRIDE = 7;
+
+        /**
+         * Live (non-tombstoned) entries — the emptiness test, kept under
+         * its wave-4 name so every {@code == 0} early-out reads unchanged.
+         * NOT the iteration bound: iterate slots {@code 0..maxSlot} and
+         * skip tombstones ({@code [18]} == −2 / the zeroed shape).
+         */
+        public int sectionCount() {
+            return liveSlotCount;
+        }
     }
 
     /**
      * Render-thread accessor for the drawer. Returns {@code null} when the
      * resident set has not changed since {@code knownEpoch} (keep the
-     * cached snapshot); otherwise a freshly built snapshot. Stale-by-a-
-     * -frame draws are safe by the same fence discipline the pump uses: a
-     * released range cannot be reallocated (and new bytes copied over it)
-     * until {@code FREE_FRAME_LAG} pumps later.
+     * cached snapshot); otherwise publishes and returns a fresh snapshot.
+     * Stale-by-a-frame draws are safe by the same fence discipline the
+     * pump uses: a released range cannot be reallocated (and new bytes
+     * copied over it) until {@code FREE_FRAME_LAG} pumps later.
+     *
+     * <p><b>The incremental publish (2026-08-18):</b> two persistent
+     * slot-indexed buffers ping-pong instead of a fresh {@code int[n*20]}
+     * walk per epoch bump (that walk — ~2 MB of garbage per bump under
+     * chunk streaming — was the #1 real-play smoothness cost, design
+     * note). The back buffer catches up by applying only the change-log
+     * records it has not seen: WRITE recomputes the full 20-int entry
+     * from the live maps through the same {@link #writeSnapshotEntryLocked}
+     * as ever ([0..17] are immutable post-admission, so recompute-all
+     * covers every mutation kind); TOMBSTONE zeroes the slot and sets
+     * {@code [18]} = −2. Handles and the (small) region snapshots are
+     * then re-captured under the SAME lock hold as always — which is what
+     * keeps the handle-only mutation sites (arena grow/append/trim,
+     * attach) record-free — and the pair swaps. Fallback events (log
+     * overflow, free-list growth, dispose, pinned regrow, an invariant
+     * break) mark BOTH buffers for a full rebuild from the maps, so the
+     * worst case equals the old behavior. The caller may hold a returned
+     * snapshot across frames: its backing array is rewritten only when
+     * the same buffer next serves as back buffer, two swaps later, and
+     * the drawer adopts every non-null return before then (single-caller
+     * discipline, docs/SNAPSHOT-DOSSIER-ALIASING.md).</p>
      */
     public static DrawSnapshot drawSnapshot(long knownEpoch) {
         synchronized (LOCK) {
             if (drawEpoch == knownEpoch) {
                 return null;
             }
-            int n = resident.size() + retained.size();
-            int[] data = new int[n * DrawSnapshot.STRIDE];
-            int o = 0;
-            for (Resident r : resident.values()) {
-                o = writeSnapshotEntryLocked(data, o, r, 0);
-            }
-            // Wave-11: retained entries ride the same flat view — the
-            // occlusion and cpuCull paths draw them with zero extra code;
-            // [19] flags them for the translucent pre-pass and the mask
-            // path reads retainedMasks below.
-            for (Resident r : retained.values()) {
-                o = writeSnapshotEntryLocked(data, o, r, 1);
+            SnapshotBuffer back = snapshotBack;
+            if (back.needsFullRebuild
+                    || back.data.length != snapshotSlotCap * DrawSnapshot.STRIDE) {
+                rebuildSnapshotBufferLocked(back);
+                snapshotFullRebuilds++;
+            } else {
+                for (long i = back.appliedLogIndex; i < snapshotLogEnd; i++) {
+                    applySnapshotRecordLocked(back.data,
+                            snapshotLog[(int) (i % snapshotLog.length)]);
+                }
+                back.appliedLogIndex = snapshotLogEnd;
             }
             long handle = arena == null ? 0L : arena.backingHandle();
             long[] blockHandles = arena == null ? new long[0] : arena.blockHandles();
             // Both snapshots inside ONE lock hold, no mutation between —
-            // identical region iteration order (RegionStore javadoc).
+            // identical region iteration order (RegionStore javadoc). They
+            // stay small full per-publish copies (7 + 8 ints per region,
+            // ~450 regions) — not the cost the delta log exists to kill.
             int[] regionData = regionStore.snapshotRegions();
             int[] retainedMasks = regionStore.snapshotRetainedMasks();
-            return new DrawSnapshot(drawEpoch, n, data, handle, blockHandles,
+            snapshotBack = snapshotFront;
+            snapshotFront = back;
+            snapshotPublishes++;
+            return new DrawSnapshot(drawEpoch, resident.size() + retained.size(),
+                    snapshotSlotHighWater - 1, back.data, handle, blockHandles,
                     regionData.length / DrawSnapshot.REGION_STRIDE, regionData,
                     sectionRecordsHandle, retainedMasks);
         }
     }
 
-    private static int writeSnapshotEntryLocked(int[] data, int o, Resident r, int retainedFlag) {
+    private static void writeSnapshotEntryLocked(int[] data, int o, Resident r, int retainedFlag) {
         data[o] = r.sx;
         data[o + 1] = r.sy;
         data[o + 2] = r.sz;
@@ -845,7 +997,203 @@ public final class TerrainResidency {
                 ? regionStore.globalSectionIndex(r.regionKey, r.posKey, r)
                 : -1;
         data[o + 19] = retainedFlag;
-        return o + DrawSnapshot.STRIDE;
+    }
+
+    /**
+     * Apply one change-log record to a packed buffer. WRITE recomputes the
+     * whole entry from the live maps at APPLY time, so replaying a slot's
+     * records in append order converges on the live state whatever
+     * interleaving produced them — free-then-readmit at the same slot
+     * included (dossier-lifecycle §4). A WRITE whose owner died later in
+     * the log tombstones now; its own TOMBSTONE record follows and lands
+     * on the same bytes.
+     */
+    private static void applySnapshotRecordLocked(int[] data, int record) {
+        int slot = record >= 0 ? record : ~record;
+        Resident r = record >= 0 ? snapshotSlotOwner[slot] : null;
+        if (r == null) {
+            tombstoneSnapshotSlot(data, slot);
+            return;
+        }
+        // [19] = which map holds the entry: orphanedAtMillis is stamped
+        // exactly when an entry moves resident → retained and never clears
+        // (the Resident javadoc's retained-vs-live test).
+        writeSnapshotEntryLocked(data, slot * DrawSnapshot.STRIDE, r,
+                r.orphanedAtMillis != 0 ? 1 : 0);
+    }
+
+    /**
+     * THE tombstone (dossier-lifecycle §2): all 20 ints zero, then
+     * {@code [18]} = −2. Zero bucket counts keep cpuCull from pushing
+     * runs, zero [4] plus negative [18] drop it from the translucent map
+     * and pre-pass, zero [19] reads as live-but-empty everywhere else;
+     * −2 (vs the live-but-slotless −1) makes dead slots readable in dumps.
+     */
+    private static void tombstoneSnapshotSlot(int[] data, int slot) {
+        int o = slot * DrawSnapshot.STRIDE;
+        java.util.Arrays.fill(data, o, o + DrawSnapshot.STRIDE, 0);
+        data[o + 18] = -2;
+    }
+
+    /**
+     * The full-rebuild fallback: the old whole-map walk into {@code buf},
+     * PRESERVING slot assignments and tombstoning every unassigned slot
+     * below the high-water mark. Worst case equals the pre-incremental
+     * rebuild — the current behavior IS the fallback.
+     */
+    private static void rebuildSnapshotBufferLocked(SnapshotBuffer buf) {
+        int capInts = snapshotSlotCap * DrawSnapshot.STRIDE;
+        if (buf.data.length != capInts) {
+            buf.data = new int[capInts];
+        } else {
+            java.util.Arrays.fill(buf.data, 0);
+        }
+        for (int slot = 0; slot < snapshotSlotHighWater; slot++) {
+            buf.data[slot * DrawSnapshot.STRIDE + 18] = -2;
+        }
+        for (Resident r : resident.values()) {
+            writeSnapshotEntryLocked(buf.data, r.snapshotSlot * DrawSnapshot.STRIDE, r, 0);
+        }
+        // Wave-11: retained entries ride the same flat view — the
+        // occlusion and cpuCull paths draw them with zero extra code;
+        // [19] flags them for the translucent pre-pass and the mask
+        // path reads retainedMasks at publish.
+        for (Resident r : retained.values()) {
+            writeSnapshotEntryLocked(buf.data, r.snapshotSlot * DrawSnapshot.STRIDE, r, 1);
+        }
+        buf.appliedLogIndex = snapshotLogEnd;
+        buf.needsFullRebuild = false;
+    }
+
+    /** A fallback event: BOTH buffers rebuild on their next turn as back. */
+    private static void forceSnapshotRebuildLocked() {
+        snapshotFront.needsFullRebuild = true;
+        snapshotBack.needsFullRebuild = true;
+    }
+
+    private static void logSlotWriteLocked(int slot) {
+        appendSnapshotLogLocked(slot);
+    }
+
+    private static void logSlotTombstoneLocked(int slot) {
+        appendSnapshotLogLocked(~slot); // complement — always negative
+    }
+
+    /**
+     * The moved-owner fanout (dossier-mutations §3): {@code RegionStore
+     * .remove}'s swap-compaction changes a THIRD PARTY's compacted slot,
+     * hence its snapshot {@code [18]} — invisible to a log that only
+     * records the removed slot, and the miss ships a stale stamp index to
+     * the translucent occlusion gate (the silent-drop mode). Every remove
+     * call site feeds its return value through here.
+     */
+    private static void logMovedOwnerLocked(Object movedOwner) {
+        if (movedOwner instanceof Resident moved) {
+            logSlotWriteLocked(moved.snapshotSlot);
+        }
+    }
+
+    private static void appendSnapshotLogLocked(int record) {
+        if (snapshotFront.needsFullRebuild && snapshotBack.needsFullRebuild) {
+            return; // both sides rebuild from the maps — records are moot
+        }
+        long oldest = snapshotLogEnd;
+        if (!snapshotFront.needsFullRebuild) {
+            oldest = Math.min(oldest, snapshotFront.appliedLogIndex);
+        }
+        if (!snapshotBack.needsFullRebuild) {
+            oldest = Math.min(oldest, snapshotBack.appliedLogIndex);
+        }
+        if (snapshotLogEnd - oldest >= snapshotLog.length) {
+            if (snapshotLog.length >= SNAPSHOT_LOG_MAX) {
+                // Overflow — a release storm (releaseAllBuffers frees every
+                // section in one frame). The full rebuild IS the fallback,
+                // so this frame costs exactly what every frame used to.
+                forceSnapshotRebuildLocked();
+                return;
+            }
+            int[] grown = new int[snapshotLog.length << 1];
+            for (long i = oldest; i < snapshotLogEnd; i++) {
+                grown[(int) (i % grown.length)] = snapshotLog[(int) (i % snapshotLog.length)];
+            }
+            snapshotLog = grown;
+        }
+        snapshotLog[(int) (snapshotLogEnd % snapshotLog.length)] = record;
+        snapshotLogEnd++;
+        snapshotLogRecords++;
+    }
+
+    /**
+     * A snapshot slot for a freshly admitted Resident: free-list first
+     * (reuse within a publish window is safe — both buffers replay the
+     * tombstone-then-rewrite records in append order); exhaustion doubles
+     * the capacity and routes the next publish through the full rebuild,
+     * the designed grow event (decision 7 — world load, render-distance
+     * raise; never steady-state streaming).
+     */
+    private static int allocSnapshotSlotLocked() {
+        if (!snapshotFreeSlots.isEmpty()) {
+            return snapshotFreeSlots.popInt();
+        }
+        if (snapshotSlotHighWater == snapshotSlotCap) {
+            snapshotSlotCap <<= 1;
+            snapshotSlotOwner = java.util.Arrays.copyOf(snapshotSlotOwner, snapshotSlotCap);
+            forceSnapshotRebuildLocked();
+        }
+        return snapshotSlotHighWater++;
+    }
+
+    /** Common tail of every per-entry death site: tombstone + free the slot. */
+    private static void freeSnapshotSlotLocked(Resident r) {
+        snapshotSlotOwner[r.snapshotSlot] = null;
+        snapshotFreeSlots.push(r.snapshotSlot);
+        logSlotTombstoneLocked(r.snapshotSlot);
+    }
+
+    /**
+     * Decision-8 check: {@code retained.put} must never displace a prior
+     * value (the retained map's re-entry argument — a position re-enters
+     * only after a fresh upload REMOVED it). If that invariant ever broke,
+     * the displaced entry's slot and arena range would leak silently and
+     * the published snapshot would carry its stale entry forever — so this
+     * logs loudly and heals the snapshot through the full rebuild instead
+     * of a bare assert nobody runs with.
+     */
+    private static void putRetainedLocked(long packedPos, Resident r) {
+        Resident displaced = retained.put(packedPos, r);
+        if (displaced != null) {
+            MesheliumClient.LOGGER.error(
+                    "Meshelium retained.put displaced an entry at packed pos {} — a Meshelium "
+                            + "bug (the retained map's re-entry invariant broke); the draw "
+                            + "snapshot heals through a full rebuild, the displaced arena "
+                            + "range leaks until dispose",
+                    packedPos);
+            forceSnapshotRebuildLocked();
+        }
+    }
+
+    // Incremental-snapshot probes (tests, bench): delta publishes should
+    // dwarf full rebuilds outside world loads and render-distance raises.
+
+    /** Snapshot publishes (swaps) this session — delta and fallback alike. */
+    public static long snapshotPublishes() {
+        synchronized (LOCK) {
+            return snapshotPublishes;
+        }
+    }
+
+    /** Publishes that took the full-rebuild fallback. */
+    public static long snapshotFullRebuilds() {
+        synchronized (LOCK) {
+            return snapshotFullRebuilds;
+        }
+    }
+
+    /** Change-log records appended (lifetime). */
+    public static long snapshotLogRecords() {
+        synchronized (LOCK) {
+            return snapshotLogRecords;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -853,7 +1201,7 @@ public final class TerrainResidency {
     // ------------------------------------------------------------------
 
     static void enqueueUpload(Object mesh, int sx, int sy, int sz, EncodedSectionMesh encoded,
-            int[] translucentOrder) {
+            int[] translucentOrder, byte builtTier) {
         TranslucentState translucent = null;
         int translucentCount = encoded.translucentCount();
         if (translucentCount > 0) {
@@ -874,8 +1222,8 @@ public final class TerrainResidency {
         }
         synchronized (LOCK) {
             encodedSections++;
-            PendingUpload previous =
-                    pendingUploads.put(mesh, new PendingUpload(sx, sy, sz, encoded, translucent));
+            PendingUpload previous = pendingUploads.put(mesh,
+                    new PendingUpload(sx, sy, sz, encoded, translucent, builtTier));
             if (previous != null) {
                 staleParks++; // one mesh, two encodings — should be impossible
                 pendingPosDrop(previous.sx(), previous.sy(), previous.sz());
@@ -1078,10 +1426,11 @@ public final class TerrainResidency {
             if (r.ownsSlot && arena != null && successorQueued(r.sx, r.sy, r.sz)) {
                 if (regionStore.markRetained(r.regionKey, r.posKey, r)) {
                     r.orphanedAtMillis = monotonicMillis();
-                    retained.put(posPack(r.sx, r.sy, r.sz), r);
+                    putRetainedLocked(posPack(r.sx, r.sy, r.sz), r);
                     quadsResident -= r.quadCount;
                     retainedQuads += r.quadCount;
                     handoverRetained++;
+                    logSlotWriteLocked(r.snapshotSlot); // [19] flips; slot + [18] kept
                     drawEpoch++;
                     return;
                 }
@@ -1096,10 +1445,11 @@ public final class TerrainResidency {
                 // the free path below rather than leaking.
                 if (regionStore.markRetained(r.regionKey, r.posKey, r)) {
                     r.orphanedAtMillis = monotonicMillis();
-                    retained.put(posPack(r.sx, r.sy, r.sz), r);
+                    putRetainedLocked(posPack(r.sx, r.sy, r.sz), r);
                     quadsResident -= r.quadCount;
                     retainedQuads += r.quadCount;
                     orphanedSections++;
+                    logSlotWriteLocked(r.snapshotSlot);
                     drawEpoch++; // [19] flips for this entry
                     return;
                 }
@@ -1109,9 +1459,10 @@ public final class TerrainResidency {
             quadsResident -= r.quadCount;
             freedSections++;
             if (r.ownsSlot) {
-                regionStore.remove(r.regionKey, r.posKey, r);
+                logMovedOwnerLocked(regionStore.remove(r.regionKey, r.posKey, r));
             }
             parkAddrLocked(r.arenaAddr, r.quadCount);
+            freeSnapshotSlotLocked(r);
         }
     }
 
@@ -1161,8 +1512,11 @@ public final class TerrainResidency {
         pendingPrefixUploads.remove(r);
         retainedQuads -= r.quadCount;
         freedSections++;
-        regionStore.remove(r.regionKey, r.posKey, r);
+        // Retained entries always own their slot, so this remove always
+        // reaches the store — and may swap-compact a third party (§3).
+        logMovedOwnerLocked(regionStore.remove(r.regionKey, r.posKey, r));
         parkAddrLocked(r.arenaAddr, r.quadCount);
+        freeSnapshotSlotLocked(r);
     }
 
     /** Park an arena range on the current frame's fence epoch. */
@@ -1229,9 +1583,31 @@ public final class TerrainResidency {
             resident.clear();
             freeEpochs.clear();
             pendingPrefixUploads.clear();
+            // Leaf-tier walker state is per-world like the store it
+            // walks: the flagged census just went to zero with resident,
+            // and a stale camera/ring memory would only skip or waste the
+            // next world's first walk.
+            tierBuiltFlagged = 0;
+            leafTierWalkCamera = SectionBuildTap.CAMERA_SECTION_UNKNOWN;
+            leafTierWalkSmartRing = -1;
+            leafTierWalkSolidRing = -1;
+            leafTierWalkPending = false;
             regionStore = new RegionStore();
             arena = null; // the whole allocator dies with its buffer
             sectionRecordsHandle = 0L; // its VkBuffer is on the destroy queue too
+            // The incremental draw snapshot dies with the store: every slot
+            // above just became garbage, which is exactly the log-overflow
+            // CLASS of event (S6, mutations dossier) — reset the free-list,
+            // the log ring and the owner index, and route BOTH ping-pong
+            // buffers through the full rebuild (they re-size lazily at the
+            // next publish; absolute log indices stay monotonic and the
+            // rebuild resets both applied indices to the current end).
+            snapshotSlotCap = SNAPSHOT_SLOTS_INITIAL;
+            snapshotSlotHighWater = 0;
+            snapshotSlotOwner = new Resident[SNAPSHOT_SLOTS_INITIAL];
+            snapshotFreeSlots.clear();
+            snapshotLog = new int[SNAPSHOT_LOG_INITIAL];
+            forceSnapshotRebuildLocked();
             quadsResident = 0;
             // freedSections deliberately SURVIVES the reset: it is a
             // lifetime diagnostic, and dispose fires immediately AFTER the
@@ -1280,8 +1656,17 @@ public final class TerrainResidency {
      * queued sections (bounded), commit dirty regions, record the command
      * buffer. Render thread, inside vanilla's lock window — see class
      * Javadoc for why releases cannot interleave.
+     *
+     * <p>The leaf-tier restore runs in two halves around the lock edge:
+     * the walk COLLECTS positions under LOCK (it reads and mutates
+     * Resident state), the re-dirty calls vanilla AFTER the lock is
+     * released — the class javadoc's discipline that no Meshelium code
+     * calls back into vanilla while holding LOCK, kept by construction
+     * here because the collected list is a plain int triple list with no
+     * reference back into the store.</p>
      */
     public static void pump(TerrainGpuHost gpu) {
+        IntArrayList leafTierRestores;
         synchronized (LOCK) {
             long frame = ++frameCounter;
             // Wave-11 self-heal: reset() runs only on the render thread
@@ -1310,6 +1695,157 @@ public final class TerrainResidency {
             regionStore.commitDirty(gpu);
             gpu.endFrame();
             maybeLogStatsLocked(gpu);
+            leafTierRestores = collectLeafTierRestoresLocked();
+        }
+        redirtyLeafTierSections(leafTierRestores);
+    }
+
+    // ------------------------------------------------------------------
+    // Smart/Solid Leaves Beyond — the ring-crossing walker (render thread)
+    // ------------------------------------------------------------------
+
+    /**
+     * At most this many re-dirties per pump. Each one costs vanilla a
+     * full section rebuild (plus its neighbors' visibility refresh), so
+     * an unbudgeted walk after a big camera jump — or after both settings
+     * are turned OFF, which restores EVERYTHING — would storm the build
+     * queue and defeat the feature it serves. 64 per pump drains even a
+     * worst-case backlog in a few seconds, which the tooltips promise.
+     */
+    private static final int LEAF_TIER_REDIRTY_BUDGET = 64;
+
+    /** Camera section the walker last armed against (packed X/Z). */
+    private static long leafTierWalkCamera = SectionBuildTap.CAMERA_SECTION_UNKNOWN;
+    /** Smart ring the walker last armed against (a live config change re-arms). */
+    private static int leafTierWalkSmartRing = -1;
+    /** Solid ring the walker last armed against (same re-arm rule). */
+    private static int leafTierWalkSolidRing = -1;
+    /** A walk is armed or mid-drain (budget ran out last pump). */
+    private static boolean leafTierWalkPending;
+    /**
+     * How many {@link Resident} objects still carry a {@code builtTier}
+     * above {@code TIER_NONE} — the gate that makes the walker FREE while
+     * both features are off or unused: zero means no sweep can ever
+     * collect anything, so the O(resident) iteration is skipped on every
+     * camera crossing, which is the whole cost the tiers add to a player
+     * who never touches either slider. Deliberately an OVER-count: a
+     * flagged Resident that dies (supersede, release, eviction) is not
+     * decremented — chasing the five death sites for a diagnostic gate is
+     * how bookkeeping drifts — so a stale positive only costs a no-op
+     * sweep, never skips a real one. Reset with the store at dispose.
+     */
+    private static int tierBuiltFlagged;
+
+    /**
+     * Under LOCK: arm a walk when the camera crossed into a new section
+     * OR either slider moved (the second trigger is what makes turning a
+     * setting down or OFF drain live — both OFF means no ring earns any
+     * tier, so every tiered entry collects), then sweep the resident set
+     * for sections whose built tier now EXCEEDS the tier their distance
+     * would earn on the restore side of the hysteresis: each ring's
+     * restore edge is (ring − 1), one inside its build gate's (ring + 1),
+     * so a camera idling on either ring cannot oscillate a section. The
+     * one compare covers every case — a Solid section approaching past
+     * the solid ring but still beyond the smart ring rebuilds down to
+     * Smart, one inside (smartRing − 1) rebuilds to full detail, a
+     * lowered slider drains the difference, both sliders Off drain
+     * everything. The walker only ever DEMOTES tiers: a section built
+     * lighter than its distance now allows stays as built until vanilla
+     * rebuilds it anyway, exactly the one-tier walker's behavior.
+     * Collected entries have their tier RESET here, so a section is
+     * collected once per tiered build no matter how many pumps pass
+     * before its rebuild lands; a budget-exhausted sweep stays pending
+     * and resumes next pump. Retained entries are deliberately not
+     * walked: vanilla holds no mesh for them, so there is nothing to
+     * re-dirty — a supersede or eviction is their only exit, exactly as
+     * before this feature.
+     *
+     * @return section coords as (sx, sy, sz) triples, or null
+     */
+    private static IntArrayList collectLeafTierRestoresLocked() {
+        long camera = SectionBuildTap.cameraSectionXZ();
+        if (camera == SectionBuildTap.CAMERA_SECTION_UNKNOWN) {
+            return null; // no frame has published a camera yet
+        }
+        int smartRing = MesheliumConfig.smartLeavesChunks();
+        int solidRing = MesheliumConfig.solidLeavesChunks();
+        if (camera != leafTierWalkCamera || smartRing != leafTierWalkSmartRing
+                || solidRing != leafTierWalkSolidRing) {
+            leafTierWalkCamera = camera;
+            leafTierWalkSmartRing = smartRing;
+            leafTierWalkSolidRing = solidRing;
+            leafTierWalkPending = true;
+        }
+        if (!leafTierWalkPending || tierBuiltFlagged == 0) {
+            return null; // nothing armed, or provably nothing to restore
+        }
+        IntArrayList out = null;
+        int budget = LEAF_TIER_REDIRTY_BUDGET;
+        // Each tier keeps holding a section at distance >= (its ring − 1),
+        // floored at 1: without the floor a ring of 1 restores only at
+        // "distance < 0", which no section ever satisfies, and tiered
+        // terrain at that slider stop would be permanent. The floor keeps
+        // the dead band against the build gate's (ring + 1) at every
+        // reachable setting.
+        int smartKeepsFrom = Math.max(1, smartRing - 1);
+        int solidKeepsFrom = Math.max(1, solidRing - 1);
+        for (Resident r : resident.values()) {
+            if (r.builtTier == SectionBuildTap.TIER_NONE) {
+                continue;
+            }
+            int dist = SectionBuildTap.chunkDistanceXZ(camera, r.sx, r.sz);
+            // The tier this distance would still tolerate, restore-side:
+            // the build tap's decision table with each (ring + 1) gate
+            // replaced by its (ring − 1) twin, and an OFF ring (0) earning
+            // nothing — the tap and the walker must rank the tiers
+            // identically or a section could rebuild forever.
+            int earned = solidRing > 0 && dist >= solidKeepsFrom ? SectionBuildTap.TIER_SOLID
+                    : smartRing > 0 && dist >= smartKeepsFrom ? SectionBuildTap.TIER_SMART
+                    : SectionBuildTap.TIER_NONE;
+            if (r.builtTier <= earned) {
+                continue; // built at or below what this distance tolerates
+            }
+            r.builtTier = SectionBuildTap.TIER_NONE;
+            tierBuiltFlagged--;
+            if (out == null) {
+                out = new IntArrayList(3 * LEAF_TIER_REDIRTY_BUDGET);
+            }
+            out.add(r.sx);
+            out.add(r.sy);
+            out.add(r.sz);
+            if (--budget == 0) {
+                return out; // budget spent: stay pending, resume next pump
+            }
+        }
+        leafTierWalkPending = false; // full sweep fit the budget
+        return out;
+    }
+
+    /**
+     * Render thread, LOCK NOT HELD (the caller released it): hand each
+     * collected section back to vanilla for a Fancy rebuild.
+     * {@code ClientLevel.setSectionDirtyWithNeighbors(int,int,int)} is
+     * public and lock-free the whole way down (javap 26.2 merged jar:
+     * ClientLevel delegates to LevelExtractor.setSectionDirtyWithNeighbors
+     * → setSectionRangeDirty ±1 → SectionUpdateTracker.setDirty, plain
+     * flag writes, zero monitorenter in either class), so calling it
+     * inside vanilla's own lock window is safe. The rebuilt section
+     * re-enters through the ordinary tap, earns whatever tier its
+     * distance rates NOW (Smart for a Solid section that crossed only
+     * the solid ring, full detail inside both), and its upload
+     * supersedes the old copy through the wave-3b slot steal.
+     */
+    private static void redirtyLeafTierSections(IntArrayList triples) {
+        if (triples == null || triples.isEmpty()) {
+            return;
+        }
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level == null) {
+            return; // world tearing down; the copies die with the dispatcher
+        }
+        for (int i = 0; i < triples.size(); i += 3) {
+            level.setSectionDirtyWithNeighbors(
+                    triples.getInt(i), triples.getInt(i + 1), triples.getInt(i + 2));
         }
     }
 
@@ -1592,11 +2128,23 @@ public final class TerrainResidency {
                     bucketStarts[b] = p.encoded().bucketStart(b);
                     bucketCounts[b] = p.encoded().bucketCount(b);
                 }
+                // The snapshot slot is assigned at this SINGLE Resident
+                // construction site (per arena copy, not per position — the
+                // handover window holds two slots for one section). If the
+                // iteration dies between here and resident.put, the slot
+                // leaks until dispose exactly like the already-recorded
+                // copy's arena range (the pre-flight comment above) —
+                // bounded, and the full rebuild tombstones it either way.
                 Resident r = new Resident(addr, p.encoded().quadCount(),
                         RegionStore.regionKey(p.sx(), p.sy(), p.sz()),
                         RegionStore.posKey(p.sx(), p.sy(), p.sz()),
                         p.sx(), p.sy(), p.sz(), bucketStarts, bucketCounts,
-                        p.translucent());
+                        p.translucent(), allocSnapshotSlotLocked());
+                if (p.builtTier() != SectionBuildTap.TIER_NONE) {
+                    r.builtTier = p.builtTier();
+                    tierBuiltFlagged++;
+                }
+                snapshotSlotOwner[r.snapshotSlot] = r;
                 RegionStore.Assignment assignment =
                         regionStore.addOrReplace(p.sx(), p.sy(), p.sz(), p.encoded(), addr, r);
                 if (assignment == null) {
@@ -1623,12 +2171,25 @@ public final class TerrainResidency {
                             freedSections++;
                             retainedSuperseded++;
                             parkAddrLocked(previous.arenaAddr, previous.quadCount);
+                            freeSnapshotSlotLocked(previous);
+                        } else {
+                            // Impossible by the retained-map invariant (an
+                            // orphaned owner IS the entry at its own
+                            // position) — heal like the decision-8 check
+                            // rather than trusting a broken map.
+                            forceSnapshotRebuildLocked();
                         }
                     } else {
                         previous.ownsSlot = false;
+                        // The slot-steal victim (promotion-lag window):
+                        // nothing removes the previous entry — only its
+                        // [18] flips to −1, which a slot log cannot see
+                        // without this record (S1(b), mutations dossier).
+                        logSlotWriteLocked(previous.snapshotSlot);
                     }
                 }
                 resident.put(mesh, r);
+                logSlotWriteLocked(r.snapshotSlot); // the new entry, same S1 bump
                 if (r.translucent != null && r.translucent.dirtySinceEncode) {
                     // A resort landed while this section waited in the
                     // backlog: the geometry copy above still carries the
@@ -1927,6 +2488,7 @@ public final class TerrainResidency {
                         + "drops[oversize={},arena={},region={},encode={}] "
                         + "retention[orphaned={},superseded={},evictAge={},evictPressure={},"
                         + "evictOff={},backpressure={}] handoverHeld={} discarded={} staleParks={} "
+                        + "snapshot[publishes={},fullRebuilds={},logRecords={}] "
                         + "greedyMerge[{}]",
                 c.sectionsResident(), c.quadsResident(),
                 c.retainedSections(), c.retainedQuads(),
@@ -1955,6 +2517,10 @@ public final class TerrainResidency {
                 // encoded section can vanish before reaching the GPU, and
                 // both were invisible in this line while the bug was hunted.
                 handoverRetained, c.discardedBeforeUpload(), c.staleParks(),
+                // The incremental snapshot's health: publishes should dwarf
+                // fullRebuilds outside world loads and rd raises, or the
+                // delta log is not doing its job.
+                snapshotPublishes, snapshotFullRebuilds, snapshotLogRecords,
                 // The other side of the merge's ledger: what it costs the
                 // build workers. Off the frame path, so no bench frame time
                 // can show it, but slower section builds are slower pop-in.

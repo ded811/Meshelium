@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.5.0
+
+**Turning your camera is much smoother now.**
+
+Whenever new terrain streamed in, Meshelium rebuilt its entire drawing
+list from scratch, almost every frame while you were moving or turning.
+At render distance 64 that one habit was costing about 40 percent of
+every turning frame, and the memory churn behind it fed the little
+hitches you could feel while flying. It now updates only what actually
+changed. Measured while spinning the camera at render distance 64, the
+frame time halved. Standing still was never affected.
+
+**New: Smart Leaves, on by default past 16 chunks.**
+
+Trees are full of faces you can never see: every leaf block touching
+another leaf block draws the hidden wall between them, twice. Past 16
+chunks, newly built terrain now skips those buried faces while keeping
+the see-through look of the leaves you can actually see. In forests
+that is roughly half of all leaf geometry gone, and because leaves
+dominate what a forest chunk costs to build, it also smooths the
+stutter of new terrain loading in. Trees quietly regain their full
+detail as you get close. The slider is in Advanced; set it to 0 if you
+want vanilla-exact terrain everywhere.
+
+**New in Advanced: Solid Leaves Beyond, off by default.**
+
+The next step past Smart: beyond a distance you choose, leaves build
+fully solid, the way Fast graphics draws them everywhere. Distant
+woods get cheaper still, and solid canopies start hiding the terrain
+behind them from the renderer, which see-through leaves cannot do.
+The see-through look returns as you approach.
+
+**Fixed: the Advanced screen could cut off rows at larger interface
+sizes.** It scrolls now, and the Done button stays put at the bottom.
+
 ## 1.4.0
 
 **Occlusion culling now costs almost nothing while you stand still.**
