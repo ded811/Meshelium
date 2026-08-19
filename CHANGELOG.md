@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.2
+
+**Fixed: black water at the screen edges when your field of view widens.**
+
+Take a speed potion over the ocean and the water revealed at the edges
+of the screen drew as a dark, waterless seafloor until you moved your
+camera. Sprinting or dragging the FOV slider flickered the same way for
+a moment. The cause turns out to be a vanilla quirk: the game only
+refreshes its list of visible chunk sections when the camera rotates,
+never when the field of view changes, so potion and sprint zoom could
+leave that list stale forever. You only noticed with occlusion on
+because Meshelium draws the seafloor the instant it appears, while the
+water layer still came from the stale list. Meshelium now tells the
+game to refresh the list the moment your field of view changes, which
+heals the water layer, the fallback path, and vanilla's own drawing all
+at once. Costs nothing while the view is steady.
+
 ## 1.5.1
 
 **Fixed: Solid Leaves was solidifying things that are not leaves.**

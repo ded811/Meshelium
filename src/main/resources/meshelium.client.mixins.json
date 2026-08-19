@@ -25,6 +25,7 @@
 		"RenderSectionInvoker",
 		"RenderSectionMixin",
 		"SectionCompilerMixin",
+		"SectionOcclusionGraphAccessor",
 		"SectionOcclusionGraphMixin",
 		"SectionRenderDispatcherMixin",
 		"VideoSettingsScreenMixin",

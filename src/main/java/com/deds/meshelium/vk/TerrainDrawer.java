@@ -11,6 +11,7 @@ import com.deds.meshelium.fabric.MesheliumClient;
 import com.mojang.blaze3d.GpuDeviceLossException;
 import com.deds.meshelium.fabric.mixin.FrustumAccessor;
 import com.deds.meshelium.fabric.mixin.RenderPassAccessor;
+import com.deds.meshelium.fabric.mixin.SectionOcclusionGraphAccessor;
 import com.deds.meshelium.fabric.mixin.VulkanRenderPassAccessor;
 import com.deds.meshelium.terrain.QuadFacing;
 import com.deds.meshelium.terrain.host.SectionBuildTap;
@@ -782,6 +783,15 @@ public final class TerrainDrawer {
     private static long pbSkipEpoch = Long.MIN_VALUE;
     private static long pbSkipLastOccSerial = Long.MIN_VALUE;
 
+    // ---- 1.5.2 FOV-reveal heal state (render thread; the volatile is a
+    // test probe) ----
+    /** Owned frames whose render projection changed bit-for-bit — each one
+     *  nudged vanilla's {@code needsFrustumUpdate} (mechanism and cost on
+     *  {@link #healFrustumOnProjectionChange}). */
+    private static volatile long frustumHealNudges;
+    private static boolean projHealKeyValid;
+    private static final float[] projHealKey = new float[16];
+
     /**
      * Per-stats-frame history rings for the camera-cut assertion (client
      * thread writes AND reads — gametest predicates run on the client
@@ -1109,6 +1119,15 @@ public final class TerrainDrawer {
     /** Frames whose phase-B recording the CPU skip elided (cumulative). */
     public static long phaseBCpuSkipFrames() {
         return phaseBCpuSkipFrames;
+    }
+
+    /**
+     * Owned frames that nudged vanilla's {@code needsFrustumUpdate} after
+     * a bit-level render-projection change (the 1.5.2 FOV-reveal heal,
+     * cumulative). Test probe (client thread).
+     */
+    public static long frustumHealNudges() {
+        return frustumHealNudges;
     }
 
     /**
@@ -1445,6 +1464,7 @@ public final class TerrainDrawer {
         pbSkipInputChangeStatsFrame = 0;
         pbSkipEpoch = Long.MIN_VALUE;
         pbSkipLastOccSerial = Long.MIN_VALUE;
+        projHealKeyValid = false; // fresh baseline, never a spurious nudge
         Arrays.fill(phaseBFrames, -1);
         Arrays.fill(changeFrames, -1);
         changeCursor = 0;
@@ -1504,6 +1524,7 @@ public final class TerrainDrawer {
         pbSkipInputChangeStatsFrame = 0;
         pbSkipEpoch = Long.MIN_VALUE;
         pbSkipLastOccSerial = Long.MIN_VALUE;
+        projHealKeyValid = false; // fresh baseline, never a spurious nudge
         Arrays.fill(phaseBFrames, -1);
         Arrays.fill(changeFrames, -1);
         changeCursor = 0;
@@ -1586,6 +1607,60 @@ public final class TerrainDrawer {
     }
 
     /**
+     * The 1.5.2 FOV-reveal heal. Vanilla rebuilds {@code visibleSections}
+     * only in {@code LevelExtractor.applyFrustum}, which extract runs on
+     * {@code SectionOcclusionGraph.consumeFrustumUpdate()} or a 2-degree
+     * camera-rotation bucket crossing (extract ip 256-279, bytecode) — NO
+     * term involves the projection. But the CULL frustum tracks a widening
+     * FOV the SAME frame: {@code Camera.update} rebuilds it every frame
+     * from {@code createProjectionMatrixForCulling()}, whose fov is
+     * {@code max(effective, option)} — the max only absorbs NARROWING
+     * modifiers (bow zoom), never widening ones. So when the effective FOV
+     * rises with the camera still (speed/sprint {@code fovModifier} ramp:
+     * the OPTION never changes, and the option int is the only value
+     * {@code invalidateIfNeeded} compares — even vanilla's slow async
+     * full-rebuild heal stays cold; the FOV slider only heals through that
+     * rebuild about a second later), sections revealed at the screen edges
+     * exist in every fresh-frustum consumer and are missing from the stale
+     * list. The occlusion opaque path draws them instantly (region records
+     * + cullFrustum + raster stamps — no visibleSections read) while the
+     * translucent pass iterates visibleSections and cannot: dark waterless
+     * seafloor at the new edges until a rotation heals the list. Vanilla
+     * itself lags identically on BOTH its layers (prepareChunkRenders
+     * iterates the same list), which is why the bug is only CONSPICUOUS
+     * with occlusion on — the fix heals every consumer at once.
+     *
+     * <p>The heal: bit-compare the render projection — the modifier ramp
+     * provably flows through it ({@code CameraRenderState.projectionMatrix}
+     * is extracted from the {@code Projection} that {@code Camera.update}
+     * builds with the EFFECTIVE fov: {@code setupPerspective(0.05,
+     * depthFar, this.fov, w, h)} → {@code extractRenderState} ip 142-149,
+     * javap-verified) — and on any change set the very flag extract
+     * consumes, via {@link SectionOcclusionGraphAccessor}. The NEXT
+     * extract then rebuilds the list with its already-widened cull
+     * frustum, byte-for-byte the rotation-crossing path. Cost: one
+     * applyFrustum (~0.5 ms, the wave-12 stage series) per
+     * projection-change frame — a ramp is ~10 such frames ({@code tickFov}
+     * halves the gap per tick) — and a 16-float raw-bits compare
+     * otherwise. Scope: Meshelium-gated by construction (the only call
+     * site is the armed drawer's frame entry); dormant sessions keep
+     * vanilla's stock behaviour, lag included.</p>
+     */
+    private static void healFrustumOnProjectionChange(CameraRenderState cam) {
+        boolean changed = pbSkipMatrixChanged(cam.projectionMatrix, projHealKey);
+        if (!projHealKeyValid) {
+            projHealKeyValid = true; // first observation is a baseline, not a change
+            return;
+        }
+        if (!changed) {
+            return;
+        }
+        ((SectionOcclusionGraphAccessor) Minecraft.getInstance().levelRenderer
+                .sectionOcclusionGraph()).meshelium$needsFrustumUpdate().set(true);
+        frustumHealNudges++;
+    }
+
+    /**
      * The kill switch's body. Returns true iff Meshelium recorded (or
      * deliberately owns) the opaque terrain this frame — ONLY then does the
      * mixin cancel vanilla's renderGroup. Any internal failure returns
@@ -1647,6 +1722,12 @@ public final class TerrainDrawer {
         if (cam == null || !cam.initialized || cam.cullFrustum == null) {
             return false; // no frame state yet — vanilla draws this frame
         }
+        // 1.5.2: when the render projection moved (FOV ramp/slider,
+        // resize), nudge vanilla's frustum update so next frame's
+        // visibleSections catches up — every membership consumer (our
+        // translucent pass, the bfs masks, vanilla's own draws) lags the
+        // stale list otherwise (mechanism on the method).
+        healFrustumOnProjectionChange(cam);
         RenderTarget target = ChunkSectionLayerGroup.OPAQUE.outputTarget();
         GpuTextureView colorView = target.getColorTextureView();
         GpuTextureView depthView = target.getDepthTextureView();
