@@ -100,52 +100,6 @@ The raw JSON behind the release sweep lives on the development machine at
 repository. It is not distributed with the mod, so reproduce these rows rather
 than trust them.
 
-### The far-armed bench, `-Pmeshelium.farbench` (2026-09-02)
-
-Nothing on this page arms the far field. `-Pmeshelium.bench=<scene>` arms the
-near renderer only and pins its camera, so those runs never load a chunk and
-never save one — which means no row here describes a session in which distant
-terrain was being written to disk, and the owner's report is precisely about
-that session.
-
-`-Pmeshelium.farbench` is the separate instrument for it, and it reports frame
-TIME distributions rather than a mean:
-
-```
-./gradlew runClientGameTest -Pmeshelium.backend=vulkan -Pmeshelium.terrain -Pmeshelium.farbench --offline
-```
-
-It arms `-Dmeshelium.test.farbench=true` (the test class, and the same
-per-frame clock this page's benchmark uses) and
-`-Dmeshelium.farfield.perfStats=true` (per-slice, per-overrun and per-column
-distributions inside the extractor, behind a `static final` so normal play pays
-nothing), and it registers that one test class rather than the suite. Three
-scenarios — standing still on saved ground, a travel corridor over fresh
-ground, and a teleport followed by a stand — each with p50/p90/p95/p99, three
-stutter counts, and the far field's own game-thread cost expressed **as a
-fraction of the measured frame** as well as in milliseconds. The A/B is a
-second run with `-Pmeshelium.vmargs="-Dmeshelium.test.farbench.far=false"`.
-
-**It pins the framerate limit to 200 on purpose.** The harness reaches
-2,731 fps unpinned, a 0.366 ms frame, and the owner plays at 200 fps with a
-5 ms frame — so a fraction of a frame measured unpinned is off by an order of
-magnitude against the target the plan is written in. The pin is an emulation of
-the owner's machine and is labelled as such in the log and the JSON; it is never
-a statement about this machine's capability. Absolute milliseconds stay the
-primary number, and a second frame series (vanilla's own CPU frame span, which
-excludes the limiter sleep) is what the fractions are computed against.
-`-Dmeshelium.test.farbench.fpsCap=260` runs it unpinned — 260 is vanilla's own
-unlimited cutoff.
-
-Reports land beside the screenshots as
-`meshelium-farbench-{faron|faroff}-rd<N>.json`. Every knob, every honest limit
-(harness render distance 16 rather than 32, an integrated server, a small
-window, a teleport-driven corridor with no view rotation) and the list of what
-it can and cannot prove are in **docs/FARFIELD-WAVES.md**, section "THE
-FAR-ARMED BENCH (pre21 instrument)"; the plan it serves is
-**docs/FARFIELD-PERF-BRIEF.md**.
-
-
 ## The release sweep (1.0.0, measured at 1920x1080)
 
 **The resolution belongs in the heading**, and until release day it was
@@ -1358,7 +1312,7 @@ trees Fancy. Two designs still owed before building: the interior-pair
 filter at decode time (the census's matcher, made a mesher rule), and
 the ring-crossing re-dirty (sections built Fast stay Fast when
 approached until rebuilt - a shell-crossing dirty walk fixes that).
-The quality gate is the owner's, per the LOD decision: this ships as
+The quality gate is the owner's: this ships as
 a slider they tune in person, default Off. Census floor note: pairs
 straddling section borders are missed, so the true number is higher.
 
