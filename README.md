@@ -20,7 +20,7 @@
 
 Frames per second at 1920x1080, same computer, same world, looking the same way, at default settings. One run with Meshelium, one without.
 
-![Bar chart pairing frames per second with Meshelium on against Meshelium off at six render distances: 2,437 against 1,621 at 12 chunks, widening to 607 against 114 at 64 chunks](docs/fps-chart.png)
+![Bar chart of how many times more frames per second Meshelium gives at six render distances, the bars rising from 1.5x at 12 chunks to 5.3x at 64](docs/fps-chart.png)
 
 **The further you look, the bigger Meshelium wins.** Here are the actual frame rates behind that graph, in frames per second, so higher is better:
 

@@ -11,7 +11,7 @@ and you can push the render distance far past the slider's usual limit.
 Measured at 1920x1080 on an AMD Radeon RX 9070 XT, same world, same view. One
 run with the mod and one without:
 
-![Bar chart pairing frames per second with Meshelium on against Meshelium off at six render distances: 2,437 against 1,621 at 12 chunks, widening to 607 against 114 at 64 chunks](https://raw.githubusercontent.com/ded811/Meshelium/master/docs/fps-chart.png)
+![Bar chart of how many times more frames per second Meshelium gives at six render distances, the bars rising from 1.5x at 12 chunks to 5.3x at 64](https://raw.githubusercontent.com/ded811/Meshelium/master/docs/fps-chart.png)
 
 | Render distance | Minecraft | Meshelium | Difference |
 |---|---|---|---|

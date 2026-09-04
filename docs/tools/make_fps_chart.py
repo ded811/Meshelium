@@ -5,8 +5,25 @@ numbers on the store page could not be re-plotted without redrawing the
 whole thing by hand. This script is that generator.
 
 Run:  python docs/tools/make_fps_chart.py
-Writes: docs/fps-chart.png          the multi-distance comparison
+Writes: docs/fps-chart-paired.png   the on-against-off comparison
         docs/fps-chart-rd64.png     the single headline comparison
+
+IT DOES NOT WRITE docs/fps-chart.png, AND MUST NOT. That file - the one
+README.md and the Modrinth page actually embed - is the older MULTIPLIER
+chart: one bar per render distance showing how many times more frames
+Meshelium gives, rising left to right from 1.5x to 5.3x. It predates this
+script and there is no generator for it.
+
+That chart was published from 1.1 through 1.5.2, was replaced by this
+script's paired style when 1.6 went out, and was put back on request. The
+reason is worth keeping: plotted as raw frames per second the bars FALL
+left to right, because frame rates drop as render distance rises, so the
+picture reads as the mod doing less the further you look. The multiplier
+chart plots the ratio instead, so the bars rise and the picture says what
+the numbers say. Same data, opposite impression.
+
+Writing to fps-chart-paired.png rather than fps-chart.png is deliberate:
+running this script used to overwrite the published chart silently.
 
 THE NUMBERS. One source of truth, below, taken from the table published
 in README.md. They are one machine, one world, one camera, at 1920x1080
@@ -138,5 +155,5 @@ def rd64_chart(path: Path):
 
 if __name__ == "__main__":
     docs = Path(__file__).resolve().parents[1]
-    paired_chart(docs / "fps-chart.png")
+    paired_chart(docs / "fps-chart-paired.png")
     rd64_chart(docs / "fps-chart-rd64.png")
