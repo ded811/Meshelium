@@ -6,6 +6,24 @@ Meshelium draws Minecraft's terrain with your graphics card's mesh shaders
 instead of the way the game normally does it. You get more frames per second,
 and you can push the render distance far past the slider's usual limit.
 
+## This release is a beta
+
+Meshelium 1.6 is out as a beta while it gets tested on more machines than
+the one it was built on. It is the first release to run on **NeoForge** as
+well as Fabric, and that half in particular has only been proven on one
+setup so far. The renderer underneath is the same code the Fabric releases
+have been running.
+
+**More is coming.** The next thing on the list is **Sodium compatibility**,
+so the two can run together instead of one replacing the other. Nothing to
+announce on timing yet.
+
+**Please report anything odd.** Bug reports, crashes, or just something
+that looks wrong go on the issue tracker:
+<https://github.com/ded811/Meshelium/issues>. The log is the useful part to
+attach - Meshelium writes down what it decided about your hardware, and
+why, every time the game starts.
+
 ## How much faster?
 
 Measured at 1920x1080 on an AMD Radeon RX 9070 XT, same world, same view. One
