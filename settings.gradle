@@ -1,12 +1,34 @@
+// The plugin repositories are the pre-split ones, unchanged. Only the
+// project list below is new: see the root build.gradle for why the split is
+// plain source sharing rather than Architectury.
 pluginManagement {
 	repositories {
 		maven {
 			name = 'Fabric'
 			url = 'https://maven.fabricmc.net/'
 		}
+		// NeoForge's plugins and artefacts, for the loader project that
+		// joins this build next.
+		maven {
+			name = 'NeoForged'
+			url = 'https://maven.neoforged.net/releases'
+		}
 		mavenCentral()
 		gradlePluginPortal()
 	}
 }
 
+// ModDevGradle runs NeoForge's decompile/patch tooling on a JDK 21
+// toolchain and hardcodes that version (NeoFormRuntimeTask sets
+// languageVersion 21 and exposes no way to override it). This machine has
+// 22 and 25 only, so let Gradle fetch a 21 for the tooling. The mod itself
+// still compiles and runs on 25 - this affects the build tools, not the
+// artefact.
+plugins {
+	id 'org.gradle.toolchains.foojay-resolver-convention' version '1.0.0'
+}
+
 rootProject.name = 'meshelium'
+
+include 'fabric'
+include 'neoforge'

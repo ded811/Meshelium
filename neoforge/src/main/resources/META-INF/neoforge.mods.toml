@@ -1,0 +1,53 @@
+modLoader = "javafml"
+loaderVersion = "[11,)"
+license = "LGPL-3.0-only"
+issueTrackerURL = "https://github.com/ded811/Meshelium/issues"
+
+[[mods]]
+modId = "meshelium"
+version = "${version}"
+displayName = "Meshelium"
+authors = "Ded811"
+displayURL = "https://modrinth.com/mod/meshelium"
+# Both, because they are different slots: bannerFile is the wide strip
+# and iconFile is the square badge in the mod list. Only the banner was
+# set, so the list showed an empty square and stretched a 256x256 logo
+# across the banner area. Fabric has had "icon" since 1.0.0.
+iconFile = "assets/meshelium/icon.png"
+bannerFile = "assets/meshelium/icon.png"
+description = '''
+Mesh-shader terrain rendering for every GPU that has them, on Minecraft's own Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. See a great deal further without the game falling over.
+'''
+
+# The mixin config lives in common/ and is shared byte-for-byte with the
+# Fabric build. Both loaders run the same Mixin fork, so the 37 mixin
+# classes are identical on both sides.
+[[mixins]]
+config = "meshelium.client.mixins.json"
+
+# NeoForge only, and one class. NeoForge patches Minecraft's window
+# creation to hand over its early loading screen's OpenGL window, which
+# Vulkan cannot draw to; this declines the handover so the first launch
+# does not crash. Nothing in it exists on Fabric, so it cannot live in the
+# shared config. See WindowEarlyDisplayMixin.
+[[mixins]]
+config = "meshelium.neoforge.mixins.json"
+
+# Upper-bounded on purpose. Every one of the 37 mixins is pinned to a
+# method descriptor in Minecraft 26.2's bytecode, and NeoForge recompiles
+# the whole game, so a NeoForge built for 26.3 would be a different set of
+# descriptors. Refusing to load is the correct failure; applying half the
+# mixins and rendering nothing is not.
+[[dependencies.meshelium]]
+modId = "neoforge"
+type = "required"
+versionRange = "[26.2,26.3)"
+ordering = "NONE"
+side = "CLIENT"
+
+[[dependencies.meshelium]]
+modId = "minecraft"
+type = "required"
+versionRange = "[26.2,26.3)"
+ordering = "NONE"
+side = "CLIENT"

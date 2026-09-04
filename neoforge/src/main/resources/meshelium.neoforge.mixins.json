@@ -1,0 +1,11 @@
+{
+	"required": true,
+	"minVersion": "0.8",
+	"package": "com.deds.meshelium.neoforge.mixin",
+	"client": [
+		"WindowEarlyDisplayMixin"
+	],
+	"injectors": {
+		"defaultRequire": 0
+	}
+}

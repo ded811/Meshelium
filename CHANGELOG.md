@@ -1,5 +1,86 @@
 # Changelog
 
+## 1.6.0
+
+**Meshelium runs on NeoForge.**
+
+Same renderer, same settings, same speed — the mod is now built for both
+Fabric and NeoForge from one set of code, so neither loader is the
+afterthought. Everything the mod does is shared between them; all that
+differs is the few lines each loader needs to start it up.
+
+**NeoForge players: nothing to set up.** There is a real problem
+underneath this, and Meshelium now deals with it for you. NeoForge's
+loading screen creates the game window in OpenGL mode, and Minecraft's
+Vulkan renderer cannot draw to a window made that way, so the game dies
+during start-up with an error that blames your graphics drivers. It is
+not your drivers. It is a NeoForge issue, its fix is not merged yet, and
+it would otherwise stop this mod dead for every NeoForge player, because
+Vulkan is the only backend Meshelium runs on.
+
+Meshelium closes that loading screen at the last moment before the game
+makes its window, so the game starts normally and you see nothing go
+wrong. Your game window opens a moment later than it would have, without
+a loading screen in front of it, and that is the whole of the
+difference. Meshelium also switches the setting off in `config/fml.toml`
+so the problem cannot come back on a future NeoForge build where the
+live fix no longer fits. If you are running OpenGL, none of this
+happens and your loading screen is left exactly as it was. Fabric is
+unaffected throughout.
+
+**Fixed: Meshelium did nothing at all if you skipped the main menu.**
+
+If you launch straight into a world — a launcher's "resume last world",
+or quick-play — Meshelium never switched itself on. It waited for the
+title screen before deciding whether your machine could use it, and if
+you never saw a title screen it never decided, so the whole mod sat idle
+for the entire session with no error and nothing in the log to say why.
+It now decides as soon as your graphics card is ready, whether or not
+you pass through the menu. If you have ever wondered why the mod seemed
+to do nothing sometimes, this was very likely it.
+
+**Fixed: the "switch to Vulkan" offer could disappear for good after you
+accepted it.**
+
+Pressing [Enable Vulkan] silently counted as pressing [Don't Show This
+Again]. That went unnoticed because it only bites when the Vulkan start-up
+then fails: Minecraft reacts to a crash during start-up by quietly putting
+your renderer back to OpenGL, so the next launch had Meshelium switched
+off, the offer spent, and no message of any kind. The mod sat dormant
+forever on hardware that runs it perfectly. Only [Don't Show This Again]
+retires that message now.
+
+**Fixed: a squared-off bite of missing ground and water at the edge of
+the loaded area.**
+
+Minecraft lists chunks for drawing in a circle but keeps them in memory
+in a square, so a chunk that slips out of the circle is still owned by
+the game, still fully built, and drawn by nobody. You saw it as a
+straight-edged gap on the side you were moving away from — about five
+chunks deep at render distance 16, taking the water surface with the
+land over an ocean. Meshelium now draws that terrain itself, since the
+game has already paid to build it.
+
+**Fixed: the ground and the ocean below you emptying out when you fly
+high.**
+
+Climb above the terrain and the world underneath went missing, worst
+over water, and it often stayed missing until you moved again — so
+hovering after a climb left the hole sitting there. Meshelium now
+decides column by column, using the ground directly beneath each chunk
+rather than the tallest thing anywhere in view, so a mountain behind you
+can no longer decide whether the water beneath you is drawn. At very low
+render distances this also closes a one-chunk-thick layer of missing
+chunks that appeared the moment you left the ground.
+
+**Fixed: water and glass vanishing while the land beside them stayed.**
+
+With occlusion culling on, the see-through half of the world was drawn
+from Minecraft's list of visible chunks while the solid half came from
+Meshelium's. Anything that emptied the game's list therefore took the
+water and left the seafloor: flying up did it, and so did anything that
+widened your field of view. Both halves now come from the same list.
+
 ## 1.5.2
 
 **Fixed: black water at the screen edges when your field of view widens.**
@@ -17,6 +98,8 @@ game to refresh the list the moment your field of view changes, which
 heals the water layer, the fallback path, and vanilla's own drawing all
 at once. Costs nothing while the view is steady.
 
+
+
 ## 1.5.1
 
 **Fixed: Solid Leaves was solidifying things that are not leaves.**
@@ -28,6 +111,8 @@ nothing behind them, which is leaves and full glass blocks, build
 solid. Thin details, plants and the grass-side overlay keep their
 normal look at every distance. Solid Leaves ships off, so nothing
 changed unless you had moved that slider.
+
+
 
 ## 1.5.0
 
@@ -63,6 +148,8 @@ The see-through look returns as you approach.
 
 **Fixed: the Advanced screen could cut off rows at larger interface
 sizes.** It scrolls now, and the Done button stays put at the bottom.
+
+
 
 ## 1.4.0
 
@@ -101,6 +188,8 @@ draws everything exactly as before; that is measured, not promised.
 They are sliders rather than defaults because the frame-rate gain
 depends on your world and your screen, and you are a better judge of
 your own horizon than we are.
+
+
 
 ## 1.3.0
 
@@ -174,6 +263,8 @@ occlusion passes behind a system property; it works, but on our AMD card the
 driver charges more for the mechanism than the skip saves, so it ships off.
 If you run this on NVIDIA or Intel and want to help, the properties are
 documented in the source.
+
+
 
 ## 1.2.0
 
@@ -287,6 +378,8 @@ Under heavy pressure it steps faster, because a world streaming in was
 measured filling terrain memory from 78 to 176 MB in three seconds, and a
 polite one-step-every-three-seconds could not keep up with that.
 
+
+
 ## 1.1.0
 
 **Occlusion culling is back, and this time it pays for itself.**
@@ -354,6 +447,8 @@ slightly less than we thought; the numbers above compare like with like.
   reverted. It made things slower and produced 63 ms stutters. The ceiling
   it was chasing is documented at 8 to 12 percent, so the next attempt
   starts from a number.
+
+
 
 ## 1.0.0
 

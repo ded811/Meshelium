@@ -12,14 +12,15 @@
 </p>
 
 <p align="center">
-  <a href="https://modrinth.com/mod/fabric-api"><img src="https://img.shields.io/badge/also%20install-Fabric%20API-1976D2?style=flat-square" alt="Fabric API on Modrinth"></a>
+  <img src="https://img.shields.io/badge/loader-Fabric%20%7C%20NeoForge-5B4FCF?style=flat-square" alt="Fabric and NeoForge">
+  <a href="https://modrinth.com/mod/fabric-api"><img src="https://img.shields.io/badge/on%20Fabric%2C%20also%20install-Fabric%20API-1976D2?style=flat-square" alt="Fabric API on Modrinth"></a>
   <a href="https://modrinth.com/mod/bobby"><img src="https://img.shields.io/badge/for%20multiplayer%2C%20also%20install-Bobby-7E57C2?style=flat-square" alt="Bobby on Modrinth"></a>
   <img src="https://img.shields.io/badge/Minecraft-26.2-brightgreen?style=flat-square" alt="Minecraft 26.2">
 </p>
 
 Frames per second at 1920x1080, same computer, same world, looking the same way, at default settings. One run with Meshelium, one without.
 
-![Bar chart showing how many times more frames per second Meshelium gives, rising from 1.5 times at render distance 12 to 5.3 times at render distance 64](docs/fps-chart.png)
+![Bar chart pairing frames per second with Meshelium on against Meshelium off at six render distances: 2,437 against 1,621 at 12 chunks, widening to 607 against 114 at 64 chunks](docs/fps-chart.png)
 
 **The further you look, the bigger Meshelium wins.** Here are the actual frame rates behind that graph, in frames per second, so higher is better:
 
@@ -40,8 +41,8 @@ These are our numbers on our computer: one graphics card, one world, one spot. Y
 
 ## What you need
 
-- **Minecraft 26.2** with the **Fabric** loader
-- [**Fabric API**](https://modrinth.com/mod/fabric-api), the helper mod almost every mod wants. Put it in your mods folder too
+- **Minecraft 26.2**, on either the **Fabric** or the **NeoForge** loader. Download the build that matches yours; they are the same mod
+- On Fabric, [**Fabric API**](https://modrinth.com/mod/fabric-api) as well, the helper mod almost every mod wants. Put it in your mods folder too. NeoForge needs no extra mod
 - Windows or Linux. Sorry, no Mac: Macs don't do mesh shaders on Vulkan yet
 - A graphics card that supports mesh shaders, which means **AMD** RX 6000 or newer, **NVIDIA** GTX 16xx or newer, or **Intel** Arc. Newer laptop and handheld chips count too, including the Steam Deck
 - If your card is older than that, Meshelium switches itself off, tells you why, and your game keeps working normally
@@ -86,7 +87,7 @@ Beyond** and **Cull Sub-Pixel Detail Beyond** skip drawing things too
 small to see at range, from distant grass tufts down to any face
 smaller than one pixel on your screen; both ship Off and apply
 instantly, so drag until you notice the picture change and back off a
-step. **Greedy Meshing** merges neighbouring block faces that look identical so there is less to draw, worth the most with Smooth Lighting off, and the picture stays the same; it ships off while it proves itself. **Idle Memory Trim** is on: after half a minute of standing still it hands unused terrain memory back to your graphics card, several hundred megabytes at long distances. **Duplicate Terrain Memory** should stay on Freed; it stops Minecraft holding a second copy of the world that nothing draws, worth gigabytes past 64 chunks. Set it to Kept only if another mod needs Minecraft's own terrain buffers. **Debug Stat Logging** writes numbers to the log and changes nothing you can see. **Backend Popup** re-arms the first-run Vulkan prompt.
+step. **Smart Leaves Beyond** skips the leaf faces buried inside tree canopies past a distance, keeping the see-through look; it ships on at 16 chunks because the buried faces cannot be seen from outside, trees regain full detail as you approach, and 0 turns it off. **Solid Leaves Beyond** goes further: past your chosen distance leaves build fully solid, the way Fast graphics draws them; it ships Off. **Greedy Meshing** merges neighbouring block faces that look identical so there is less to draw, worth the most with Smooth Lighting off, and the picture stays the same; it ships off while it proves itself. **Idle Memory Trim** is on: after half a minute of standing still it hands unused terrain memory back to your graphics card, several hundred megabytes at long distances. **Duplicate Terrain Memory** should stay on Freed; it stops Minecraft holding a second copy of the world that nothing draws, worth gigabytes past 64 chunks. Set it to Kept only if another mod needs Minecraft's own terrain buffers. **Debug Stat Logging** writes numbers to the log and changes nothing you can see. **Backend Popup** re-arms the first-run Vulkan prompt.
 
 ## Performance may vary
 
@@ -109,7 +110,7 @@ MCRcortex has no involvement in Meshelium, has not endorsed it, and is not respo
 ### And
 
 - **Bobby** by **Johni0702**, the perfect partner for playing online
-- The **Fabric** team, for the loader and Fabric API
+- The **Fabric** team, for the loader and Fabric API, and the **NeoForge** team for the other loader
 - Meshelium is by **Ded811**. Copyright (C) 2026
 - License: **LGPL-3.0-only**, the same license Nvidium uses
 

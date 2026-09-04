@@ -11,9 +11,11 @@ and you can push the render distance far past the slider's usual limit.
 Measured at 1920x1080 on an AMD Radeon RX 9070 XT, same world, same view. One
 run with the mod and one without:
 
+![Bar chart pairing frames per second with Meshelium on against Meshelium off at six render distances: 2,437 against 1,621 at 12 chunks, widening to 607 against 114 at 64 chunks](https://raw.githubusercontent.com/ded811/Meshelium/master/docs/fps-chart.png)
+
 | Render distance | Minecraft | Meshelium | Difference |
 |---|---|---|---|
-| 12, Minecraft's default | 1,621 FPS | **2,400 FPS** | 1.48× (+48%) |
+| 12, Minecraft's default | 1,621 FPS | **2,437 FPS** | 1.50× (+50%) |
 | 16 | 1,115 FPS | **2,126 FPS** | 1.91× (+91%) |
 | 24 | 641 FPS | **1,709 FPS** | 2.67× (+167%) |
 | 32, as far as Minecraft goes | 393 FPS | **1,206 FPS** | 3.07× (+207%) |
@@ -46,7 +48,7 @@ the rest of your game and your computer keep.
 - Windows or Linux. Sorry, no Mac: Macs don't do mesh shaders on Vulkan yet
 - A graphics card with mesh shaders. Meshelium asks your driver for the feature
   rather than checking a list of models, so anything that reports it will work.
-  In practice that means **AMD** RX 6000 or newer, **NVIDIA** RTX 20xx or newer,
+  In practice that means **AMD** RX 6000 or newer, **NVIDIA** GTX 16xx / RTX 20xx or newer,
   and **Intel** Arc, plus recent laptop and handheld chips. Keeping your
   graphics driver current matters as much as the card
 - If the feature is missing, Meshelium turns itself off and tells you why. Your
@@ -148,3 +150,25 @@ same LGPL-3.0 licence.
 MCRcortex has no involvement in Meshelium, has not endorsed it, and is not
 responsible for anything it does. Any bug you find here is ours. Go and star
 their project anyway.
+
+## NeoForge and the early loading screen
+
+**Handled for you; here is what is happening.** NeoForge's loading
+screen and Minecraft's Vulkan renderer cannot both exist. The loading
+screen creates the game window in OpenGL mode, and Vulkan — the renderer Meshelium runs on — cannot draw to a window made
+that way, so the game dies during start-up with a GLFW error that blames
+your graphics drivers. It is not your drivers, and updating them will not
+help. It is a known NeoForge issue (neoforged/NeoForge#3230) and its fix
+has not been merged.
+
+**You do not have to do anything about it.** Meshelium closes that
+loading screen in the instant before the game creates its window, so the
+game starts normally. You get no loading screen and a game window that
+appears a moment later than usual; nothing else changes. Meshelium also
+turns `earlyWindowControl` off in `config/fml.toml`, so that even on a
+future NeoForge build where the live fix no longer applies, the game
+still starts.
+
+On OpenGL none of this happens and the loading screen is left alone.
+
+The Fabric build is unaffected.

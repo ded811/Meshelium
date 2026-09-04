@@ -41,23 +41,21 @@ touch, and a completely different layer from what distance mods touch.
 
 | Mod | What it changes | Where the work moves | What it needs from your GPU |
 |---|---|---|---|
-| **Sodium** | Rewrites Minecraft's chunk renderer and mesher: better batching, better data layout, fewer state changes | Still CPU driven draws, per section, on OpenGL | Anything |
-| **Nvidium** | Adds a GPU driven mesh shader renderer on top of Sodium | GPU issues and culls the terrain work | Six mandatory GL extensions, five of them NVIDIA only. NVIDIA only in practice. |
+| **Nvidium** | Adds a GPU driven mesh shader renderer on top of an OpenGL chunk-renderer replacement | GPU issues and culls the terrain work | Six mandatory GL extensions, five of them NVIDIA only. NVIDIA only in practice. |
 | **Distant Horizons** | Builds its own low detail model of the world and draws it past your loaded chunks | A second, simplified world drawn alongside the real one | Anything |
 | **Bobby** | Caches the chunks a server sent you and replays them as real chunks later | The data layer. It draws nothing. | Nothing |
 | **Meshelium** | Re-encodes vanilla's finished section meshes into a GPU arena, then draws and culls them with mesh shaders | GPU issues and culls the terrain work | `VK_EXT_mesh_shader`, on Minecraft's Vulkan backend. AMD, NVIDIA and Intel all ship it. |
 
-**Versus Sodium.** Sodium makes the CPU side of terrain cheap. Meshelium takes
-the CPU side largely as vanilla gives it and moves the drawing and the
-visibility decision onto the GPU: one dispatch per visible region, and a task
-shader that throws sections away, instead of walking a section list on the CPU.
-That is why the gap widens as the scene gets heavier. Per section CPU work
-scales with the section count and a GPU task stage mostly does not. The two
-have never been run together and probably cannot be: Sodium is a GL era
-renderer, and this project has found no Sodium build that runs on 26.2's Vulkan
-backend, which is Meshelium's hard floor. Meshelium is **not** a Sodium addon,
-has no Sodium code, no Sodium dependency and no Sodium version pin. It was
-studied only because Nvidium is a Sodium addon.
+**Versus the CPU-side chunk-renderer replacements.** Those make the CPU side of
+terrain cheap. Meshelium takes the CPU side largely as vanilla gives it and
+moves the drawing and the visibility decision onto the GPU: one dispatch per
+visible region, and a task shader that throws sections away, instead of walking
+a section list on the CPU. That is why the gap widens as the scene gets
+heavier. Per section CPU work scales with the section count and a GPU task
+stage mostly does not. They are also a different era: those renderers are
+OpenGL, and Meshelium's hard floor is 26.2's Vulkan backend. Meshelium is
+standalone — it is an addon to nothing, has no third-party renderer as a
+dependency, and pins no version of one.
 
 **Versus Nvidium.** Nvidium is the reason this exists and it proved the whole
 idea. It is also NVIDIA only by construction: six GL extensions checked in a
@@ -488,15 +486,15 @@ ported, its shader logic. That debt is spelled out file by file in
 [Credits](#credits) and it is not a small one.
 
 What Meshelium is **not** is Nvidium with the names changed. Nvidium is an
-OpenGL Sodium addon standing on six mandatory GL extensions, five of them
-NVIDIA only. Getting the same idea onto AMD and Intel hardware, on Minecraft's
+OpenGL addon standing on six mandatory GL extensions, five of them NVIDIA
+only. Getting the same idea onto AMD and Intel hardware, on Minecraft's
 own Vulkan backend, turned out to be mostly a series of "you cannot do that
 here" problems, and each one needed an answer rather than a translation.
 
 | Area | Nvidium | Meshelium |
 |---|---|---|
 | **GPU requirement** | six GL extensions, all mandatory, no optional tier, five of them NVIDIA only | **one** extension, `VK_EXT_mesh_shader`, which AMD, NVIDIA and Intel all ship |
-| **Host** | Sodium addon on an OpenGL host, pinned to exact Sodium versions | **standalone on vanilla**, riding Minecraft's own Vulkan device, VMA allocator, queues and command encoder |
+| **Host** | an addon on an OpenGL host, pinned to exact host versions | **standalone on vanilla**, riding Minecraft's own Vulkan device, VMA allocator, queues and command encoder |
 | **Depth** | conventional depth | 26.2 is reversed Z: GEQUAL and a 0.0 clear, inherited by every pipeline |
 | **Visibility state** | one byte per section, shifted every frame, written by a cross stage same address race | **ping pong frame stamps**: one unsigned int per slot in two buffers picked by frame parity, every writer in a frame writing the identical value with an atomic exchange |
 | **Indirect draws** | 8 byte commands carrying a `firstTask` field | no GPU written indirect buffers at all: **one CPU recorded dispatch per visible region**, with push constants |
@@ -506,7 +504,7 @@ here" problems, and each one needed an answer rather than a translation.
 | **Occlusion speed hack** | `GL_NV_representative_fragment_test` | dropped, because the occlusion stores are idempotent so correctness does not depend on it |
 | **Memory** | 80 GB sparse virtual arena, which Nvidium itself disables on Linux | **256 MiB elastic arena**, grow and copy on demand, ceiling derived from the device's largest device local heap |
 | **VRAM pressure** | eviction heuristic fed by an async query raster | **no eviction**: hand the whole frame back to vanilla, so a partial world cannot happen |
-| **Settings and view distance** | Sodium's options GUI and option storage | vanilla's Video Settings, and **vanilla's own render distance slider widened** |
+| **Settings and view distance** | its host's options GUI and option storage | vanilla's Video Settings, and **vanilla's own render distance slider widened** |
 
 Five of those are worth a paragraph.
 
@@ -728,7 +726,7 @@ this as long as it is done openly. So: openly.
 
 **Alphadium**, the community fork of Nvidium (author "Cortex", with contributors
 **drouarb** and **R7CE4**), LGPL-3.0, which tracked the original across many
-Minecraft and Sodium versions. Studying it contributed two things directly. Its
+Minecraft and host versions. Studying it contributed two things directly. Its
 history proved that the GPU core survives host churn essentially byte identical
 while all the maintenance lands at the host boundary, which is the evidence
 behind Meshelium standing alone on vanilla. And Meshelium adopted two of its
@@ -772,8 +770,8 @@ the same breath for attacking the same layer from a different angle.
 - **SpongePowered Mixin**, via Loom.
 - **No optional mod integrations.** Meshelium compiles against nothing but
   Minecraft, Fabric loader and Fabric API, so a fresh clone builds.
-- **Sodium** is **not** a dependency and never was, for the reasons in
-  [Where Meshelium sits next to the mods you already run](#where-meshelium-sits-next-to-the-mods-you-already-run).
+- **No third-party renderer** is a dependency, and none ever was. Meshelium is
+  standalone on vanilla's own Vulkan backend.
 
 Not affiliated with Mojang, AMD, NVIDIA, or Intel.
 

@@ -1,0 +1,121 @@
+// The NeoForge package of Meshelium.
+//
+// Mirrors fabric/build.gradle in intent: this project holds only the two
+// loader files, and compiles the renderer from ../common as if it were its
+// own source. See the root build.gradle for why the split shares source
+// directly rather than through Architectury.
+//
+// ModDevGradle rather than the Architectury loom fork, for the same reason
+// the Fabric side stayed on plain loom: fewer moving parts in the launch
+// path, and nothing between the test harness and its exit code.
+plugins {
+	id 'net.neoforged.moddev' version "${moddev_version}"
+	id 'java-library'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+	archivesName = 'meshelium-neoforge'
+}
+
+// THE SHARED RENDERER, the same directory the Fabric project compiles.
+// Nothing in it names a loader, so both compilations see an identical and
+// complete picture; the only loader-specific code in this jar is the two
+// files under src/main/java here.
+sourceSets {
+	main {
+		java.srcDir rootProject.file('common/src/main/java')
+		resources.srcDir rootProject.file('common/src/main/resources')
+	}
+}
+
+neoForge {
+	version = project.neoforge_version
+
+	// The mixin config lives in common/ and is shared verbatim with the
+	// Fabric build. NeoForge reads it through neoforge.mods.toml's
+	// [[mixins]] block; both loaders run the same Mixin fork, so the 37
+	// mixin classes are the same bytes on both sides.
+	mods {
+		meshelium {
+			sourceSet sourceSets.main
+		}
+	}
+
+	runs {
+		client {
+			client()
+			// Same backend pin the Fabric harness uses. Vanilla 26.2 boots
+			// OpenGL-first, and on the OpenGL path Meshelium deliberately
+			// switches itself off - so without this a NeoForge boot test
+			// proves the mod loads and nothing about whether it renders.
+			// -Pmeshelium.backend=opengl|vulkan|default, as on Fabric.
+			if (project.hasProperty('meshelium.backend')) {
+				def backend = project.property('meshelium.backend').toString().toLowerCase()
+				if (!['opengl', 'vulkan', 'default'].contains(backend)) {
+					throw new IllegalArgumentException(
+							"meshelium.backend must be opengl, vulkan or default; got '${backend}'")
+				}
+				programArgument '--graphicsBackend'
+				programArgument backend
+			}
+			// -Pmeshelium.world=<name> boots straight into a world in
+			// neoforge/run/saves. Vanilla's own quick-play flag, and the
+			// closest thing this loader has to the Fabric harness: NeoForge
+			// ships server gametests only, so until a client harness exists
+			// the honest check is "load a world, let it render, read the
+			// log for terrain residency and draw counters".
+			if (project.hasProperty('meshelium.world')) {
+				programArgument '--quickPlaySingleplayer'
+				programArgument project.property('meshelium.world').toString()
+			}
+			// -Pmeshelium.vmargs="-Dk=v -Dk2=v2", the same diagnostic
+			// passthrough the Fabric runs have.
+			if (project.hasProperty('meshelium.vmargs')) {
+				project.property('meshelium.vmargs').toString().trim().split(/\s+/).each {
+					jvmArgument it
+				}
+			}
+		}
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+	it.options.encoding = 'UTF-8'
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+	// ModDevGradle runs its own decompile/patch tooling on a toolchain JVM
+	// and defaults that to 21. Only JDK 25 is installed on this machine, and
+	// 25 is what the mod targets, so pin it rather than have Gradle hunt for
+	// a JDK that is not there.
+	toolchain.languageVersion = JavaLanguageVersion.of(25)
+}
+
+processResources {
+	def v = project.version
+	inputs.property 'version', v
+	filesMatching('META-INF/neoforge.mods.toml') {
+		expand 'version': v
+	}
+}
+
+// LGPL-3.0-only conveyance: the licence text must accompany the binary,
+// exactly as on the Fabric side.
+jar {
+	from(rootProject.file('LICENSE')) {
+		rename { "${it}_meshelium" }
+	}
+}
+
+// No sources jar is built. The LGPL-3.0-only source obligation is met by
+// publishing this build's code to the public repo by hand,
+// which is the practice every release so far has followed - eight published
+// versions, none of them with a sources jar attached. Building one only
+// produced a 1.2 MB artifact nobody uploads, sitting in release/ next to the
+// files that DO get uploaded.

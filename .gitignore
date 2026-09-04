@@ -41,3 +41,32 @@ desktop.ini
 __pycache__/
 .claude/
 CLAUDE.md
+
+# Staged release artifacts. Built from tags; never source of truth.
+release/
+
+# ----------------------------------------------------------------------
+# PUBLIC REPO ONLY. This block does not exist in the private repo, and it
+# is the reason this .gitignore must not be overwritten by a straight copy
+# of the private one. Over there these docs are tracked on purpose; here
+# they must not be.
+#
+# Two reasons. Several carry a name the clean-room rule keeps out of
+# anything public (NVIDIUM-ARCHITECTURE.md alone has 60 mentions), and the
+# far-field files are designs for an unreleased 1.7 feature.
+#
+# The far-field CODE is still published, and has to be: it is compiled
+# into the shipped jar, so it is part of the corresponding source whether
+# or not a player can reach the feature. Only the design notes are held
+# back.
+#
+# Ignore everything under docs/, then name the exceptions, so a new
+# internal doc is private by default instead of public by accident.
+docs/*
+!docs/MODRINTH.md
+!docs/PERFORMANCE.md
+!docs/TECHNICAL.md
+!docs/fps-chart.png
+!docs/fps-chart-rd64.png
+!docs/releases/
+!docs/tools/
