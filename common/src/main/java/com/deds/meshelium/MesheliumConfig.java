@@ -165,7 +165,7 @@ public final class MesheliumConfig {
     public int configVersion = 0;
 
     /** Current schema version. Bump when adding a migration below. */
-    private static final int CURRENT_CONFIG_VERSION = 2;
+    private static final int CURRENT_CONFIG_VERSION = 3;
 
     /**
      * Bring an older file up to the current schema. Returns true if anything
@@ -202,6 +202,22 @@ public final class MesheliumConfig {
             // for the same reason as v1: nobody has had time to form an
             // opinion about a setting that is hours old.
             fogMode = FogMode.OFF;
+        }
+        if (configVersion < 3) {
+            // v3: re-arm the Vulkan prompt once.
+            //
+            // Every build before 504d1fd (all v1.7.0-pre builds) spent
+            // showVulkanPrompt on [Enable Vulkan], and a boot that then
+            // crashed back to OpenGL left the file saying "never ask" for a
+            // choice the player never made. The file cannot tell that false
+            // from a real [Don't Show This Again], so one extra notice for
+            // the second group is the price of ever telling the first group
+            // again - the same trade resetToDefaults() documents. All three
+            // flags, for the same reason the Advanced screen's "Backend
+            // Popup" row writes all three (owner report 2026-09-08 (beta.8)).
+            showVulkanPrompt = true;
+            noMeshShaderNoticeShown = false;
+            vulkanFailedNoticeShown = false;
         }
         configVersion = CURRENT_CONFIG_VERSION;
         return true;
@@ -425,6 +441,23 @@ public final class MesheliumConfig {
      * Read every frame by {@code TerrainDrawer.uploadScene}.
      */
     public int subPixelCullChunks = 0;
+
+    /**
+     * Under Sodium: resolve terrain visibility on the GPU (Meshelium's
+     * mirror of Sodium's chunk records, box-raster occlusion with a
+     * frame-to-frame memory, one indirect draw per geometry buffer)
+     * instead of drawing Sodium's render list as it comes.
+     *
+     * <p>Default ON since 2026-09-13 (D-025). Sodium reads its list from a
+     * 360-degree tree on every frame the camera moved and from a tighter
+     * one only at rest, which is why the frame rate dipped while looking
+     * around; the GPU path decides visibility itself and measured faster
+     * than the list path in every rd64 cell at 1080p and 1440p, static and
+     * moving, by 6-38%, at 2.1-2.5x Sodium. Off = the list path (stage
+     * 1), which is also the rung the GPU path falls back to on its own.
+     * JVM: {@code -Dmeshelium.sodium.gpuDraw=true|false} overrides.</p>
+     */
+    public boolean sodiumGpuVisibility = true;
 
     /**
      * Smart Leaves Beyond: past this many chunks, NEW section builds drop
@@ -802,6 +835,11 @@ public final class MesheliumConfig {
         };
     }
 
+    /** {@code meshelium.sodium.gpuDraw} ?? {@link #sodiumGpuVisibility}. */
+    public static boolean sodiumGpuVisibilityEnabled() {
+        return propertyOr("meshelium.sodium.gpuDraw", get().sodiumGpuVisibility);
+    }
+
     /** {@code meshelium.greedyMeshing} ?? {@link #greedyMeshing}. */
     public static boolean greedyMeshingEnabled() {
         return propertyOr("meshelium.greedyMeshing", get().greedyMeshing);
@@ -1048,6 +1086,7 @@ public final class MesheliumConfig {
         this.arenaTrim = d.arenaTrim;
         this.plantCullChunks = d.plantCullChunks;
         this.subPixelCullChunks = d.subPixelCullChunks;
+        this.sodiumGpuVisibility = d.sodiumGpuVisibility;
         this.smartLeavesChunks = d.smartLeavesChunks;
         this.solidLeavesChunks = d.solidLeavesChunks;
         // Retention has no rows any more (Bobby owns that job since

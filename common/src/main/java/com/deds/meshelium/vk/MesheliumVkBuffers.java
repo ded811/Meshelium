@@ -107,6 +107,74 @@ final class MesheliumVkBuffers {
      * SEQUENTIAL_WRITE's promise forbids reads, RANDOM_BIT lets VMA pick
      * cached-if-available memory; COHERENT means no invalidate needed).
      */
+    /**
+     * DEVICE-local if the driver will allow it, host-visible either way,
+     * persistently mapped, sequential-write — the resizable-BAR flavour.
+     *
+     * <h2>When to use this instead of {@link #createHostMapped}</h2>
+     * <p>When the CPU writes it once a frame and the GPU reads it MANY
+     * times. {@code createHostMapped} asks VMA to prefer HOST memory, so
+     * the allocation lands in system RAM and every GPU read crosses PCIe
+     * at roughly a microsecond of latency. That is invisible for something
+     * read a hundred times a frame and catastrophic for something read by
+     * every workgroup.
+     *
+     * <p>Measured, 2026-09-04: the Sodium run table started life on
+     * {@code createHostMapped}, and the mesh stage's binary search over it
+     * — about a dozen DEPENDENT reads per workgroup, tens of thousands of
+     * workgroups — cost roughly 0.5 ms a frame, which was more than the
+     * batching that needed it had just saved. The tell was that removing
+     * the workgroup barrier around the search barely helped: latency that
+     * refuses to hide is usually latency that is much larger than you
+     * think, not latency you are hiding badly.
+     *
+     * <h2>What "if the driver will allow it" means</h2>
+     * <p>{@code AUTO_PREFER_DEVICE} with a host-access flag asks VMA for
+     * memory that is both device-local and host-visible — the BAR window.
+     * On a card with resizable BAR that is the whole of VRAM; without it,
+     * classically 256 MiB; and where neither is available VMA falls back
+     * to host memory and the caller is exactly where
+     * {@code createHostMapped} would have left it. There is no failure
+     * mode here, only a quality of placement, which is why this returns
+     * the same type and takes no fallback argument.
+     *
+     * <p>Sequential-write still applies: never read the mapping back.
+     */
+    static MappedBuffer createDeviceMapped(long vma, long sizeBytes, int vkUsage, String what) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkBufferCreateInfo bufferInfo = VkBufferCreateInfo.calloc(stack)
+                    .sType$Default()
+                    .size(sizeBytes)
+                    .usage(vkUsage)
+                    .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE);
+            VmaAllocationCreateInfo allocInfo = VmaAllocationCreateInfo.calloc(stack)
+                    .usage(Vma.VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE)
+                    // HOST_VISIBLE and HOST_COHERENT are REQUIRED; only
+                    // DEVICE_LOCAL is a preference. Coherence has to be
+                    // required, not preferred: nothing on the write path
+                    // ever flushes, and the callers' contract says it need
+                    // not — a merely-preferred coherent bit could hand back
+                    // a non-coherent type on some card and the GPU would
+                    // read stale run records with no error anywhere.
+                    .requiredFlags(VK10.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                            | VK10.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                    .preferredFlags(VK10.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                    .flags(Vma.VMA_ALLOCATION_CREATE_MAPPED_BIT
+                            | Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            LongBuffer pBuffer = stack.callocLong(1);
+            PointerBuffer pAllocation = stack.callocPointer(1);
+            VmaAllocationInfo allocationInfo = VmaAllocationInfo.calloc(stack);
+            check(Vma.vmaCreateBuffer(vma, bufferInfo, allocInfo, pBuffer, pAllocation, allocationInfo),
+                    what);
+            long mapped = allocationInfo.pMappedData();
+            if (mapped == 0L) {
+                Vma.vmaDestroyBuffer(vma, pBuffer.get(0), pAllocation.get(0));
+                throw new IllegalStateException(what + ": VMA returned no persistent mapping");
+            }
+            return new MappedBuffer(pBuffer.get(0), pAllocation.get(0), mapped);
+        }
+    }
+
     static MappedBuffer createHostReadback(long vma, long sizeBytes, int vkUsage, String what) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCreateInfo bufferInfo = VkBufferCreateInfo.calloc(stack)

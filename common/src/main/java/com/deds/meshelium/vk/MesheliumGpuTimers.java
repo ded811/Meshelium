@@ -69,12 +69,17 @@ import java.util.OptionalLong;
  * point 4  after phase B       (occlusion mode only)
  * point 5  translucent begin
  * point 6  after translucent
+ * point 7  after pass 1a        (GPU rung only)
+ * point 8  after the half-res depth downsample (NEXT (c); lever-on only)
  * </pre>
  * Reported durations are DIFFERENCES of adjacent points, each valid only
  * when both ends were written this frame (a per-frame point mask travels
  * with the slot): phaseA=1−0, regionRaster=2−1, sectionRaster=3−2,
  * phaseB=4−3, translucent=6−5. In bfs/cpu mode "phaseA" is honestly the
  * whole single opaque pass and the other opaque slots read −1 (absent).
+ * On a half-resolution frame pass D lands between points 1 and 2, so
+ * downsample=8−1 and regionRaster becomes 2−8: the region-raster figure
+ * must not absorb the pass the lever exists to pay for.
  *
  * <h2>Honesty rules</h2>
  * <ul>
@@ -115,7 +120,25 @@ public final class MesheliumGpuTimers {
     public static final int PASS_SECTION_RASTER = 2;
     public static final int PASS_PHASE_B = 3;
     public static final int PASS_TRANSLUCENT = 4;
-    public static final int PASSES = 5;
+    /**
+     * The GPU rung's pass 1a alone (SOLID call: phase A SOLID and, with
+     * mergePhaseA, CUTOUT too), from the opaque begin to a mark written
+     * before the SOLID call returns. {@link #PASS_OPAQUE_A} spans to the
+     * CUTOUT call's mark and so carries whatever the host records between
+     * the two terrain layers; the difference of the two is that host
+     * work, which 0r could not separate (NEXT (b), 2026-09-14). -1 on
+     * the list path, which never writes the point.
+     */
+    public static final int PASS_1A = 5;
+    /**
+     * NEXT (c): pass D, the half-resolution depth downsample - from the
+     * phase-A mark to a mark written before pass 2 opens. -1 whenever the
+     * half-res lever is off, which is how a bench row proves the lever did
+     * or did not run its own pass. APPENDED, so every existing index and
+     * every bench JSON key stays where it was.
+     */
+    public static final int PASS_DOWNSAMPLE = 6;
+    public static final int PASSES = 7;
 
     // Timestamp points (query index within a frame slot).
     static final int POINT_OPAQUE_BEGIN = 0;
@@ -125,8 +148,21 @@ public final class MesheliumGpuTimers {
     static final int POINT_AFTER_PHASE_B = 4;
     static final int POINT_TRANSLUCENT_BEGIN = 5;
     static final int POINT_AFTER_TRANSLUCENT = 6;
+    /** End of the GPU rung's pass 1a (the former pad query; see {@link #PASS_1A}). */
+    static final int POINT_AFTER_PASS_1A = 7;
+    /**
+     * NEXT (c): end of pass D, written only on half-resolution frames -
+     * which is what makes {@link #PASS_DOWNSAMPLE} read -1 in an off-cell
+     * and a real figure in an on-cell, with nothing to configure.
+     */
+    static final int POINT_AFTER_DOWNSAMPLE = 8;
 
-    private static final int QUERIES_PER_FRAME = 8; // 7 used, 1 pad
+    // NEXT (c): 9, the MINIMUM the new point needs. The pool is
+    // RING_FRAMES * QUERIES_PER_FRAME and the per-slot write index is
+    // slot * QUERIES_PER_FRAME + point, so indices stay monotonic per slot
+    // and the ring argument is unchanged; ringMask is an int, with room for
+    // 32 points, so a later point costs one increment here.
+    private static final int QUERIES_PER_FRAME = 9;
     private static final int RING_FRAMES = 8;
     private static final int READ_LAG = TerrainResidency.FREE_FRAME_LAG;
 
@@ -416,18 +452,27 @@ public final class MesheliumGpuTimers {
         }
         int mask = ringMask[slot];
         ringFrame[slot] = -1; // consume once
-        OptionalLong[] values = pool.getValues(slot * QUERIES_PER_FRAME, QUERIES_PER_FRAME - 1);
+        OptionalLong[] values = pool.getValues(slot * QUERIES_PER_FRAME, QUERIES_PER_FRAME);
 
         long[] row = absentRow();
         boolean anyAbsentReady = false;
         boolean anomalous = false;
         // duration i spans points pairs[i][0] → pairs[i][1].
+        // NEXT (c): on a half-resolution frame pass D sits BETWEEN phase A
+        // and the region raster, so the region-raster segment must start at
+        // the downsample mark instead - without this it would silently
+        // absorb the downsample and every lever-on raster figure would be
+        // the sum of the two things the measurement is meant to separate.
+        int regionRasterStart = (mask & (1 << POINT_AFTER_DOWNSAMPLE)) != 0
+                ? POINT_AFTER_DOWNSAMPLE : POINT_AFTER_PHASE_A;
         int[][] pairs = {
                 {POINT_OPAQUE_BEGIN, POINT_AFTER_PHASE_A},
-                {POINT_AFTER_PHASE_A, POINT_AFTER_REGION_RASTER},
+                {regionRasterStart, POINT_AFTER_REGION_RASTER},
                 {POINT_AFTER_REGION_RASTER, POINT_AFTER_SECTION_RASTER},
                 {POINT_AFTER_SECTION_RASTER, POINT_AFTER_PHASE_B},
-                {POINT_TRANSLUCENT_BEGIN, POINT_AFTER_TRANSLUCENT}};
+                {POINT_TRANSLUCENT_BEGIN, POINT_AFTER_TRANSLUCENT},
+                {POINT_OPAQUE_BEGIN, POINT_AFTER_PASS_1A},
+                {POINT_AFTER_PHASE_A, POINT_AFTER_DOWNSAMPLE}};
         for (int i = 0; i < PASSES; i++) {
             int a = pairs[i][0];
             int b = pairs[i][1];
@@ -481,12 +526,13 @@ public final class MesheliumGpuTimers {
         }
         lastLogNanos = now;
         String line = String.format(
-                "meshelium GPU pass times (frame-%d readback, us): opaqueA=%s regionRaster=%s "
-                        + "sectionRaster=%s phaseB=%s translucent=%s "
+                "meshelium GPU pass times (frame-%d readback, us): opaqueA=%s downsample=%s "
+                        + "regionRaster=%s sectionRaster=%s phaseB=%s translucent=%s "
                         + "(GPU timestamps between vanilla pass-end barriers; CPU draw-path "
                         + "micros are a separate line — never sum the two)",
                 READ_LAG,
-                us(row[PASS_OPAQUE_A]), us(row[PASS_REGION_RASTER]), us(row[PASS_SECTION_RASTER]),
+                us(row[PASS_OPAQUE_A]), us(row[PASS_DOWNSAMPLE]),
+                us(row[PASS_REGION_RASTER]), us(row[PASS_SECTION_RASTER]),
                 us(row[PASS_PHASE_B]), us(row[PASS_TRANSLUCENT]));
         if (MesheliumConfig.debugStatsEnabled()) {
             MesheliumLog.LOGGER.info(line);

@@ -3,6 +3,7 @@ package com.deds.meshelium;
 import net.minecraft.client.Minecraft;
 
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -104,6 +105,63 @@ public final class MesheliumPlatform {
          * people building the thing.</p>
          */
         boolean isDevelopment();
+
+        /**
+         * Whether another mod is loaded, by its mod id.
+         *
+         * <p>Both loaders answer this from their own mod list, which is
+         * fully populated before any client code runs, so the answer is
+         * stable for the whole session and cheap to ask repeatedly.
+         *
+         * <p>This exists for ONE purpose: knowing when something else
+         * owns terrain rendering. Meshelium replaces the terrain draw by
+         * cancelling a vanilla method, and so does Sodium. Mixin returns
+         * from a target as soon as any HEAD callback cancels it, so two
+         * mods doing that to the same method is a silent race decided by
+         * apply order, and the loser's terrain never appears. Asking the
+         * loader is the only way to find out before drawing rather than
+         * after.
+         *
+         * <p>Do not grow this into general mod sniffing. Behaviour that
+         * varies by which mods are installed is behaviour nobody can
+         * reproduce from a bug report.
+         */
+        boolean isModLoaded(String modId);
+
+        /**
+         * Whether this jar carries the Sodium render adapter (the
+         * {@code sodium/} source set): the mesh-shader draw of Sodium's
+         * chunks. Both loaders since 2026-09-14: Fabric compiles it
+         * against the Modrinth artefact and NeoForge against the mod jar
+         * unwrapped out of Sodium's jar-in-jar wrapper at build time
+         * (neoforge/build.gradle, extractSodiumNeoForge). Before that it
+         * was Fabric only, and the "no" branch this answer feeds stays
+         * for any loader whose build omits {@code sodium/}.
+         *
+         * <p>Asked so the screens and the gate log can stop promising a
+         * draw path that is not in the jar. Before this existed the
+         * NeoForge build said "Working with Sodium" off the Vulkan device
+         * alone, and nothing ever drew (owner report 2026-09-08 (beta.8)).
+         */
+        boolean sodiumAdapterAvailable();
+
+        /**
+         * The version string of a loaded mod, by its mod id, or empty if
+         * no such mod is loaded or the loader will not say.
+         *
+         * <p>Added 2026-09-14 for the Sodium adapter's config entry,
+         * which shows Meshelium's version in Sodium's options screen and
+         * used to ask {@code FabricLoader} for it directly - one of the
+         * three lines that kept the adapter out of the NeoForge jar. The
+         * NeoForge entrypoint's start-up line reads the same answer, so
+         * the two cannot drift.
+         *
+         * <p>Only ever called after the entrypoint has installed the
+         * services: the config entry runs at
+         * {@code Minecraft.onGameLoadFinished}, and both loaders have
+         * their mod list populated before any entrypoint constructs.
+         */
+        Optional<String> modVersion(String modId);
     }
 
     private static volatile Services services;
@@ -154,6 +212,54 @@ public final class MesheliumPlatform {
      */
     public static boolean isDevelopment() {
         return require().isDevelopment();
+    }
+
+    /**
+     * Whether a mod with this id is loaded. See
+     * {@link Services#isModLoaded(String)}.
+     *
+     * <p>Answers false rather than throwing if the loader refuses the
+     * question. A wrong "no" leaves Meshelium behaving as it always has;
+     * an exception thrown from the gate would take the client down.
+     */
+    public static boolean isModLoaded(String modId) {
+        try {
+            return require().isModLoaded(modId);
+        } catch (Throwable t) {
+            MesheliumLog.LOGGER.warn(
+                    "Meshelium could not ask the loader whether '{}' is installed; assuming it is "
+                            + "not. If terrain is missing and another rendering mod is present, "
+                            + "this is the first thing to suspect.", modId, t);
+            return false;
+        }
+    }
+
+    /**
+     * Whether the Sodium render adapter is compiled into this jar. See
+     * {@link Services#sodiumAdapterAvailable()}. Answers false rather than
+     * throwing, for the same reason {@link #isModLoaded} does: a wrong
+     * "no" only makes the screens say Sodium is drawing alone.
+     */
+    public static boolean sodiumAdapterAvailable() {
+        try {
+            return require().sodiumAdapterAvailable();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * A loaded mod's version string, or empty. See
+     * {@link Services#modVersion(String)}. Answers empty rather than
+     * throwing, for the same reason {@link #sodiumAdapterAvailable} does:
+     * a version string is never worth failing a load over.
+     */
+    public static Optional<String> modVersion(String modId) {
+        try {
+            return require().modVersion(modId);
+        } catch (Throwable t) {
+            return Optional.empty();
+        }
     }
 
     private static Services require() {

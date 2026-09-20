@@ -16,11 +16,11 @@ displayURL = "https://modrinth.com/mod/meshelium"
 iconFile = "assets/meshelium/icon.png"
 bannerFile = "assets/meshelium/icon.png"
 description = '''
-Mesh-shader terrain rendering for every GPU that has them, on Minecraft's own Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. See a great deal further without the game falling over.
+Mesh-shader terrain rendering for every GPU that has them, on Minecraft's own Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. See a great deal further without the game falling over. Works with Sodium: Sodium builds the chunks, Meshelium draws them.
 '''
 
 # The mixin config lives in common/ and is shared byte-for-byte with the
-# Fabric build. Both loaders run the same Mixin fork, so the 37 mixin
+# Fabric build. Both loaders run the same Mixin fork, so the 38 mixin
 # classes are identical on both sides.
 [[mixins]]
 config = "meshelium.client.mixins.json"
@@ -33,7 +33,20 @@ config = "meshelium.client.mixins.json"
 [[mixins]]
 config = "meshelium.neoforge.mixins.json"
 
-# Upper-bounded on purpose. Every one of the 37 mixins is pinned to a
+# The Sodium adapter's mixins, the same bytes as the Fabric build's
+# (sodium/ is a source set of this jar since 2026-09-14). requiredMods
+# keeps FML from registering the config at all when Sodium is absent
+# (ModFileParser reads config/requiredMods/behaviorVersion;
+# MixinFacade.areRequiredModsPresent logs "not applied as required mod
+# 'sodium' is missing" and never hands the config to Mixin); the config's
+# own plugin re-checks from inside Mixin so a present-but-declined Sodium
+# (-Dmeshelium.sodium.adapter=false) still gets every render mixin
+# switched off.
+[[mixins]]
+config = "meshelium.sodium.mixins.json"
+requiredMods = ["sodium"]
+
+# Upper-bounded on purpose. Every one of the 38 shared mixins is pinned to a
 # method descriptor in Minecraft 26.2's bytecode, and NeoForge recompiles
 # the whole game, so a NeoForge built for 26.3 would be a different set of
 # descriptors. Refusing to load is the correct failure; applying half the

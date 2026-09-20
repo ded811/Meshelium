@@ -1,13 +1,29 @@
+import javax.inject.Inject
+
 // The NeoForge package of Meshelium.
 //
-// Mirrors fabric/build.gradle in intent: this project holds only the two
-// loader files, and compiles the renderer from ../common as if it were its
-// own source. See the root build.gradle for why the split shares source
-// directly rather than through Architectury.
+// Mirrors fabric/build.gradle in intent: this project holds only the loader
+// files (the entrypoint, its MesheliumPlatform.Services implementation, the
+// early-window bypass) and compiles the renderer from ../common and the
+// Sodium adapter from ../sodium as if they were its own source. See the
+// root build.gradle for why the split shares source directly rather than
+// through Architectury.
 //
 // ModDevGradle rather than the Architectury loom fork, for the same reason
 // the Fabric side stayed on plain loom: fewer moving parts in the launch
 // path, and nothing between the test harness and its exit code.
+//
+// ORDER OF THE BLOCKS BELOW IS LOAD BEARING. A Groovy script `def` is a
+// local of the script's run method: a closure declared AFTER it in source
+// order captures it, a closure declared BEFORE it resolves the bare name
+// against its delegate (the Project) and throws MissingPropertyException
+// when the closure runs. Two task registrations and one run block read
+// shared values, so: shared values first, then the repository and the
+// configuration they need, then the task classes and their registrations,
+// then the source set, then the dependencies that name the tasks, then the
+// run block that names the tasks and the values. tasks.named('x') is not a
+// way out of this - it throws UnknownTaskException for a task not yet
+// registered at the point of the call - so the order is the fix.
 plugins {
 	id 'net.neoforged.moddev' version "${moddev_version}"
 	id 'java-library'
@@ -20,24 +36,289 @@ base {
 	archivesName = 'meshelium-neoforge'
 }
 
-// THE SHARED RENDERER, the same directory the Fabric project compiles.
-// Nothing in it names a loader, so both compilations see an identical and
-// complete picture; the only loader-specific code in this jar is the two
-// files under src/main/java here.
+// BLOCK 0 - values shared by installSodiumForRun (block 3) and runs.client
+// (block 6). Declared here, above every reader, for the reason in the
+// header. Any further value both of them read goes here by name; nothing
+// else does.
+//
+//   -Pmeshelium.proofShot=<file>   the PNG the proof hook writes under
+//                                  run/screenshots/ and the one the install
+//                                  task sweeps before every run: ONE binding,
+//                                  so the two cannot disagree.
+//   -Pmeshelium.proofFrames=<n>    in-world frames before the hook captures;
+//                                  0 (the default) leaves the hook inert.
+def mesheliumProofShot = (project.findProperty('meshelium.proofShot') ?: 'meshelium-proof.png').toString()
+if (mesheliumProofShot.contains('/') || mesheliumProofShot.contains('\\') || mesheliumProofShot.isEmpty()) {
+	throw new IllegalArgumentException(
+			"meshelium.proofShot must be a bare file name under run/screenshots; got '${mesheliumProofShot}'")
+}
+def mesheliumProofFrames = (project.findProperty('meshelium.proofFrames') ?: '0').toString()
+if (!(mesheliumProofFrames ==~ /\d+/)) {
+	throw new IllegalArgumentException(
+			"meshelium.proofFrames must be a frame count; got '${mesheliumProofFrames}'")
+}
+
+// BLOCK 1 - the one repository ModDevGradle does not add. Its
+// RepositoriesPlugin adds NeoForged Releases, Mojang Meta and Mojang
+// Minecraft Libraries; the root build.gradle declares none; the Fabric
+// project declares this one for itself (fabric/build.gradle). exclusiveContent
+// so this repository answers ONLY maven.modrinth and nothing else in the
+// build changes resolution order.
+repositories {
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = 'Modrinth'
+				url = 'https://api.modrinth.com/maven'
+			}
+		}
+		filter { includeGroup 'maven.modrinth' }
+	}
+}
+
+// BLOCK 2 - a dedicated configuration for Sodium's NeoForge WRAPPER jar.
+// Never on a compile or runtime classpath itself: the published artefact
+// is a jar-in-jar shell (see block 3) whose classes javac cannot see, and
+// putting it on the JVM classpath would be wrong for a second reason given
+// under block 5. transitive = false: the Modrinth POM declares no
+// dependencies anyway, and nothing of Sodium's must ever arrive by accident.
+configurations {
+	sodiumNeoForge {
+		canBeConsumed = false
+		canBeResolved = true
+		transitive = false
+		description = "Sodium's NeoForge wrapper jar, unwrapped for compilation and installed into run/mods for -Pmeshelium.sodium runs"
+	}
+}
+
+// BLOCK 3 - the two tasks.
+//
+// Unwraps Sodium's NeoForge distribution. The published artefact is a
+// jar-in-jar shell: META-INF/jarjar/metadata.json plus the real mod jar
+// under META-INF/jarjar/ (plus a GraphicsBootstrapper early service, a
+// mods.toml and ~100 wrapper-only classes the adapter never imports), and
+// every class the adapter compiles against lives only in that nested jar.
+// javac given the shell sees an empty jar (measured 2026-09-04: 36 "package
+// does not exist" errors against an artefact that resolved perfectly).
+//
+// Why the glob is not the fragility the 2026-09-04 note feared. That note
+// assumed a hard-coded nested file name. The glob depends only on the
+// META-INF/jarjar/ directory, which is FML's own JarInJar contract
+// (JarInJarDependencyLocator reads META-INF/jarjar/metadata.json and the
+// `path` inside it), not on Sodium's naming; the task asserts exactly one
+// match and fails with the names it did find; and a version bump changes
+// the resolved wrapper, so the task re-runs and wipes its directory first -
+// a stale nested jar cannot linger beside a new one.
+//
+// A custom task class rather than Copy/Sync on purpose: Copy's source is
+// @SkipWhenEmpty, so a glob matching nothing would NO-SOURCE silently and
+// hand javac the same 36 errors. Both task classes call the injected
+// FileSystemOperations/ArchiveOperations through an explicit closure
+// parameter (`spec -> spec.from(...)`), never through the bare `from`/`into`
+// form, so neither depends on Gradle decorating the closure's delegate.
+// javax.inject.Inject is the one import Gradle's default set lacks, hence
+// line 1.
+@CacheableTask
+abstract class ExtractSodiumNeoForge extends DefaultTask {
+	@InputFiles
+	@PathSensitive(PathSensitivity.NAME_ONLY)
+	abstract ConfigurableFileCollection getWrapperJars()
+
+	// Glob inside the wrapper. Never a fixed file name.
+	@Input
+	abstract Property<String> getNestedJarGlob()
+
+	@OutputDirectory
+	abstract DirectoryProperty getOutputDir()
+
+	@Inject
+	abstract ArchiveOperations getArchives()
+
+	@Inject
+	abstract FileSystemOperations getFs()
+
+	@TaskAction
+	void extract() {
+		def out = outputDir.get().asFile
+		fs.delete { spec -> spec.delete(out) }
+		out.mkdirs()
+		def wrappers = wrapperJars.files
+		if (wrappers.size() != 1) {
+			throw new GradleException(
+					"sodiumNeoForge must resolve to exactly one wrapper jar, got ${wrappers}")
+		}
+		def wrapper = wrappers.first()
+		def glob = nestedJarGlob.get()
+		def matches = archives.zipTree(wrapper).matching { pattern -> pattern.include(glob) }.files
+		if (matches.size() != 1) {
+			throw new GradleException(
+					"Expected exactly one nested mod jar matching '${glob}' inside ${wrapper.name}, " +
+					"found ${matches.size()}: ${matches*.name}. Sodium changed its NeoForge wrapper " +
+					"layout; fix the glob or the coordinate.")
+		}
+		fs.copy { spec -> spec.from(matches); spec.into(out) }
+		logger.lifecycle("Unwrapped ${matches.first().name} from ${wrapper.name} into ${out}")
+	}
+}
+
+// Installs (or removes) Sodium's NeoForge WRAPPER in the run's mods folder
+// before every runClient, and sweeps the proof PNG. State-untracked on
+// purpose: run/mods is shared with anything the owner drops there by hand,
+// so it is never declared as an output, and the copy is cheap enough to do
+// every run.
+//
+// Why the wrapper and not the nested jar, and why a task: FML's
+// EarlyServiceDiscovery walks <gameDir>/mods unconditionally (dev and prod)
+// and claims the wrapper as an early-service jar because it ships
+// META-INF/services/...GraphicsBootstrapper; JarInJarDependencyLocator then
+// extracts the nested mod out of it. That is byte-for-byte how a player
+// installs Sodium on NeoForge. ModDevGradle never wipes run/ (unlike the
+// Fabric harness), so a jar copied in once would stay for every later
+// baseline run; this task runs unconditionally so the folder always equals
+// the command line. additionalRuntimeClasspath is NOT an option:
+// ModDevGradle 2.0.146 throws on any dependency added to it for Minecraft
+// >= 1.21.9 (ModDevRunWorkflow.forbidAdditionalRuntimeDependencies).
+//
+// The PNG sweep covers runs that never reach the hook's own delete (the
+// hook deletes the file again immediately before it grabs): vanilla's
+// Screenshot.grab overwrites a named file rather than de-duplicating it, so
+// without a sweep every proof run after the first could read a stale
+// picture. Gradle's delete ignores paths that do not exist, so the absent
+// run/screenshots/ costs nothing.
+abstract class InstallSodiumForRun extends DefaultTask {
+	@InputFiles
+	@PathSensitive(PathSensitivity.NAME_ONLY)
+	abstract ConfigurableFileCollection getWrapper()
+
+	@Internal
+	abstract DirectoryProperty getRunDir()
+
+	@Input
+	abstract Property<Boolean> getInstall()
+
+	@Input
+	abstract Property<String> getProofShot()
+
+	@Inject
+	abstract FileSystemOperations getFs()
+
+	@TaskAction
+	void sync() {
+		def mods = runDir.dir('mods').get().asFile
+		// Remove whatever this task installed before (any version). Only
+		// files matching the wrapper's own naming pattern are touched.
+		def stale = runDir.dir('mods').get().asFileTree.matching { pattern -> pattern.include('sodium-mc*-neoforge.jar') }
+		// ... and, whatever Modrinth names a future wrapper, the resolved
+		// artefact's own file name(s): a renamed wrapper must not survive a
+		// later baseline run without -Pmeshelium.sodium (review, 2026-09-14).
+		def wrappers = wrapper.files
+		def resolvedNames = wrappers.collect { f -> f.name } as Set
+		fs.delete { spec ->
+			spec.delete(stale)
+			resolvedNames.each { name -> spec.delete(new File(mods, name)) }
+		}
+		fs.delete { spec -> spec.delete(runDir.file("screenshots/${proofShot.get()}")) }
+		if (install.get()) {
+			if (wrappers.size() != 1) {
+				throw new GradleException(
+						"sodiumNeoForge must resolve to exactly one wrapper jar, got ${wrappers}")
+			}
+			mods.mkdirs()
+			fs.copy { spec -> spec.from(wrappers.first()); spec.into(mods) }
+			logger.lifecycle("Installed ${wrappers.first().name} into ${mods}")
+		} else {
+			logger.lifecycle("No -Pmeshelium.sodium: ${mods} holds no Sodium wrapper for this run")
+		}
+	}
+}
+
+def extractSodiumNeoForge = tasks.register('extractSodiumNeoForge', ExtractSodiumNeoForge) {
+	group = 'build setup'
+	description = "Unwraps Sodium's nested NeoForge mod jar so the adapter can compile against it"
+	wrapperJars.from(configurations.sodiumNeoForge)
+	nestedJarGlob = 'META-INF/jarjar/*-mod.jar'
+	outputDir = layout.buildDirectory.dir('sodium-neoforge')
+}
+
+def installSodiumForRun = tasks.register('installSodiumForRun', InstallSodiumForRun) {
+	group = 'build setup'
+	description = "Puts Sodium's wrapper jar into run/mods when -Pmeshelium.sodium is set, removes it otherwise, and sweeps the proof PNG"
+	doNotTrackState('run/mods is shared with hand-placed jars and must reflect the command line every run')
+	wrapper.from(configurations.sodiumNeoForge)
+	install = project.hasProperty('meshelium.sodium')
+	runDir = layout.projectDirectory.dir('run')
+	proofShot = mesheliumProofShot
+}
+
+// BLOCK 4 - THE SHARED RENDERER and THE SHARED ADAPTER, the same two
+// directories the Fabric project compiles. Nothing in common/ names a
+// loader; since 2026-09-14 nothing in sodium/ does either (its three
+// loader-bound lines went behind MesheliumPlatform and a class-loader
+// check), so both compilations see an identical and complete picture. The
+// only loader-specific code in this jar is under src/main/java here.
 sourceSets {
 	main {
 		java.srcDir rootProject.file('common/src/main/java')
 		resources.srcDir rootProject.file('common/src/main/resources')
+		// The Sodium adapter, exactly as fabric/build.gradle adds it. Its
+		// Sodium coordinate is the NeoForge twin, unwrapped by
+		// extractSodiumNeoForge above. mods { meshelium { sourceSet } } in
+		// block 6 hands the whole main output (common/ + sodium/ + this
+		// project) to FML through MOD_CLASSES with no further change, and
+		// the java-library `jar` packs com/deds/meshelium/sodium/** and
+		// meshelium.sodium.mixins.json the same way.
+		java.srcDir rootProject.file('sodium/src/main/java')
+		resources.srcDir rootProject.file('sodium/src/main/resources')
 	}
 }
 
+// BLOCK 5 - dependencies.
+dependencies {
+	sodiumNeoForge "maven.modrinth:sodium:${project.sodium_neoforge_version}"
+
+	// The unwrapped nested jar, and only that. fileTree, not files(task):
+	// the latter would put the DIRECTORY on the classpath and javac needs
+	// the jar. builtBy is what makes compileJava depend on the extraction.
+	//
+	// compileOnly, NEVER implementation/runtimeOnly, and not taste: the
+	// adapter's mixin plugin decides "is Sodium here" by asking its own
+	// class loader for RenderSectionManager.class, and FML's
+	// ModuleClassLoader.getResource falls back to the application class
+	// loader when its own modules have no answer. A nested Sodium jar on
+	// the JVM classpath would therefore make the plugin answer "present"
+	// for a Sodium FML never loaded as a mod, and the adapter mixins would
+	// try to apply against classes the transforming loader cannot see.
+	// The adapter classes ship in our jar; Sodium itself never does.
+	compileOnly fileTree(dir: layout.buildDirectory.dir('sodium-neoforge'), include: '*.jar')
+			.builtBy(extractSodiumNeoForge)
+
+	// sodium/ is the FIRST source in this build to import ASM
+	// (MesheliumSodiumMixinPlugin reads org.objectweb.asm.tree.ClassNode /
+	// MethodNode through org.spongepowered.asm.service.MixinService);
+	// common/, fabric/ and neoforge/ import none. Both come from
+	// ModDevGradle off the NeoForge 26.2.0.75 POM (org.ow2.asm:asm-tree
+	// 9.10.1 at compile scope; sponge-mixin 0.17.3+mixin.0.8.7, whose own
+	// POM depends on asm-tree). Nothing is declared here for them; this
+	// sentence exists so that a future ModDevGradle classpath change is
+	// diagnosable as "asm-tree left the compile classpath" rather than a
+	// javac error in a file nobody edited.
+}
+
+// Redundant with builtBy above, kept explicit so the dependency survives
+// someone later replacing the fileTree with a files(...) call.
+tasks.named('compileJava') { dependsOn extractSodiumNeoForge }
+
+// BLOCK 6 - the run block.
 neoForge {
 	version = project.neoforge_version
 
 	// The mixin config lives in common/ and is shared verbatim with the
 	// Fabric build. NeoForge reads it through neoforge.mods.toml's
-	// [[mixins]] block; both loaders run the same Mixin fork, so the 37
-	// mixin classes are the same bytes on both sides.
+	// [[mixins]] block; both loaders run the same Mixin fork, so the 38
+	// mixin classes are the same bytes on both sides. The adapter's config
+	// (meshelium.sodium.mixins.json, five render mixins including the
+	// invoker plus the two config-loader twins, seven in all) is the toml's
+	// third block, requiredMods = ["sodium"].
 	mods {
 		meshelium {
 			sourceSet sourceSets.main
@@ -47,11 +328,26 @@ neoForge {
 	runs {
 		client {
 			client()
+
+			// -Pmeshelium.sodium: Sodium's wrapper in run/mods for this run
+			// (and removed again on the next run without the property).
+			// Modrinth artefact, never ../test-mods: same rule as the Fabric
+			// compileOnly. The task runs before EVERY runClient so the folder
+			// always matches the command line. Note the property is root
+			// level and the Fabric project sees it too: there it puts the
+			// Modrinth Fabric jar on the run classpath (harmless for a
+			// :neoforge: task) and swaps the gametest entrypoint list, which
+			// is inert for :neoforge: tasks because processGametestResources
+			// is not in their graph.
+			taskBefore installSodiumForRun
+
 			// Same backend pin the Fabric harness uses. Vanilla 26.2 boots
 			// OpenGL-first, and on the OpenGL path Meshelium deliberately
 			// switches itself off - so without this a NeoForge boot test
 			// proves the mod loads and nothing about whether it renders.
 			// -Pmeshelium.backend=opengl|vulkan|default, as on Fabric.
+			// "graphicsBackend" is a vanilla Main option, the same string in
+			// the NeoForge-patched jar.
 			if (project.hasProperty('meshelium.backend')) {
 				def backend = project.property('meshelium.backend').toString().toLowerCase()
 				if (!['opengl', 'vulkan', 'default'].contains(backend)) {
@@ -61,18 +357,77 @@ neoForge {
 				programArgument '--graphicsBackend'
 				programArgument backend
 			}
-			// -Pmeshelium.world=<name> boots straight into a world in
-			// neoforge/run/saves. Vanilla's own quick-play flag, and the
+
+			// -Pmeshelium.quickplay=<name> (alias: the older -Pmeshelium.world)
+			// boots straight into neoforge/run/saves/<name>. Vanilla's own
+			// quick-play flag ("quickPlaySingleplayer", verified in both
+			// jars; FML passes program args through unchanged), and the
 			// closest thing this loader has to the Fabric harness: NeoForge
-			// ships server gametests only, so until a client harness exists
-			// the honest check is "load a world, let it render, read the
-			// log for terrain residency and draw counters".
-			if (project.hasProperty('meshelium.world')) {
-				programArgument '--quickPlaySingleplayer'
-				programArgument project.property('meshelium.world').toString()
+			// ships server gametests only, so the honest check is "load a
+			// world, let it render, read the log and the proof PNG".
+			// QuickPlay refuses a missing folder with
+			// quickplay.error.invalid_identifier and creates nothing.
+			def quickplay = ['meshelium.quickplay', 'meshelium.world']
+					.findAll { project.hasProperty(it) }
+					.collect { project.property(it).toString() }
+					.unique()
+			if (quickplay.size() > 1) {
+				throw new IllegalArgumentException(
+						"meshelium.quickplay and meshelium.world disagree: ${quickplay}")
 			}
+			if (quickplay) {
+				programArgument '--quickPlaySingleplayer'
+				programArgument quickplay.first()
+			}
+
+			// The switches every terrain run needs, named as the Fabric
+			// gametest run names them (fabric/build.gradle):
+			//   -Pmeshelium.terrain          -> -Dmeshelium.terrainDraw=true
+			//   -Pmeshelium.rd=<32..120>     -> -Dmeshelium.maxRenderDistance=<n>
+			//   -Pmeshelium.sodiumAdapter=<v> -> -Dmeshelium.sodium.adapter=<v>
+			//   -Pmeshelium.prop.<k>=<v>     -> -Dmeshelium.<k>=<v>
+			// The adapter's draw does not depend on meshelium.terrainDraw
+			// (only the Sodium slider ceiling reads it), so the proof run
+			// does not need -Pmeshelium.terrain.
+			if (project.hasProperty('meshelium.terrain')) {
+				systemProperty 'meshelium.terrainDraw', 'true'
+			}
+			if (project.hasProperty('meshelium.rd')) {
+				def rd = project.property('meshelium.rd').toString()
+				if (!(rd ==~ /\d+/) || rd.toInteger() < 32 || rd.toInteger() > 120) {
+					throw new IllegalArgumentException(
+							"meshelium.rd must be a chunk count in 32..120; got '${rd}'")
+				}
+				systemProperty 'meshelium.maxRenderDistance', rd
+			}
+			if (project.hasProperty('meshelium.sodiumAdapter')) {
+				systemProperty 'meshelium.sodium.adapter', project.property('meshelium.sodiumAdapter').toString()
+			}
+			project.properties.each { k, v ->
+				def key = k.toString()
+				if (key.startsWith('meshelium.prop.')) {
+					systemProperty 'meshelium.' + key.substring('meshelium.prop.'.length()), v.toString()
+				}
+			}
+
+			// The proof hook (MesheliumProofRun, common/): counts in-world
+			// frames, dumps the gate and the adapter's counters, takes
+			// run/screenshots/<proofShot> and stops the client. Both values
+			// are the block-0 bindings - the same ones installSodiumForRun
+			// sweeps by - so the file the game writes and the file the task
+			// wipes cannot disagree. Use the -P form for these two; a
+			// -Dmeshelium.dev.proofShot in vmargs would duplicate the -D.
+			systemProperty 'meshelium.dev.proofShot', mesheliumProofShot
+			if (project.hasProperty('meshelium.proofFrames')) {
+				systemProperty 'meshelium.dev.proofFrames', mesheliumProofFrames
+			}
+
 			// -Pmeshelium.vmargs="-Dk=v -Dk2=v2", the same diagnostic
-			// passthrough the Fabric runs have.
+			// passthrough the Fabric runs have. -Dmeshelium.smokeTicks=<n> is
+			// the watchdog every proof run keeps armed; -Dmixin.debug.verbose=true
+			// is what makes Mixin's "Mixing X from meshelium.sodium.mixins.json"
+			// lines appear at all - ModDevGradle's log4j config roots at INFO
+			// and Mixin logs apply lines at DEBUG without it.
 			if (project.hasProperty('meshelium.vmargs')) {
 				project.property('meshelium.vmargs').toString().trim().split(/\s+/).each {
 					jvmArgument it
@@ -100,6 +455,8 @@ java {
 processResources {
 	def v = project.version
 	inputs.property 'version', v
+	// Expands only the toml; meshelium.sodium.mixins.json and the shared
+	// config pass through untouched.
 	filesMatching('META-INF/neoforge.mods.toml') {
 		expand 'version': v
 	}
@@ -119,3 +476,19 @@ jar {
 // versions, none of them with a sources jar attached. Building one only
 // produced a 1.2 MB artifact nobody uploads, sitting in release/ next to the
 // files that DO get uploaded.
+
+// Two root censuses, wired in here so a plain `./gradlew build` runs both.
+//
+// checkSodiumCoordinate is called at CONFIGURATION time, not from a task:
+// its whole job is to stop a build whose Sodium coordinate and whose
+// shipped MesheliumSodiumVersion.BUILT_AGAINST name different Sodiums, and
+// a check that only runs when somebody remembers to run `check` is a check
+// that certifies memory. It is handed THIS project's property name and
+// loader suffix, because a root property inherits into every subproject
+// and the drafted single call would have green-lit a NeoForge-only bump
+// while reading the Fabric coordinate.
+rootProject.ext.checkSodiumCoordinate('sodium_neoforge_version', 'neoforge')
+
+tasks.named('check') {
+	dependsOn rootProject.tasks.named('checkLangKeys')
+}

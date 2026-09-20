@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Ded811
  * SPDX-License-Identifier: LGPL-3.0-only
  *
- * The pre5 instrument (docs/FARFIELD-WAVES.md): the far field,
+ * The pre5 instrument (docs/unreleased/farfield/FARFIELD-WAVES.md): the far field,
  * photographed in a world that HAS oceans, forests and cliffs in it.
  * Runs only under -Pmeshelium.farvisual, so the normal suite never
  * pays for it.
@@ -64,7 +64,7 @@ import java.util.function.Predicate;
  * wrong green and no cliff to be holed. So every colour and shape claim
  * this project has made was argued from javap output and PNG assets
  * rather than from a rendered pixel, and the same defects survived fix
- * after fix (docs/FARFIELD-WAVES.md, pre4 playtest; the same shape of
+ * after fix (docs/unreleased/farfield/FARFIELD-WAVES.md, pre4 playtest; the same shape of
  * blind spot the sibling repo's superflat merge tests had). This class
  * is the instrument that closes that gap.</p>
  *
@@ -477,7 +477,7 @@ public final class MesheliumFarFieldVisualTest implements FabricClientGameTest {
     private static final String TAG = "FARVISUAL";
 
     // ------------------------------------------------------------------
-    // S6: THE FLY-UP LADDER (docs/FARFIELD-WAVES.md, "FLY-UP ANSWERED")
+    // S6: THE FLY-UP LADDER (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP ANSWERED")
     //
     // Five fixes to the fly-up hole shipped without one of them ever being
     // reproduced under test. This leg reproduces it, and it is the first
@@ -504,7 +504,7 @@ public final class MesheliumFarFieldVisualTest implements FabricClientGameTest {
     //   * an A/B at four rungs. Without it a green run cannot distinguish
     //     "the fix works" from "this pose never had a hole".
     //
-    // pre21 (docs/FARFIELD-WAVES.md, "FLY-UP ANSWERED (seventh attempt:
+    // pre21 (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP ANSWERED (seventh attempt:
     // the core)"): the owner reproduced the layer at RENDER DISTANCE 2,
     // WITH the far field on. Four things changed here because of it:
     //   * the expectation set INCLUDES vanilla's 7x7 adjacency core. It was

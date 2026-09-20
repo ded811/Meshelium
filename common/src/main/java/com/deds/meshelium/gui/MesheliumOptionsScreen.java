@@ -6,6 +6,8 @@ package com.deds.meshelium.gui;
 
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumGate;
+import com.deds.meshelium.MesheliumPlatform;
+import com.deds.meshelium.MesheliumSodiumVersion;
 
 import com.mojang.blaze3d.platform.InputConstants;
 
@@ -37,10 +39,13 @@ import java.util.function.IntSupplier;
  * gate honesty, reworked in wave 15 from the owner's settings playtest
  * (2026-08-10, 12 directives). Reached three ways: the "Meshelium
  * Settings..." button in vanilla's Video Settings screen
- * ({@code VideoSettingsScreenMixin}, the primary route) and the
- * {@code /meshelium} client command. The wave-8 ModMenu adapter was
- * REMOVED at 1.0.0: it was a third route to this same screen and the only
- * thing stopping a clean clone from building.
+ * ({@code VideoSettingsScreenMixin}, the primary route on a vanilla
+ * install), the "Meshelium..." row at the bottom of vanilla's Options
+ * screen while Sodium is installed ({@code OptionsScreenMixin}, 2026-09-13:
+ * Sodium substitutes the Video Settings screen, so that route has nowhere
+ * to attach there), and the {@code /meshelium} client command. The wave-8
+ * ModMenu adapter was REMOVED at 1.0.0: it was one more route to this same
+ * screen and the only thing stopping a clean clone from building.
  *
  * <h2>Wave-15 layout (owner directive 4: "re arange it in a way that
  * makes sense")</h2>
@@ -118,6 +123,18 @@ import java.util.function.IntSupplier;
  * the gate is not VULKAN_MESH_SHADERS the renderer rows render INACTIVE
  * with a banner naming the exact cause, plus the [Enable Vulkan]
  * affordance on the plain-GL path (broken-promise rule unchanged).</p>
+ *
+ * <p><b>Sodium (owner report 2026-09-08 (beta.8)).</b> SODIUM_PRESENT is
+ * about the vanilla path, so the banner and the tooltips read the
+ * BACKEND ({@link MesheliumGate#backend()}) and the adapter
+ * ({@link MesheliumGate#sodiumAdapterArmed()}) instead of the gate: the
+ * standalone rows are held with a sentence that says Sodium builds the
+ * chunks, never "Needs the Vulkan renderer" on a Vulkan game; the
+ * distance-cap rows are live, because the range they edit is widened
+ * under Sodium too; [Enable Vulkan] is offered when the backend is
+ * OpenGL; and a screen built while the gate was still undecided rebuilds
+ * itself once it has decided, so "still checking" cannot outlive the
+ * check.</p>
  */
 public final class MesheliumOptionsScreen extends Screen {
 
@@ -133,9 +150,35 @@ public final class MesheliumOptionsScreen extends Screen {
     private final LinearLayout layout = LinearLayout.vertical().spacing(2);
     /** Wave-13 harness probe: true when the gate locked the renderer rows. */
     private boolean gateLocked;
+    /**
+     * The distance-cap rows, separately: they edit a vanilla option's
+     * range that {@code MesheliumExtendedRd} widens under Sodium too, so
+     * they are live there while the renderer rows are held. Holding them
+     * on {@link #gateLocked} had the row and the range disagreeing.
+     */
+    private boolean capLocked;
+    /**
+     * The gate at init. A screen built under UNKNOWN (the loading-overlay
+     * fade on a fresh boot) rebuilds itself once the gate decides; see
+     * {@link #tick()}.
+     */
+    private MesheliumGate.State gateAtInit;
+    /** The gate banner, when one was built; a harness probe reads it. */
+    private MultiLineTextWidget gateBanner;
     /** The tick-updated status header (see class javadoc). */
     private StringWidget statusLine;
+    /**
+     * Terrain memory, built on the standalone screen only: it reads
+     * {@code TerrainResidency} and {@code MesheliumVramState}, which
+     * describe Meshelium's OWN arena, and under Sodium nothing fills it.
+     */
     private StringWidget memoryLine;
+    /**
+     * Which Sodium is installed, and whether it is the one this build was
+     * made for. Built under Sodium only, and only when the loader will say
+     * what version it is.
+     */
+    private MultiLineTextWidget sodiumVersionLine;
     /** Wave-15: cap value at init — onClose rebuilds a stale parent on change. */
     private int capAtOpen;
     /**
@@ -211,6 +254,44 @@ public final class MesheliumOptionsScreen extends Screen {
         return this.gateLocked;
     }
 
+    /**
+     * Harness probe: were the distance-cap rows held? Under Sodium they
+     * are live while {@link #gateLocked()} is true.
+     */
+    public boolean capLocked() {
+        return this.capLocked;
+    }
+
+    /** Harness probe: the gate banner's text, or "" when none was built. */
+    public String gateBannerText() {
+        return this.gateBanner != null ? this.gateBanner.getMessage().getString() : "";
+    }
+
+    /**
+     * Harness probe: the Sodium version line, or "" when none was built.
+     *
+     * <p>Empty is a legitimate answer twice over: on a standalone build
+     * there is no Sodium, and under a loader that will not report a mod
+     * version there is no honest sentence to write. The leg that reads
+     * this distinguishes the two rather than accepting "" as a pass.
+     */
+    public String sodiumVersionText() {
+        return this.sodiumVersionLine != null
+                ? this.sodiumVersionLine.getMessage().getString() : "";
+    }
+
+    /**
+     * Harness probe: rebuild the status header now, on the caller's
+     * thread, so the text and the counter it was built from can be read
+     * in the same call with no frame in between. {@link #tick()} does the
+     * same once per client tick, and frames render between ticks.
+     */
+    public void testRefreshStatus() {
+        if (this.statusLine != null) {
+            this.statusLine.setMessage(buildStatusLine());
+        }
+    }
+
     /** Wave-13 harness probe: the status header's current text. */
     public String statusText() {
         return this.statusLine != null ? this.statusLine.getMessage().getString() : "";
@@ -266,6 +347,17 @@ public final class MesheliumOptionsScreen extends Screen {
     @Override
     public void tick() {
         super.tick();
+        // Built while the gate was undecided (the loading-overlay fade on a
+        // fresh boot): rebuild once it has decided, the rebuildOcclusionRows
+        // idiom, or the banner keeps saying the backend is being checked
+        // for as long as the screen stays open (owner report 2026-09-08
+        // (beta.8)).
+        if (this.gateAtInit == MesheliumGate.State.UNKNOWN
+                && MesheliumGate.state() != MesheliumGate.State.UNKNOWN
+                && this.minecraft != null) {
+            this.minecraft.gui.setScreen(new MesheliumOptionsScreen(this.parent));
+            return;
+        }
         if (this.statusLine != null) {
             this.statusLine.setMessage(buildStatusLine());
         }
@@ -290,7 +382,86 @@ public final class MesheliumOptionsScreen extends Screen {
             case VULKAN_NO_MESH_SHADERS -> off("meshelium.options.status.reason.no_mesh");
             case UNKNOWN -> Component.translatable("meshelium.options.status.checking")
                     .withStyle(ChatFormatting.YELLOW);
+            case SODIUM_PRESENT -> sodiumStatusLine();
             case VULKAN_MESH_SHADERS -> vulkanStatusLine();
+        };
+    }
+
+    /**
+     * With Sodium installed there are two different things Meshelium can
+     * be doing, and for one release the screen only knew about one of
+     * them: it reported "off" while the mesh-shader adapter was drawing
+     * the world. The gate state cannot distinguish them — SODIUM_PRESENT
+     * correctly means "the vanilla path is down" in both cases — so the
+     * adapter has to be asked separately.
+     */
+    private Component sodiumStatusLine() {
+        if (!MesheliumGate.sodiumAdapterArmed()) {
+            // Name the reason that is actually true. The stock sentence
+            // promises Vulkan would help, which on a loader whose jar has
+            // no adapter (NeoForge until 2026-09-14; no shipped loader
+            // now) or with the adapter declined on the command line it
+            // would not (owner report 2026-09-08 (beta.8)).
+            String reason = !MesheliumPlatform.sodiumAdapterAvailable()
+                    ? "meshelium.options.status.reason.sodium_no_adapter"
+                    : !MesheliumGate.sodiumAdapterConfigured()
+                            ? "meshelium.options.status.reason.sodium_declined"
+                            : "meshelium.options.status.reason.sodium";
+            return off(reason);
+        }
+        if (com.deds.meshelium.vk.SodiumTerrainDrawer.broken()) {
+            return off("meshelium.options.status.reason.error");
+        }
+        if (this.minecraft == null || this.minecraft.level == null) {
+            return Component.translatable("meshelium.options.status.sodium_ready")
+                    .withStyle(ChatFormatting.GREEN);
+        }
+        // Armed is intent; framesDrawn() is the fact (the gate javadoc).
+        // A renderer that armed and never drew must not read "drawing 0
+        // chunk sections".
+        if (com.deds.meshelium.vk.SodiumTerrainDrawer.framesDrawn() == 0L) {
+            return off("meshelium.options.status.reason.sodium_no_frames");
+        }
+        // Per FRAME, the unit of the vanilla-path header and of the tooltip.
+        // The per-pass figure alternates between the SOLID and the CUTOUT
+        // pass and counts runs rather than sections (owner report
+        // 2026-09-08 (beta.8)).
+        return Component.translatable("meshelium.options.status.sodium_active",
+                com.deds.meshelium.vk.SodiumTerrainDrawer.lastSectionsDrawnFrame())
+                .withStyle(ChatFormatting.GREEN);
+    }
+
+    /**
+     * The lock banner under Sodium. SODIUM_PRESENT is about the vanilla
+     * path; the banner has to say what the ADAPTER is doing and, if it is
+     * not, why - which is a backend or a loader question, never "still
+     * checking" once the gate has decided (owner report 2026-09-08
+     * (beta.8)).
+     */
+    private static String sodiumBannerKey(MesheliumGate.State backend,
+            boolean vulkanAlreadyRequested) {
+        if (MesheliumGate.sodiumAdapterArmed()) {
+            return "meshelium.options.gate.sodium";
+        }
+        if (!MesheliumPlatform.sodiumAdapterAvailable()) {
+            // No backend would turn it on, so the backend is not the story.
+            return "meshelium.options.gate.sodium_no_adapter";
+        }
+        // The two SODIUM TWINS (2026-09-16). gate.vulkan_failed and
+        // gate.no_mesh are shared with the standalone screen's own switch
+        // and must not gain a Sodium sentence, but under Sodium both are
+        // shown over a screen with nine rows missing AND both used to say
+        // "Minecraft keeps rendering the normal way" while Sodium was the
+        // one drawing. The twins say who is drawing and name the settings
+        // this screen is holding.
+        return switch (backend) {
+            case OPENGL -> vulkanAlreadyRequested
+                    ? "meshelium.options.gate.vulkan_failed.sodium"
+                    : "meshelium.options.gate.sodium_opengl";
+            case VULKAN_NO_MESH_SHADERS -> "meshelium.options.gate.no_mesh.sodium";
+            case UNKNOWN -> "meshelium.options.gate.unknown";
+            // VULKAN_MESH_SHADERS with -Dmeshelium.sodium.adapter=false.
+            default -> "meshelium.options.gate.sodium_declined";
         };
     }
 
@@ -414,7 +585,17 @@ public final class MesheliumOptionsScreen extends Screen {
         super.init();
         MesheliumConfig config = MesheliumConfig.get();
         MesheliumGate.State gate = MesheliumGate.state();
+        this.gateAtInit = gate;
+        boolean sodium = gate == MesheliumGate.State.SODIUM_PRESENT;
+        // Standalone renderer rows: Meshelium's own chunk path is live only
+        // here.
         this.gateLocked = gate != MesheliumGate.State.VULKAN_MESH_SHADERS;
+        // The cap edits a vanilla option's range and Sodium draws the extra
+        // distance, so it is held for UNKNOWN, OpenGL and no-mesh only
+        // (MesheliumExtendedRd.onEndTick's gateOk counts SODIUM_PRESENT).
+        // Holding it under Sodium had the row and the range disagreeing
+        // (owner report 2026-09-08 (beta.8)).
+        this.capLocked = this.gateLocked && !sodium;
         this.capAtOpen = config.maxRenderDistance;
         this.rdAtOpen = this.minecraft != null && this.minecraft.options != null
                 ? this.minecraft.options.renderDistance().get() : -1;
@@ -424,6 +605,11 @@ public final class MesheliumOptionsScreen extends Screen {
         // which is built before it, can count it.
         boolean occlusionOverridden = System.getProperty("meshelium.terrainDraw.bfsOnly") != null;
         boolean fogOverridden = System.getProperty("meshelium.fogMode") != null;
+        // Hoisted from the GPU Visibility row below for the same reason
+        // occlusionOverridden is: the dev-override banner is built above
+        // that row and has to be able to count it. Under Sodium it is one
+        // of only three properties that can lock anything on this screen.
+        boolean sodiumGpuOverridden = System.getProperty("meshelium.sodium.gpuDraw") != null;
         // meshelium.retainTerrain / meshelium.retainSeconds are deliberately
         // absent from this census: retention has no row left to lock
         // (2026-08-11, see the class javadoc), so a dev arming it must
@@ -445,19 +631,55 @@ public final class MesheliumOptionsScreen extends Screen {
         this.statusLine.setTooltip(Tooltip.create(
                 Component.translatable("meshelium.options.tooltip.status")));
 
+        // WHICH Sodium, directly under the status header, because it is
+        // the second thing a Sodium player needs to know and the first
+        // thing a bug report needs. GRAY when it is the version this build
+        // was made for, YELLOW with what to do when it is not. Built only
+        // when the loader will say: inventing "unknown" in a sentence that
+        // is meant to reassure would be worse than no row.
+        if (sodium) {
+            String installedSodium =
+                    MesheliumPlatform.modVersion(MesheliumGate.SODIUM_MOD_ID).orElse(null);
+            if (installedSodium != null) {
+                Component versionLine = MesheliumSodiumVersion.matches(installedSodium)
+                        ? Component.translatable("meshelium.options.sodium.version",
+                                installedSodium).withStyle(ChatFormatting.GRAY)
+                        : Component.translatable("meshelium.options.sodium.version_mismatch",
+                                installedSodium, MesheliumSodiumVersion.BUILT_AGAINST)
+                                .withStyle(ChatFormatting.YELLOW);
+                this.sodiumVersionLine = this.layout.addChild(
+                        new MultiLineTextWidget(versionLine, this.font)
+                                .setMaxWidth(BANNER_MAX_WIDTH)
+                                .setCentered(true), s -> s.paddingTop(1));
+            }
+        }
+
         // Terrain memory on its OWN line under the status, not appended to
         // it (owner's request). The status answers "is it running"; the
         // memory answers "what is it costing", and jamming both into one
         // line made the row long enough to crowd the screen.
-        this.memoryLine = this.layout.addChild(
-                new StringWidget(memoryStatus(), this.font), s -> s.paddingTop(1));
+        //
+        // NOT under Sodium: memoryStatus() reads TerrainResidency and
+        // MesheliumVramState, which are Meshelium's own arena, and
+        // SodiumTerrainDrawer never touches either. The line read
+        // "Terrain memory: 0 MB" on a screen whose header said Meshelium
+        // was drawing the world, which is a number that can only mislead.
+        if (!sodium) {
+            this.memoryLine = this.layout.addChild(
+                    new StringWidget(memoryStatus(), this.font), s -> s.paddingTop(1));
+        }
 
         // Gate banner: WHY the rows below are locked, by exact cause —
         // plus the wave-1 [Enable Vulkan] affordance on the plain-GL path
         // (no button when the option already says VULKAN but boot fell
         // back — the broken-promise rule).
         if (this.gateLocked) {
-            boolean vulkanAlreadyRequested = gate == MesheliumGate.State.OPENGL
+            // Keyed on the BACKEND, not the gate: under Sodium the gate says
+            // SODIUM_PRESENT whatever the backend is, and reading that as
+            // "undecided" is what put "still checking the graphics backend"
+            // on a Sodium-on-Vulkan screen (owner report 2026-09-08 (beta.8)).
+            MesheliumGate.State backend = MesheliumGate.backend();
+            boolean vulkanAlreadyRequested = backend == MesheliumGate.State.OPENGL
                     && this.minecraft.options.preferredGraphicsBackend().get()
                             == PreferredGraphicsApi.VULKAN;
             String reasonKey = switch (gate) {
@@ -465,13 +687,22 @@ public final class MesheliumOptionsScreen extends Screen {
                         ? "meshelium.options.gate.vulkan_failed"
                         : "meshelium.options.gate.opengl";
                 case VULKAN_NO_MESH_SHADERS -> "meshelium.options.gate.no_mesh";
-                default -> "meshelium.options.gate.unknown";
+                case SODIUM_PRESENT -> sodiumBannerKey(backend, vulkanAlreadyRequested);
+                case UNKNOWN -> "meshelium.options.gate.unknown";
+                case VULKAN_MESH_SHADERS -> throw new AssertionError(
+                        "gateLocked is false for " + gate);
             };
-            this.layout.addChild(new MultiLineTextWidget(
+            this.gateBanner = this.layout.addChild(new MultiLineTextWidget(
                     Component.translatable(reasonKey).withStyle(ChatFormatting.YELLOW), this.font)
                     .setMaxWidth(BANNER_MAX_WIDTH)
                     .setCentered(true), s -> s.paddingTop(2));
-            if (gate == MesheliumGate.State.OPENGL && !vulkanAlreadyRequested) {
+            // The button covers plain GL and Sodium-on-GL alike; the
+            // broken-promise rule is unchanged. Not on a loader whose jar
+            // has no adapter (none of the shipped ones since 2026-09-14,
+            // kept for any build that omits sodium/): the banner above
+            // has just said no renderer would turn it on.
+            if (backend == MesheliumGate.State.OPENGL && !vulkanAlreadyRequested
+                    && (!sodium || MesheliumGate.sodiumAdapterConfigured())) {
                 Button enable = Button.builder(
                         Component.translatable("meshelium.popup.enable_vulkan"),
                         b -> this.enableVulkan()).width(WIDGET_WIDTH).build();
@@ -480,7 +711,25 @@ public final class MesheliumOptionsScreen extends Screen {
                 this.layout.addChild(enable);
             }
         }
-        if (terrainOverridden || maxRdOverridden || occlusionOverridden) {
+        // THE CENSUS IS PER SHAPE, over the rows this screen actually
+        // built. Two changes here, both declared:
+        //
+        // 1. fogOverridden joins the standalone census. It already locks
+        //    two rows on BOTH shapes (fog.active and fogSliderActive
+        //    below), so a -Dmeshelium.fogMode run greyed two rows out with
+        //    no banner saying why. That is a fix, and it is the ONE
+        //    behaviour change the standalone screen takes in this commit;
+        //    it has its own assertion rather than riding along under
+        //    "nothing moved".
+        // 2. Under Sodium the master switch and the occlusion trio are not
+        //    built at all, so their properties must not raise a banner
+        //    over rows that are not on screen - the same rule the Advanced
+        //    screen's own census follows, and the reason retention and
+        //    debugStats are absent from this one.
+        boolean devOverride = sodium
+                ? maxRdOverridden || fogOverridden || sodiumGpuOverridden
+                : terrainOverridden || maxRdOverridden || occlusionOverridden || fogOverridden;
+        if (devOverride) {
             this.layout.addChild(new MultiLineTextWidget(
                     Component.translatable("meshelium.options.dev_override"), this.font)
                     .setMaxWidth(BANNER_MAX_WIDTH)
@@ -493,6 +742,16 @@ public final class MesheliumOptionsScreen extends Screen {
         // Enabled/Disabled rather than ON/OFF because "Terrain Rendering:
         // OFF" reads like a rendering feature being disabled rather than
         // the whole mod being switched off, which is what it actually does.
+        //
+        // NOT BUILT UNDER SODIUM (2026-09-16). The row's own comment below
+        // has said for a release that the switch does not govern the Sodium
+        // adapter, so under Sodium it was a greyed switch whose tooltip
+        // promised the whole mod and whose only truthful annotation was a
+        // sentence saying it does nothing here. A row that cannot act is
+        // not information, it is furniture; the banner above now names
+        // every setting this screen is holding, including this one, and
+        // names the property that DOES switch the adapter off.
+        if (!sodium) {
         CycleButton<Boolean> terrain = CycleButton
                 .booleanBuilder(Component.translatable("meshelium.options.enabled"),
                         Component.translatable("meshelium.options.disabled"),
@@ -507,14 +766,20 @@ public final class MesheliumOptionsScreen extends Screen {
                 });
         terrain.setWidth(WIDGET_WIDTH);
         terrain.active = !this.gateLocked && !terrainOverridden;
-        terrain.setTooltip(tip("meshelium.options.tooltip.terrain", "meshelium.options.applies.now"));
+        // No Sodium arm left on this tooltip: the row is not built under
+        // Sodium at all, so tip()'s SODIUM_PRESENT branch is unreachable
+        // from here. Making this switch govern the adapter is still a
+        // separate change on the draw path.
+        terrain.setTooltip(tip(this.gateLocked, "meshelium.options.tooltip.terrain",
+                "meshelium.options.applies.now"));
         this.layout.addChild(terrain, s -> s.paddingBottom(4));
+        }
 
         // 2. The setting players actually touch. (The retention toggle
         // and its time limit used to follow here; retired 2026-08-11,
         // Bobby owns that job now. Class javadoc has the argument.)
-        this.capSlider = new CapSlider(config, !this.gateLocked && !maxRdOverridden);
-        this.capSlider.setTooltip(tip("meshelium.options.tooltip.max_rd",
+        this.capSlider = new CapSlider(config, !this.capLocked && !maxRdOverridden);
+        this.capSlider.setTooltip(tip(this.capLocked, "meshelium.options.tooltip.max_rd",
                 "meshelium.options.applies.now"));
         this.capBox = new ValueBox(MesheliumConfig.MIN_MAX_RENDER_DISTANCE,
                 MesheliumConfig.MAX_MAX_RENDER_DISTANCE,
@@ -522,12 +787,41 @@ public final class MesheliumOptionsScreen extends Screen {
                 this::applyCap,
                 Component.translatable("meshelium.options.max_rd.label",
                         Component.literal("")));
-        this.capBox.active = !this.gateLocked && !maxRdOverridden;
-        this.capBox.setTooltip(tip("meshelium.options.tooltip.max_rd_custom",
+        this.capBox.active = !this.capLocked && !maxRdOverridden;
+        this.capBox.setTooltip(tip(this.capLocked, "meshelium.options.tooltip.max_rd_custom",
                 "meshelium.options.applies.now"));
         this.layout.addChild(sliderRow(this.capSlider, this.capBox), s -> s.paddingTop(4));
 
+        // 2b. GPU visibility under Sodium (D-025, 2026-09-13): the switch
+        // between resolving visibility on the GPU (the default) and drawing
+        // Sodium's render list as it comes. Live only while the adapter is
+        // the one drawing; held elsewhere with a sentence saying what it is
+        // for rather than the gate's reason, which would be wrong here.
+        boolean adapterArmed = MesheliumGate.sodiumAdapterArmed();
+        CycleButton<Boolean> sodiumGpu = toggle("meshelium.options.sodium_gpu",
+                config.sodiumGpuVisibility, adapterArmed && !sodiumGpuOverridden, value -> {
+                    config.sodiumGpuVisibility = value;
+                    config.save();
+                    // The drawer re-reads the row and the properties; the
+                    // class loads here, under Sodium on Vulkan, never on
+                    // the screen's build.
+                    com.deds.meshelium.vk.SodiumTerrainDrawer.applyConfiguredGpuVisibility();
+                });
+        sodiumGpu.setTooltip(Tooltip.create(withSemantics(
+                Component.translatable("meshelium.options.tooltip.sodium_gpu"),
+                adapterArmed ? "meshelium.options.applies.now"
+                        : "meshelium.options.applies.sodium_gpu_held")));
+        this.layout.addChild(sodiumGpu, s -> s.paddingTop(4));
+
         // 3. Occlusion culling — BACK AT 1.1, as Auto/On/Off.
+        //
+        // NOT BUILT UNDER SODIUM (2026-09-16), with its Auto-crossover
+        // slider and that slider's box. All three drive Meshelium's own
+        // chunk builder and its own visibility pass; on Sodium's chunks
+        // hidden terrain is skipped by the GPU Visibility row above
+        // instead (SodiumTerrainDrawer's own lever). Three greyed rows
+        // whose tooltips had to explain that they belong to a renderer
+        // that is standing aside are worse than a banner that names them.
         //
         // It was hidden at 1.0.0 because the two box rasters cost ~3.1 ms
         // per frame while the drawing they saved cost ~0.1 ms. That cost is
@@ -549,6 +843,7 @@ public final class MesheliumOptionsScreen extends Screen {
         // lose, 48 and 64 both win) where a section count does not:
         // ground-rd64 wins 31% at ~4,000 resident sections while
         // plains-rd32 loses at ~3,300.
+        if (!sodium) {
         CycleButton<MesheliumConfig.OcclusionMode> occlusion = CycleButton
                 .builder((MesheliumConfig.OcclusionMode m) -> Component.translatable(
                         switch (m) {
@@ -564,7 +859,7 @@ public final class MesheliumOptionsScreen extends Screen {
                 });
         occlusion.setWidth(WIDGET_WIDTH);
         occlusion.active = !this.gateLocked && !occlusionOverridden;
-        occlusion.setTooltip(tip("meshelium.options.tooltip.occlusion",
+        occlusion.setTooltip(tip(this.gateLocked, "meshelium.options.tooltip.occlusion",
                 "meshelium.options.applies.now"));
         this.layout.addChild(occlusion);
 
@@ -577,7 +872,8 @@ public final class MesheliumOptionsScreen extends Screen {
         boolean autoActive = !this.gateLocked && !occlusionOverridden
                 && config.occlusionMode == MesheliumConfig.OcclusionMode.AUTO;
         this.occlusionSlider = new OcclusionRdSlider(config, autoActive);
-        this.occlusionSlider.setTooltip(tip("meshelium.options.tooltip.occlusion_rd",
+        this.occlusionSlider.setTooltip(tip(this.gateLocked,
+                "meshelium.options.tooltip.occlusion_rd",
                 "meshelium.options.applies.now"));
         this.occlusionBox = new ValueBox(MesheliumConfig.MIN_OCCLUSION_AUTO_RD,
                 MesheliumConfig.MAX_OCCLUSION_AUTO_RD,
@@ -586,9 +882,11 @@ public final class MesheliumOptionsScreen extends Screen {
                 Component.translatable("meshelium.options.occlusion_rd.label",
                         Component.literal("")));
         this.occlusionBox.active = autoActive;
-        this.occlusionBox.setTooltip(tip("meshelium.options.tooltip.occlusion_rd_custom",
+        this.occlusionBox.setTooltip(tip(this.gateLocked,
+                "meshelium.options.tooltip.occlusion_rd_custom",
                 "meshelium.options.applies.now"));
         this.layout.addChild(sliderRow(this.occlusionSlider, this.occlusionBox));
+        }
 
         // 3b. Distance fog.
         //
@@ -654,7 +952,14 @@ public final class MesheliumOptionsScreen extends Screen {
         // returning to a cached Screen only repositions it, so this screen
         // keeps its widgets, its tick loop and its capAtOpen snapshot, and
         // the wave-15 back-out fix keeps working.
-        this.layout.addChild(Button.builder(
+        //
+        // 2026-09-16: a tooltip, under SODIUM ONLY. Shape B holds most of
+        // what is behind this button, so the button is the last place a
+        // player can be told what is still there; on the standalone screen
+        // every one of those rows is present and pressing the button shows
+        // them, so adding a tooltip there would be a second undeclared
+        // change to the shape this commit keeps as its control.
+        Button advanced = Button.builder(
                 Component.translatable("meshelium.options.advanced"),
                 b -> {
                     // Disarm the two-click reset on the way out, or it would
@@ -669,7 +974,12 @@ public final class MesheliumOptionsScreen extends Screen {
                         this.minecraft.gui.setScreen(new MesheliumAdvancedScreen(this));
                     }
                 })
-                .width(WIDGET_WIDTH).build(), s -> s.paddingTop(6));
+                .width(WIDGET_WIDTH).build();
+        if (sodium) {
+            advanced.setTooltip(Tooltip.create(
+                    Component.translatable("meshelium.options.tooltip.advanced.sodium")));
+        }
+        this.layout.addChild(advanced, s -> s.paddingTop(6));
 
         // Reset. TWO CLICKS on purpose: the first arms and relabels, the
         // second does it. A single click would be one slip away from wiping
@@ -681,7 +991,16 @@ public final class MesheliumOptionsScreen extends Screen {
                 b -> {
                     if (!this.resetArmed) {
                         this.resetArmed = true;
-                        b.setMessage(Component.translatable("meshelium.options.reset.confirm")
+                        // Shape B says "everything, shown or not":
+                        // resetToDefaults() rewrites twenty fields,
+                        // including greedy meshing, both leaf tiers, the
+                        // plant cull, arena trim, suppressVanillaUploads,
+                        // the occlusion mode and the master switch - none
+                        // of which a Sodium player can now see. The greyed
+                        // rows at least kept those values on screen.
+                        b.setMessage(Component.translatable(sodium
+                                        ? "meshelium.options.reset.confirm.sodium"
+                                        : "meshelium.options.reset.confirm")
                                 .withStyle(ChatFormatting.RED));
                         return;
                     }
@@ -693,7 +1012,11 @@ public final class MesheliumOptionsScreen extends Screen {
                     rebuildOcclusionRows();
                 })
                 .width(WIDGET_WIDTH).build();
-        this.resetButton.setTooltip(tip("meshelium.options.tooltip.reset",
+        // tipAlways: this row is never locked (below), so its tooltip must
+        // not say "Needs the Vulkan renderer" over a live button, which it
+        // did on OpenGL.
+        this.resetButton.setTooltip(tipAlways(sodium ? "meshelium.options.tooltip.reset.sodium"
+                        : "meshelium.options.tooltip.reset",
                 "meshelium.options.applies.now"));
         // Never locked: resetting is how a player recovers from a bad value
         // even on a gate-locked screen, and it cannot make the gate worse.
@@ -836,8 +1159,32 @@ public final class MesheliumOptionsScreen extends Screen {
      * is why it is locked — the wave-13 rule, unchanged).
      */
     private Tooltip tip(String descriptionKey, String appliesKey) {
-        return Tooltip.create(withSemantics(Component.translatable(descriptionKey),
-                this.gateLocked ? "meshelium.options.applies.vulkan" : appliesKey));
+        return tip(this.gateLocked, descriptionKey, appliesKey);
+    }
+
+    /**
+     * A held row's semantics line names WHY it is held. Under Sodium that
+     * is never "Needs the Vulkan renderer": the game may well be on Vulkan,
+     * and the row is held because Sodium builds the terrain (owner report
+     * 2026-09-08 (beta.8)).
+     */
+    private Tooltip tip(boolean locked, String descriptionKey, String appliesKey) {
+        // Two-way since 2026-09-16. The four-arg overload existed for the
+        // two rows that needed a Sodium sentence of their own - the master
+        // switch and the occlusion trio - and neither is BUILT under Sodium
+        // any more, so no caller could reach that arm. applies.sodium stays
+        // the default held sentence and stays in en_us.json: two Far
+        // Terrain chains still pass it (MesheliumFarFieldScreen and
+        // MesheliumFarLayerScreen), on pages that come back the moment
+        // FarFieldConfig.FEATURE_ENABLED flips, and "unreachable at
+        // runtime" is not "uncompiled" - Component.translatable falls back
+        // to the key, so deleting it would have rendered the raw string
+        // meshelium.options.applies.sodium at a 1.7 player.
+        String semantics = !locked ? appliesKey
+                : MesheliumGate.state() == MesheliumGate.State.SODIUM_PRESENT
+                        ? "meshelium.options.applies.sodium"
+                        : "meshelium.options.applies.vulkan";
+        return Tooltip.create(withSemantics(Component.translatable(descriptionKey), semantics));
     }
 
     /**

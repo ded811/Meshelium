@@ -156,7 +156,7 @@ import java.util.zip.Inflater;
  * <h2>Version 2: the per-palette-entry tint table</h2>
  * Version 1 stored geometry only, and the far field had no way to colour
  * a grayscale sprite: distant grass tops, foliage and water rendered gray
- * (docs/FARFIELD-WAVES.md items A1/A3). Biome tint cannot be resolved at
+ * (docs/unreleased/farfield/FARFIELD-WAVES.md items A1/A3). Biome tint cannot be resolved at
  * MESH time - the chunk is long gone by then and the far field has no
  * biome source - so the colour is sampled once per palette entry while
  * the chunk is still live and carried in the record.
@@ -180,7 +180,7 @@ import java.util.zip.Inflater;
  *
  * <h2>Version 3: the tint GRID and the light plane</h2>
  * Two independent additions, both optional per record, both driven by the
- * owner's pre7 list (docs/FARFIELD-WAVES.md item H4).
+ * owner's pre7 list (docs/unreleased/farfield/FARFIELD-WAVES.md item H4).
  *
  * <p><b>The tint field</b> answers "oceans do not mix colour" and "chunks
  * do not mix". Version 2 stored ONE colour per palette entry per chunk, so

@@ -18,7 +18,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * ray-marched "advanced" culling arm out of
  * {@code SectionOcclusionGraph.runUpdates} — and <b>only</b> that arm,
  * and (since R6) only for graph nodes the camera is actually looking
- * DOWN at. See docs/FARFIELD-WAVES.md, "P2 AND P9 ANSWERED" and
+ * DOWN at. See docs/unreleased/farfield/FARFIELD-WAVES.md, "P2 AND P9 ANSWERED" and
  * "R6 AND R7 ANSWERED", and the argument on
  * {@link TerrainResidency#skipAdvancedRayMarch(double)}, which is where
  * the arm, the threshold, the cost and the counters live.
@@ -121,7 +121,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * project's discipline forbids. <b>This file is unchanged by S6.</b></p>
  *
  * <h2>pre21: the owner's rd 2, and why this file is moot there</h2>
- * <p>The seventh attempt (docs/FARFIELD-WAVES.md, "FLY-UP ANSWERED
+ * <p>The seventh attempt (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP ANSWERED
  * (seventh attempt: the core)") found the residual at render distance 2
  * in {@code getRelativeFrom}, not in the march: ip 20-44 returns null for
  * any neighbour with {@code |camSy - sy| > viewDistance}, so at rd 2 the

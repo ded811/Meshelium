@@ -237,7 +237,7 @@ import java.util.concurrent.atomic.LongAdder;
  * assumes the terrain is locally flat; a mansion, a cliff and a cave mouth
  * are each a counter-example, and in every one of them the guess comes out
  * too HIGH and the bottom of something goes see-through. See
- * docs/FARFIELD-WAVES.md, "P4 AND P5 ANSWERED".</p>
+ * docs/unreleased/farfield/FARFIELD-WAVES.md, "P4 AND P5 ANSWERED".</p>
  *
  * <p><b>Client heightmap honesty</b>: WORLD_SURFACE is Usage.CLIENT (the
  * server sends it; Types clinit ip 30-41), but OCEAN_FLOOR is
@@ -1132,7 +1132,7 @@ public final class ShellExtractor {
      * and exactly one pair of source implementations, the captured ones
      * in Pin. The game thread FREEZES a column into a ColumnSnapshot and
      * the worker walks it, whether the column was dropped or is still
-     * live (docs/FARFIELD-PERF-BRIEF.md section 2, "unify LIVE onto
+     * live (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 2, "unify LIVE onto
      * Pin"). The measurement that forced it: the far-armed bench put this
      * walk at p50 6.816 ms and p99 20.972 ms on a travel leg, against a
      * 5.0 ms frame - an atom no budget rule can schedule.
@@ -1761,7 +1761,7 @@ public final class ShellExtractor {
          * bottom-up, the LOWEST cell of that state in the chunk.
          *
          * <p><b>This is no longer where the tint field is sampled, and
-         * that change is pre20's whole fix (docs/FARFIELD-WAVES.md
+         * that change is pre20's whole fix (docs/unreleased/farfield/FARFIELD-WAVES.md
          * "GREEN WATER ANSWERED").</b> It used to be: every one of an
          * entry's 256 nodes was read at this single y while vanilla
          * evaluates biome tint in 3D, so an entry spanning two biome
@@ -2362,7 +2362,7 @@ public final class ShellExtractor {
      * {@link #farLightBrightestFacePicks} therefore keeps its counter and
      * sharpens its meaning: it counts the cells whose stored byte is an
      * aggregate, i.e. exactly the population the donor map exists to
-     * correct. See docs/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)".</p>
+     * correct. See docs/unreleased/farfield/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)".</p>
      *
      * <p><b>The mask here is the ADMISSIBLE mask</b> — the caller has
      * already stripped any boundary face whose probe would cross into a
@@ -3188,7 +3188,7 @@ public final class ShellExtractor {
      * measurement leaves 26 of 300 chunks visibly leaking at ANY budget,
      * because there the limit is the domain and not the depth. Closing it
      * is a change in that class, not in this one: see
-     * docs/FARFIELD-WAVES.md, "P4 AND P5 ANSWERED".</li>
+     * docs/unreleased/farfield/FARFIELD-WAVES.md, "P4 AND P5 ANSWERED".</li>
      * <li><b>Reachability is ONE HOP.</b> The domain is the 3x3, so an
      * opening whose daylight is two or more chunks away along a roofed
      * tunnel is still cut. Desk-checked: a tunnel at y 50 under a surface

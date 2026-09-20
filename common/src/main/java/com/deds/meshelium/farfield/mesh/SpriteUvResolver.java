@@ -530,7 +530,7 @@ public final class SpriteUvResolver {
      * corner of its cell.</p>
      *
      * <p><b>Fixed at pre18 (the owner's R4) for every single-draw variant
-     * list</b> - see docs/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)".
+     * list</b> - see docs/unreleased/farfield/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)".
      * {@link #enumerateVariants} builds one {@link Quads} table per draw
      * value and {@code ShellMesher.variantDraw} reproduces vanilla's own
      * roll from the cell's world position, behind the Block Variants row
@@ -613,7 +613,7 @@ public final class SpriteUvResolver {
      *                    quad's four vertices on the cell's own lattice
      *                    corners" - and that question is what
      *                    {@code ShellMesher}'s smooth lighting asks. See
-     *                    docs/FARFIELD-WAVES.md, "P4 AND P5 ANSWERED".
+     *                    docs/unreleased/farfield/FARFIELD-WAVES.md, "P4 AND P5 ANSWERED".
      */
     public record Quads(int count, float[] pos, float[] uv, byte[] cull,
                         byte[] facing, byte[] cutoff, boolean[] translucent,

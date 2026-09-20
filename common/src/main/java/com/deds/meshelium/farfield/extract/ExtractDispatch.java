@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.LongAdder;
  * <h2>pre2 change: extraction moved to the RECEIVE side (defect B1)</h2>
  * W2 extracted ONLY at {@code ClientLevel.unload}. The owner's pre1
  * playtest reported "a lot of gaps and missing chunks, worse in parts i
- * havent been to" (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre1, B1).
+ * havent been to" (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre1, B1).
  * The unload seam cannot be complete, because three paths make a chunk
  * unreachable with no unload callback at all (dossier section 1.3):
  * a view-radius shrink copies only the surviving chunks into a fresh
@@ -73,7 +73,7 @@ import java.util.concurrent.atomic.LongAdder;
  * One {@code Long2ObjectOpenHashMap<ColumnRecord>} is the ONLY
  * bookkeeping structure: the extract-once tracker, the incomplete marks,
  * the stale marks, the refresh epoch and the deferral list all collapsed
- * into it (docs/FARFIELD-SAVE-DESIGN.md). Truth is a pair of version
+ * into it (docs/unreleased/farfield/FARFIELD-SAVE-DESIGN.md). Truth is a pair of version
  * numbers advanced only by real events - {@code liveVersion} stamps the
  * freshest client truth seen, {@code storedVersion} what the store has
  * ACKED - and <i>dirty</i> is their difference, derived at decision time
@@ -173,7 +173,7 @@ import java.util.concurrent.atomic.LongAdder;
  *
  * <p><b>The refill period.</b> A 50 ms window refills twenty times a
  * second whatever the client is doing. At the owner's measured 120 to 180
- * fps (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre8) that is one slice
+ * fps (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre8) that is one slice
  * every six to nine FRAMES: the far field did nothing at all in the other
  * five to eight, and a faster machine bought exactly nothing. The slice is
  * now opened by {@link #pumpGameThread}, once per frame, so throughput
@@ -209,7 +209,7 @@ import java.util.concurrent.atomic.LongAdder;
  * <h2>pre13 (N1): the adaptive slice was not adaptive, and every column
  * was walked twice</h2>
  * The owner reported the ring failing to fill for the THIRD time
- * (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre12, N1). Three separate
+ * (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre12, N1). Three separate
  * things were wrong and they multiplied:
  * <ol>
  *   <li><b>the cap ate the whole rule.</b> pre10's ceiling was
@@ -374,7 +374,7 @@ import java.util.concurrent.atomic.LongAdder;
  * measurement</h2>
  * The owner has now asked for the same thing four playtests running, and
  * pre15 is the first answer that is not another scheduling tweak
- * (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre14, P3: "it should always
+ * (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre14, P3: "it should always
  * cache, especially when leaving a chunk"). Every wave from pre10 to
  * pre14 changed how the FILL work was ordered or funded; none of them
  * looked at what happens to a column on its way out. Four things did:
@@ -674,7 +674,7 @@ public final class ExtractDispatch {
 
     /**
      * N1's idle boost, RETIRED at the T2 budget wave (Phase 2 of
-     * docs/FARFIELD-PERF-BRIEF.md). <b>Permanently zero.</b>
+     * docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md). <b>Permanently zero.</b>
      *
      * <p>The counter is kept, and kept in the bench's export, precisely
      * so the deletion is READABLE as a number: a pre21 log shows this
@@ -1037,7 +1037,7 @@ public final class ExtractDispatch {
      * shipped Background Saving point.
      *
      * <p><b>Why a fraction and not milliseconds</b>
-     * (docs/FARFIELD-PERF-BRIEF.md section 3; the owner's T2 report is
+     * (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 3; the owner's T2 report is
      * "saving the chunks to lod causes HUGE fps drops. this drops 200 to
      * 60 while its going on"). Every budget this class has ever had was
      * an absolute count of milliseconds - a 3 ms guaranteed slice, an
@@ -1174,7 +1174,7 @@ public final class ExtractDispatch {
      * is clamped by MAX_SLICE_NANOS, which they can no longer approach.
      *
      * Why the split exists, and it is the fourth answer to the same
-     * report (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre14, P3:
+     * report (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre14, P3:
      * "it should always cache, especially when leaving a chunk"). One
      * budget served two populations with completely different deadlines,
      * and the one with no deadline was spending it first. The order is
@@ -1237,7 +1237,7 @@ public final class ExtractDispatch {
     //     this budget entirely. So the population keep-up protected is
     //     still protected, by a mechanism that spends no frame time.
     //     What is genuinely slower is the horizon behind a travelling
-    //     player, and Phase 3 of docs/FARFIELD-PERF-BRIEF.md gives it
+    //     player, and Phase 3 of docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md gives it
     //     back by making a live column cost ~40 us instead of ~900.
     //
     // WHAT MUST NOT COME BACK. A frame-rate floor, in any spelling. The
@@ -1286,7 +1286,7 @@ public final class ExtractDispatch {
 
     /**
      * <b>Phase 3's pacing rule, part 1: pace by the WORKER, not by a
-     * clock</b> (docs/FARFIELD-PERF-BRIEF.md section 3). No new capture
+     * clock</b> (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 3). No new capture
      * is started while {@link PinWorker} already holds this many
      * un-walked columns. Self-limiting and untunable in the way that
      * matters: if the worker is behind, the game thread simply stops
@@ -1383,7 +1383,7 @@ public final class ExtractDispatch {
      * guarantees the extract-once tracker is COMPLETE was switched off for
      * the whole of every travel leg, which is exactly the leg the owner
      * walks when the horizon behind them fails to fill
-     * (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre8, item J1). During
+     * (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre8, item J1). During
      * travel the only remaining writers are the arrival plus, the
      * deferral drain, the drop seam and the on-demand rescue, and none of
      * them is a coverage guarantee: the arrival plus only ever touches
@@ -1446,7 +1446,7 @@ public final class ExtractDispatch {
 
     // ------------------------------------------------------------------
     // M2: the per-column record - the ONLY bookkeeping structure
-    // (docs/FARFIELD-SAVE-DESIGN.md sections 1-3). The extract-once
+    // (docs/unreleased/farfield/FARFIELD-SAVE-DESIGN.md sections 1-3). The extract-once
     // tracker, the incomplete marks, the stale marks, the refresh epoch
     // and the deferral list all collapsed into this map; every decision
     // derives from the record at decision time (invariant I2).
@@ -2908,7 +2908,7 @@ public final class ExtractDispatch {
 
     // ------------------------------------------------------------------
     // The slice: a fraction of the measured frame (T2, Phase 2 of
-    // docs/FARFIELD-PERF-BRIEF.md)
+    // docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md)
     // ------------------------------------------------------------------
 
     /**
@@ -3073,7 +3073,7 @@ public final class ExtractDispatch {
      *
      * <p>At the shipped Background Saving point that is <b>a tenth of the
      * measured frame, never more than 2 ms and never less than
-     * 0.25 ms</b>, which is docs/FARFIELD-PERF-BRIEF.md section 3 exactly.
+     * 0.25 ms</b>, which is docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 3 exactly.
      * Worked through, with the walk cost this machine measures
      * ({@code ~0.9 ms}) beside it:</p>
      *
@@ -4860,7 +4860,7 @@ public final class ExtractDispatch {
     }
 
     // ------------------------------------------------------------------
-    // Phase 1 of the performance plan (docs/FARFIELD-PERF-BRIEF.md):
+    // Phase 1 of the performance plan (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md):
     // the three distributions its claims stand or fall on
     //
     // The brief's central numbers are DISTRIBUTIONS and this class

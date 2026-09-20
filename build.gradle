@@ -2,12 +2,15 @@
 // vanilla Vulkan backend.
 //
 // SPLIT LAYOUT, since the NeoForge port. The renderer lives in common/ as
-// plain source — 106 files of vanilla, LWJGL and Vulkan, including all 37
-// mixins, which target vanilla classes and are not loader-specific. Each
-// loader project compiles that source itself and adds only its entrypoint
-// and its implementation of MesheliumPlatform.Services, which is the whole
-// of what this mod asks a loader for: the game directory, the config
-// directory, and an end-of-client-tick callback.
+// plain source — 106 files of vanilla, LWJGL and Vulkan, including all 38
+// mixins, which target vanilla classes and are not loader-specific. The
+// Sodium adapter lives beside it in sodium/, a second shared tree that
+// both loaders compile (NeoForge since 2026-09-14). Each loader project
+// compiles that source itself and adds only its entrypoint and its
+// implementation of MesheliumPlatform.Services, which is the whole of
+// what this mod asks a loader for: the game directory, the config
+// directory, an end-of-client-tick callback, isDevelopment, isModLoaded,
+// sodiumAdapterAvailable and modVersion.
 //
 // THE RULE FOR WHAT GOES WHERE: if it names a loader API it cannot be in
 // common/. Nothing there does, and a grep for net.fabricmc under common/
@@ -35,3 +38,218 @@
 // So each loader project simply adds common/ to its own source set. Shared
 // code is compiled twice, which costs seconds, and the Fabric build stays
 // byte-for-byte the toolchain that has gated this project all along.
+
+// ======================================================================
+// BUILD-TIME CENSUSES (2026-09-16)
+//
+// Two facts that used to be true only by memory, and that a green build
+// then certified as still true. Both live at the root, because both read
+// common/ and sodium/, which are plain shared source rather than Gradle
+// projects of their own.
+// ======================================================================
+
+/**
+ * One literal, two coordinates, one truth.
+ *
+ * The Modrinth coordinate a loader build resolves Sodium from and the
+ * constant the jar ships (MesheliumSodiumVersion.BUILT_AGAINST) must name
+ * the same Sodium; a bump to one without the other is exactly the silent
+ * wrongness the version work exists to stop.
+ *
+ * Called with the PROPERTY NAME and the LOADER SUFFIX, so each build
+ * checks the coordinate it actually consumes rather than whichever one a
+ * root property happened to inherit:
+ *   fabric/build.gradle    -> sodium_version           (gradle.properties:30)
+ *   neoforge/build.gradle  -> sodium_neoforge_version  (gradle.properties:34)
+ *
+ * The comparison is an EXACT rebuild of the expected coordinate, never
+ * `coordinate.contains(builtAgainst)`. A substring test passes the drift
+ * it exists to catch: "mc26.2-0.9.2-beta.10-fabric" contains
+ * "0.9.2-beta.1", so a beta.1 -> beta.10 bump on one loader would build
+ * green with the jar still claiming beta.1. gradle.properties:31-33 says
+ * in its own comment that the two coordinates exist separately because
+ * Modrinth has published the two loaders a day apart, which is precisely
+ * that case.
+ */
+ext.checkSodiumCoordinate = { String propertyName, String loaderSuffix ->
+	def source = rootProject.file(
+			'common/src/main/java/com/deds/meshelium/MesheliumSodiumVersion.java')
+	def matcher = source.text =~ /BUILT_AGAINST\s*=\s*"([^"]+)"/
+	if (!matcher.find()) {
+		throw new GradleException(
+				"MesheliumSodiumVersion.BUILT_AGAINST not found in ${source}")
+	}
+	def builtAgainst = matcher.group(1)
+	def parts = builtAgainst.split(/\+/)
+	if (parts.length != 2) {
+		throw new GradleException("MesheliumSodiumVersion.BUILT_AGAINST=${builtAgainst} is not "
+				+ "<version>+<metadata>; the loader reports Sodium in that shape and the "
+				+ "constant has to match it")
+	}
+	def expectedMetadata = "mc${rootProject.minecraft_version}".toString()
+	if (parts[1] != expectedMetadata) {
+		throw new GradleException("MesheliumSodiumVersion.BUILT_AGAINST=${builtAgainst} is built "
+				+ "against ${parts[1]} but this project targets ${expectedMetadata}")
+	}
+	def expected = "${expectedMetadata}-${parts[0]}-${loaderSuffix}".toString()
+	def coordinate = rootProject.property(propertyName).toString()
+	if (coordinate != expected) {
+		throw new GradleException("${propertyName}=${coordinate} but "
+				+ "MesheliumSodiumVersion.BUILT_AGAINST=${builtAgainst} expects ${expected}; "
+				+ "bump both or neither")
+	}
+}
+
+/**
+ * Every lang key a literal names must exist, and every key must have a
+ * literal. BOTH directions, because only one of them fails loudly.
+ *
+ * Component.translatable falls back to rendering the KEY when the key is
+ * missing, so a literal the lang file never got renders the raw string
+ * "meshelium.chat.popup.no_mesh" at a player while every test stays green.
+ * The other direction is quieter still: a key nothing names is dead
+ * weight that reads like coverage, and deleting a row without deleting its
+ * key is how that happens.
+ *
+ * A gametest cannot do this job. It can read en_us.json off the classpath
+ * (MesheliumBootSmokeTest.assertLangHasNoLongDashes is the precedent) but
+ * it cannot read common/src, so it can only ever check keys against
+ * themselves.
+ *
+ * The em/en dash lint runs here as well as in that gametest. The gametest
+ * throws from runTest on BOTH the GL and the Vulkan run, so a dash in a
+ * new string costs a whole client run to discover; at build time it costs
+ * a second.
+ *
+ * The task PRINTS its counts, including what it SKIPPED. A census that
+ * silently passes over what it cannot parse hides exactly the cases that
+ * later break.
+ */
+tasks.register('checkLangKeys') {
+	group = 'verification'
+	description = 'Every lang literal has a key, every key has a literal, and no long dashes.'
+
+	def sourceRoots = [rootProject.file('common/src/main/java'),
+	                   rootProject.file('sodium/src/main/java')]
+	def langFile = rootProject.file(
+			'common/src/main/resources/assets/meshelium/lang/en_us.json')
+	def stamp = layout.buildDirectory.file('checkLangKeys.txt')
+
+	inputs.files(sourceRoots).withPropertyName('sources')
+	inputs.file(langFile).withPropertyName('lang')
+	outputs.file(stamp).withPropertyName('stamp')
+
+	doLast {
+		// The five roots that were already lang keys, plus meshelium.toast.
+		// added 2026-09-16 with the remote-world notice. Every other
+		// meshelium.* literal in the tree is a system property or a
+		// filename (meshelium.sodium.adapter, meshelium.bench,
+		// meshelium.test.*, meshelium.farfield.*, meshelium.json), so the
+		// root list separates the two by construction rather than by an
+		// exclusion list that would rot.
+		def langRoots = ['meshelium.options.', 'meshelium.popup.', 'meshelium.chat.',
+		                 'meshelium.rd.', 'meshelium.videosettings.', 'meshelium.toast.']
+		// A literal ending in '.' is a prefix an enum completes at runtime;
+		// each is listed by name so a NEW one cannot be waved through.
+		def dynamicPrefixes = ['meshelium.options.farfield.',
+		                       'meshelium.options.farfield.preset.',
+		                       'meshelium.options.tooltip.farfield.']
+		// Keys that legitimately have no literal. EMPTY today, and it stays
+		// that way unless something is argued into it right here.
+		def allowedWithoutLiteral = []
+
+		def keys = [] as Set
+		langFile.eachLine { line ->
+			def m = line =~ /^\s*"([^"]+)"\s*:/
+			if (m) {
+				keys << m[0][1]
+			}
+		}
+
+		def langText = langFile.text
+		def dashSample = null
+		for (int i = 0; i < langText.length(); i++) {
+			char c = langText.charAt(i)
+			if (c == ((char) 0x2014) || c == ((char) 0x2013)) {
+				dashSample = langText.substring(Math.max(0, i - 60),
+						Math.min(langText.length(), i + 10))
+				break
+			}
+		}
+		if (dashSample != null) {
+			throw new GradleException("en_us.json contains an em/en dash near: ..." + dashSample
+					+ "... Player-facing strings use commas; tooltips carry the detail. "
+					+ "MesheliumBootSmokeTest.assertLangHasNoLongDashes throws on this too, "
+					+ "on both client runs, which is a whole client boot to find out.")
+		}
+
+		def literalPattern = ~/"(meshelium\.[A-Za-z0-9_.]*)"/
+		def inRoot = [:]
+		int scanned = 0
+		int outOfRoot = 0
+		sourceRoots.each { root ->
+			root.eachFileRecurse { file ->
+				if (!file.isFile() || !file.name.endsWith('.java')) {
+					return
+				}
+				int lineNo = 0
+				file.eachLine { line ->
+					lineNo++
+					def m = literalPattern.matcher(line)
+					while (m.find()) {
+						scanned++
+						def literal = m.group(1)
+						if (langRoots.any { literal.startsWith(it) }) {
+							if (!inRoot.containsKey(literal)) {
+								inRoot.put(literal, [])
+							}
+							inRoot.get(literal).add("${file.name}:${lineNo}".toString())
+						} else {
+							outOfRoot++
+						}
+					}
+				}
+			}
+		}
+
+		def dynamicSeen = inRoot.keySet().findAll { it.endsWith('.') }
+		def undeclaredDynamic = dynamicSeen.findAll { !dynamicPrefixes.contains(it) }
+		if (!undeclaredDynamic.isEmpty()) {
+			throw new GradleException("new dynamic lang prefix(es) ${undeclaredDynamic} - add "
+					+ "each to dynamicPrefixes in build.gradle beside the enum that completes "
+					+ "it, or this census stops being able to see the keys behind them")
+		}
+
+		def missing = inRoot.findAll { k, v -> !dynamicSeen.contains(k) && !keys.contains(k) }
+		if (!missing.isEmpty()) {
+			throw new GradleException("lang key(s) named in source but absent from en_us.json - "
+					+ "Component.translatable renders the raw key at the player:\n  "
+					+ missing.collect { k, v -> "${k}  (${v.join(', ')})" }.join('\n  '))
+		}
+
+		def orphans = keys.findAll { key ->
+			!inRoot.containsKey(key) && !dynamicPrefixes.any { key.startsWith(it) } &&
+					!allowedWithoutLiteral.contains(key)
+		}
+		if (!orphans.isEmpty()) {
+			throw new GradleException("lang key(s) in en_us.json that no source literal names:\n  "
+					+ orphans.sort().join('\n  ')
+					+ "\nDelete each with the row it belonged to, or add it to "
+					+ "allowedWithoutLiteral with a reason.")
+		}
+
+		// The + goes at the END of each line, not the start: outside
+		// parentheses Groovy ends the statement at the newline, and a line
+		// beginning with + parses as String.positive(), which is the error
+		// this shipped with ("No signature of method: java.lang.String
+		// .positive()"). Caught by the build, 2026-09-16.
+		def report = "checkLangKeys: ${scanned} meshelium.* literals scanned, ${inRoot.size()} " +
+				"distinct lang literals, ${keys.size()} keys in en_us.json, ${outOfRoot} " +
+				"literals skipped as out-of-root (system properties and filenames), " +
+				"${dynamicSeen.size()} dynamic prefixes skipped, 0 missing, 0 orphans."
+		logger.lifecycle(report)
+		def out = stamp.get().asFile
+		out.parentFile.mkdirs()
+		out.text = report + '\n'
+	}
+}

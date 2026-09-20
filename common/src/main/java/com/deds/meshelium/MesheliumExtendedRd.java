@@ -568,7 +568,20 @@ public final class MesheliumExtendedRd {
         MesheliumGate.State state = MesheliumGate.state();
         int configured = MesheliumConfig.maxRenderDistanceConfigured();
         boolean extendedWanted = configured > vanillaMax && MesheliumConfig.terrainRenderingEnabled();
-        boolean gateOk = state == MesheliumGate.State.VULKAN_MESH_SHADERS;
+        // SODIUM_PRESENT counts. Widening the render-distance slider past
+        // vanilla's 32 has nothing to do with WHO draws the terrain - it
+        // edits a vanilla option's range - and Sodium is entirely capable
+        // of rendering the extra distance. Standing our renderer down is
+        // not a reason to take a working feature away from the player, and
+        // vanilla's own cap is the thing this exists to lift.
+        //
+        // It also unblocks measurement: with this gated on
+        // VULKAN_MESH_SHADERS alone, a benchmark run with Sodium installed
+        // silently fell back to render distance 12 while reporting that it
+        // had asked for 64, which made Sodium look 4.5x faster than
+        // Meshelium when it was simply drawing a far smaller world.
+        boolean gateOk = state == MesheliumGate.State.VULKAN_MESH_SHADERS
+                || state == MesheliumGate.State.SODIUM_PRESENT;
         boolean bootGrace = state == MesheliumGate.State.UNKNOWN && minecraft.level == null;
 
         applyRange(options, extendedWanted && (gateOk || bootGrace) ? configured : vanillaMax);
@@ -1108,8 +1121,19 @@ public final class MesheliumExtendedRd {
      * cross). Cost note on {@code DistanceManagerMixin}.
      */
     public static int serverViewDistanceCap() {
-        if (MesheliumGate.state() == MesheliumGate.State.VULKAN_MESH_SHADERS
-                && MesheliumConfig.terrainRenderingEnabled()) {
+        // SODIUM_PRESENT counts here for the same reason it counts in
+        // onEndTick's gateOk: the option range is widened under Sodium, and
+        // a widened option that the integrated server clamps back to 32
+        // (Options.getEffectiveRenderDistance takes the min with the
+        // server's distance, and Sodium's renderer reads exactly that) is a
+        // slider that moves to 96 and renders 32 — the class of silent
+        // no-op the wave-13 rework was written to remove. Found by the
+        // 2026-09-06 recon of Sodium's slider, which had the same gap on
+        // Sodium's side (D-019).
+        MesheliumGate.State state = MesheliumGate.state();
+        boolean gateOk = state == MesheliumGate.State.VULKAN_MESH_SHADERS
+                || state == MesheliumGate.State.SODIUM_PRESENT;
+        if (gateOk && MesheliumConfig.terrainRenderingEnabled()) {
             int configured = MesheliumConfig.maxRenderDistanceConfigured();
             if (configured > 32) {
                 return configured;

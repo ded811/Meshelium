@@ -121,7 +121,7 @@ import java.util.OptionalDouble;
  * verdicts the opaque pass just used — do the culling; the
  * {@code visibleSections} loop and the {@code [19]} split survive only on
  * the bfs path, where that list really is the only visibility answer
- * available. See docs/FARFIELD-WAVES.md, "P2 AND P9 ANSWERED".
+ * available. See docs/unreleased/farfield/FARFIELD-WAVES.md, "P2 AND P9 ANSWERED".
  *
  * <h2>Gating</h2>
  * Unchanged from wave 4: {@code MesheliumGate.state()==VULKAN_MESH_SHADERS}
@@ -474,22 +474,41 @@ public final class TerrainDrawer {
     static final int MESH_WG_MAX = 64;
 
     /**
-     * Per-vertex output locations both terrain mesh shaders emit: locations
-     * 0 to 5 in {@code terrain.mesh} plus {@code gl_Position}, which the
-     * output-size formula counts like any other vec4. MUST move with the
-     * shader's out declarations - it exists because the spec sizes a mesh
-     * workgroup's output as verts x locations x 16 B against
-     * {@code maxMeshOutputMemorySize}, whose guaranteed minimum is 32768 B
-     * and which the dev RDNA4 card reports at EXACTLY that floor. The
-     * greedy-merge varyings briefly grew this to 9, putting the 64-quad
-     * translucent workgroup at 36864 B - over the limit on the very card
-     * that ran every test, undefined behavior the driver happened to
-     * tolerate. The varyings are now packed back to 7 (sprite rect as one
-     * vec4, tile counts re-derived from materialBits per fragment), and
-     * the budget is queried, clamped and asserted so the NEXT growth is a
-     * loud failure instead of a silent one.
+     * {@code -Dmeshelium.unpackedVaryings=true} restores the pre-2026-09-06
+     * varying layout (seven output locations) for A/B. Read once; pipelines
+     * cache at creation and the shader macro and this constant must agree.
      */
-    static final int MESH_OUTPUT_LOCATIONS = 7;
+    static final boolean PACKED_VARYINGS = !Boolean.getBoolean("meshelium.unpackedVaryings");
+
+    /** The varying layout in force, for the bench report's knob block. */
+    public static boolean packedVaryings() {
+        return PACKED_VARYINGS;
+    }
+
+    /**
+     * Per-vertex output locations the STANDALONE terrain mesh shader emits,
+     * plus {@code gl_Position}, which the output-size formula counts like
+     * any other vec4. MUST move with the shader's out declarations - it
+     * exists because the spec sizes a mesh workgroup's output as verts x
+     * locations x 16 B against {@code maxMeshOutputMemorySize}, whose
+     * guaranteed minimum is 32768 B and which the dev RDNA4 card reports at
+     * EXACTLY that floor. The greedy-merge varyings briefly grew this to 9,
+     * putting the 64-quad translucent workgroup at 36864 B - over the limit
+     * on the very card that ran every test, undefined behavior the driver
+     * happened to tolerate. The budget is queried, clamped and asserted so
+     * the NEXT growth is a loud failure instead of a silent one.
+     *
+     * <p>Packed layout (2026-09-06): vertexColor, texFog (UV + both fog
+     * distances), materialBits, spriteRect, gl_Position = 5. Unpacked: the
+     * same with UV and the two distances in their own locations = 7. The
+     * Sodium variant drops spriteRect and is one lower still (4 packed);
+     * it shares this constant as a bound that is conservative by one
+     * location. No conformant device can be rejected by that: the spec
+     * floor of 32768 B admits 102 quads per workgroup packed and 73
+     * unpacked, both above MESH_WG_MAX, so the clamp below is a no-op at
+     * every reachable shape under either layout (second review, 2026-09-06).
+     */
+    static final int MESH_OUTPUT_LOCATIONS = PACKED_VARYINGS ? 5 : 7;
 
     /** verts/quad x locations x 16 B: what one quad costs the output budget. */
     static final int MESH_OUTPUT_BYTES_PER_QUAD = 4 * MESH_OUTPUT_LOCATIONS * 16;
@@ -497,8 +516,9 @@ public final class TerrainDrawer {
     /**
      * Largest quads-per-workgroup the device's mesh-output memory admits,
      * or {@code Integer.MAX_VALUE} before caps exist. At the spec floor
-     * this is 56; the dev RDNA4 admits far more, so the clamp is a no-op
-     * everywhere the mod has ever actually run.
+     * this is 102 packed / 73 unpacked (it was 56 at the nine-location
+     * layout that first motivated the clamp); the dev RDNA4 admits far
+     * more, so the clamp is a no-op everywhere the mod has ever run.
      */
     private static int maxQuadsByOutputMemory() {
         MesheliumVulkanState.MeshShaderCaps caps = MesheliumVulkanState.caps();
@@ -522,8 +542,9 @@ public final class TerrainDrawer {
         if (v < 0) {
             v = resolveKnob(PROPERTY_MESH_WG, WORKGROUP_QUADS, MESH_WG_MAX);
             // Output-memory clamp (see MESH_OUTPUT_LOCATIONS): the default 32
-            // fits every conformant device, but the knob reaches 64, which a
-            // spec-floor device cannot hold at 9 locations per vertex. Only
+            // fits every conformant device, and so does the knob's 64 at the
+            // current layouts (it did not at the nine-location layout that
+            // motivated this clamp; the clamp stays for the next growth). Only
             // CACHE once caps exist, so an early call cannot freeze an
             // unclamped value that a later pipeline build would disagree with.
             int memoryCap = maxQuadsByOutputMemory();
@@ -793,7 +814,7 @@ public final class TerrainDrawer {
     private static volatile int lastRetainedTranslucentSections;
 
     // ------------------------------------------------------------------
-    // S6: THE COVERAGE CAPTURE (docs/FARFIELD-WAVES.md, "FLY-UP ANSWERED")
+    // S6: THE COVERAGE CAPTURE (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP ANSWERED")
     //
     // Every counter this class and TerrainResidency publish is a
     // CARDINALITY of something we hold. lastUnlistedMaskSections counts
@@ -918,6 +939,16 @@ public final class TerrainDrawer {
     private static int pbSkipExtentW = -1, pbSkipExtentH = -1;
     private static long pbSkipEpoch = Long.MIN_VALUE;
     private static long pbSkipLastOccSerial = Long.MIN_VALUE;
+    /** NEXT (c): the half-resolution mode the key was last refreshed with. */
+    private static int pbSkipHalfMode = -1;
+    /**
+     * NEXT (c): the decide's own answer, published so 97_18's standalone
+     * twin can prove its phase-B-silence check is NOT vacuous - with the
+     * skip armed, phase B records nothing whatever the stamps do, and a
+     * silence check under that is a statement about the skip, not the
+     * lever. The Sodium host's {@code phaseBCpuSkipArmed()} is the twin.
+     */
+    private static volatile boolean phaseBCpuSkipArmed;
 
     // ---- 1.5.2 FOV-reveal heal state (render thread; the volatile is a
     // test probe) ----
@@ -937,6 +968,8 @@ public final class TerrainDrawer {
     private static final int HISTORY = 128;
     private static final long[] phaseBFrames = new long[HISTORY];
     private static final int[] phaseBCounts = new int[HISTORY];
+    /** NEXT (c): phase A of the same stats frames, tagged by {@link #phaseBFrames}. */
+    private static final int[] phaseACounts = new int[HISTORY];
     private static final long[] changeFrames = new long[64];
     private static int changeCursor;
     static {
@@ -1393,6 +1426,43 @@ public final class TerrainDrawer {
     /** Frames whose phase-B recording the CPU skip elided (cumulative). */
     public static long phaseBCpuSkipFrames() {
         return phaseBCpuSkipFrames;
+    }
+
+    /**
+     * NEXT (c): is the phase-B CPU skip armed right now? The standalone
+     * twin of {@code SodiumTerrainDrawer.phaseBCpuSkipArmed()}. A
+     * "phase B stayed silent" check is only evidence about the LEVER when
+     * this is false; with the skip armed, phase B records nothing whatever
+     * the stamps do.
+     */
+    public static boolean phaseBCpuSkipArmed() {
+        return phaseBCpuSkipArmed;
+    }
+
+    /**
+     * NEXT (c): phase-A section count of stats frame {@code f}, or -1 when
+     * that readback has not landed or has been overwritten (ring of
+     * {@value #HISTORY}). Shaped exactly like {@link #gpuPhaseBAt} and
+     * sharing its tag array, so 97_18's standalone twin has the same STABLE
+     * probe the Sodium host has. Client thread.
+     */
+    public static int gpuSectionsAAt(long f) {
+        if (f < 0) {
+            return -1;
+        }
+        int i = (int) (f % HISTORY);
+        return phaseBFrames[i] == f ? phaseACounts[i] : -1;
+    }
+
+    /**
+     * NEXT (c), test-only: the most recently folded visible set, or null
+     * when {@code meshelium.occlusion.diag.stampsReadback} is absent or
+     * nothing has been folded yet. Index space
+     * {@code regionId * 256 + compacted slot}.
+     */
+    public static VisibleSetSample debugVisibleSet() {
+        TerrainOcclusion occ = occlusion;
+        return occ == null ? null : occ.debugVisibleSet();
     }
 
     /**
@@ -1855,6 +1925,7 @@ public final class TerrainDrawer {
             frameLists = null;
         }
         TerrainOcclusion.destroyPipelines(device);
+        SodiumTerrainDrawer.destroyDeviceObjects(device);
     }
 
     // ------------------------------------------------------------------
@@ -2278,10 +2349,62 @@ public final class TerrainDrawer {
         // ---- 2. lagged GPU stats readback (before this frame records) ----
         pullGpuStats(true);
 
+        // ---- 2a. NEXT (c): the half-resolution arm ----
+        // FIRST encoder-touching statement of the frame (pullGpuStats reads
+        // host memory only): it may create the half attachment pair, whose
+        // UNDEFINED-to-GENERAL layout barrier must not land inside a
+        // rendering instance, and nothing at the Java level would refuse
+        // that. It also runs BEFORE the skip decide below, so that decide
+        // can key on the arm's per-frame RESULT.
+        //
+        // TWO matrices, two jobs (NEXT (c1), 2026-09-16). The rasters BIND
+        // the captured one - RenderSystem.getProjectionMatrixBuffer(), i.e.
+        // vanilla's LEVEL projection buffer, whose content is the
+        // bob-multiplied and portal/nausea-transformed COPY built in
+        // GameRenderer.renderLevel - because the box must raster in the
+        // same clip space as the terrain depth it is tested against. But k
+        // and NearR are DERIVED from cam.projectionMatrix, the pre-bob
+        // perspective, because a bobbed matrix is not the canonical shape
+        // the derivation assumes: the old gate refused it, and the bob's
+        // 0.1-block translate alone puts m11 * 0.1 = 0.143 in front of a
+        // 1.0e-5 tolerance, so essentially every walking frame ran full-res
+        // while every winning bench cell was a stationary camera.
+        //
+        // The stash is used rather than cam.projectionMatrix directly even
+        // though they are the same object here: one code path in arm(), one
+        // refusal counter and one fail-safe across both hosts.
+        int halfMode = 0;
+        if (occlusion != null) {
+            Matrix4f bound = MesheliumProjectionCapture.lastIfBound(
+                    RenderSystem.getProjectionMatrixBuffer());
+            if (bound != null
+                    && RenderSystem.getProjectionType()
+                            == com.mojang.blaze3d.ProjectionType.PERSPECTIVE) {
+                if (!bound.equals(cam.projectionMatrix)) {
+                    // Not a failure, and NOT a non-vacuity witness either:
+                    // Matrix4f.equals is floatToIntBits, and
+                    // mulPerspectiveAffine writes D.m33 = P.m23 * M.m32 =
+                    // (-1.0f) * 0.0f = -0.0f against P.m33 = +0.0f, so a
+                    // pose that merely EXISTS (bobView runs at bob == 0 and
+                    // Matrix4f.translation never sets PROPERTY_IDENTITY)
+                    // can increment this on every armed frame. It is a
+                    // printed diagnostic; the window-scoped witness is
+                    // halfResArmedTransformedFrames.
+                    TerrainOcclusion.halfResArmProjectionMismatches++;
+                }
+                long preBobSerial = MesheliumProjectionCapture.preBobSerial();
+                halfMode = occlusion.armHalfRes(colorView, depthView, bound,
+                        MesheliumProjectionCapture.preBob(), cam.viewRotationMatrix,
+                        preBobSerial,
+                        VulkanConst.toVk(colorView.texture().getFormat()),
+                        VulkanConst.toVk(depthView.texture().getFormat()), false, extLists);
+            }
+        }
+
         // ---- 2b. phase-B CPU skip decision (needs this frame's readback
         // fold above AND the signature bookkeeping before it; consumed at
         // pass 4) ----
-        boolean phaseBCpuSkip = phaseBCpuSkipDecide(cam, frustum, depthView);
+        boolean phaseBCpuSkip = phaseBCpuSkipDecide(cam, frustum, depthView, halfMode);
 
         // ---- 3. per-frame list + transient uploads (before any pass
         // opens, wave-2 note) ----
@@ -2345,22 +2468,50 @@ public final class TerrainDrawer {
         }
         MesheliumGpuTimers.mark(encoder, MesheliumGpuTimers.POINT_AFTER_PHASE_A);
 
+        // ---- NEXT (c): pass D, then passes 2-3 on the half-res views ----
+        // Only the BOX rasters move: phase A (pass 1) and phase B (pass 4)
+        // stay on the main views always, so nothing that draws a pixel ever
+        // lands at half resolution.
+        GpuTextureView rasterColorView = colorView;
+        GpuTextureView rasterDepthView = depthView;
+        if (halfMode != 0) {
+            rasterColorView = occlusion.halfColorView();
+            rasterDepthView = occlusion.halfDepthView();
+            // Depth CLEAR to 0.0 = reversed-Z FAR: an unwritten half texel
+            // passes every box (fail-open) under the full-screen triangle.
+            final GpuTextureView passColor = rasterColorView;
+            final GpuTextureView passDepth = rasterDepthView;
+            try (RenderPass pass = encoder.createRenderPass(
+                    () -> "meshelium occlusion depth downsample",
+                    passColor, Optional.empty(), passDepth, OptionalDouble.of(0.0))) {
+                VulkanRenderPass backendPass =
+                        (VulkanRenderPass) ((RenderPassAccessor) pass).meshelium$backend();
+                VkCommandBuffer cb =
+                        ((VulkanRenderPassAccessor) backendPass).meshelium$commandBuffer();
+                occlusion.recordDepthDownsample(cb, depthView);
+            }
+            MesheliumGpuTimers.mark(encoder, MesheliumGpuTimers.POINT_AFTER_DOWNSAMPLE);
+        }
+        final GpuTextureView rasterColor = rasterColorView;
+        final GpuTextureView rasterDepth = rasterDepthView;
+
         // ---- pass 2: region boxes ----
         try (RenderPass pass = encoder.createRenderPass(() -> "meshelium occlusion regions",
-                colorView, Optional.empty(), depthView, OptionalDouble.empty())) {
+                rasterColor, Optional.empty(), rasterDepth, OptionalDouble.empty())) {
             VulkanRenderPass backendPass = (VulkanRenderPass) ((RenderPassAccessor) pass).meshelium$backend();
             VkCommandBuffer cb = ((VulkanRenderPassAccessor) backendPass).meshelium$commandBuffer();
-            occlusion.recordRegionRaster(cb, occListSlice, sceneSlice, rasterCount, frameStamp32);
+            occlusion.recordRegionRaster(cb, occListSlice, sceneSlice, rasterCount, frameStamp32,
+                    halfMode);
         }
         MesheliumGpuTimers.mark(encoder, MesheliumGpuTimers.POINT_AFTER_REGION_RASTER);
 
         // ---- pass 3: section boxes ----
         try (RenderPass pass = encoder.createRenderPass(() -> "meshelium occlusion sections",
-                colorView, Optional.empty(), depthView, OptionalDouble.empty())) {
+                rasterColor, Optional.empty(), rasterDepth, OptionalDouble.empty())) {
             VulkanRenderPass backendPass = (VulkanRenderPass) ((RenderPassAccessor) pass).meshelium$backend();
             VkCommandBuffer cb = ((VulkanRenderPassAccessor) backendPass).meshelium$commandBuffer();
             occlusion.recordSectionRaster(cb, occListSlice, sceneSlice,
-                    snap.sectionRecordsHandle(), rasterCount, frameStamp32, curStamps);
+                    snap.sectionRecordsHandle(), rasterCount, frameStamp32, curStamps, halfMode);
         }
         MesheliumGpuTimers.mark(encoder, MesheliumGpuTimers.POINT_AFTER_SECTION_RASTER);
 
@@ -2426,6 +2577,9 @@ public final class TerrainDrawer {
         // ---- stats copy + zero (the transfer CB; barrier story in
         // TerrainOcclusion) ----
         occlusion.recordStatsTransfer(statsFrames);
+        // NEXT (c), test-only: the visible-set copy beside it. A no-op
+        // unless -Dmeshelium.occlusion.diag.stampsReadback is set.
+        occlusion.recordStampsTransfer(statsFrames, curStamps, frameStamp32);
         statsFrames++;
 
         // Wave-7 carry: the translucent pass (recorded later this frame at
@@ -2531,6 +2685,13 @@ public final class TerrainDrawer {
         int i = (int) (readFrame % HISTORY);
         phaseBFrames[i] = readFrame;
         phaseBCounts[i] = s[2];
+        // NEXT (c): phase A of the same frames, tagged by the same ring, so
+        // 97_18's standalone twin has the same STABLE probe the Sodium host
+        // has (gpuSectionsAAt).
+        phaseACounts[i] = s[1];
+        // NEXT (c), test-only: fold the visible set on THIS thread. No-op
+        // unless the readback property armed the ring.
+        occlusion.foldVisibleSet(readFrame);
         lastReadStatsFrame = readFrame;
     }
 
@@ -2575,17 +2736,36 @@ public final class TerrainDrawer {
      * never a hole that stays.</p>
      */
     private static boolean phaseBCpuSkipDecide(CameraRenderState cam, Frustum frustum,
-            GpuTextureView depthView) {
+            GpuTextureView depthView, int halfMode) {
         // Absent means ON (the multiWG rule: measured winners are
         // defaults, the property is the escape hatch).
         String cpuSkipProp = System.getProperty(PROPERTY_PHASE_B_CPU_SKIP);
         if (cpuSkipProp != null && !Boolean.parseBoolean(cpuSkipProp)) {
             pbSkipKeyValid = false;
+            phaseBCpuSkipArmed = false;
             return false;
         }
         if (occlusion.phaseBPredicateActive()) {
+            phaseBCpuSkipArmed = false;
             return false;
         }
+        // NEXT (c1), 2026-09-16, PRE-EXISTING and out of scope for c1, but
+        // recorded here because the walking legs land right next to it:
+        // EVERY matrix in this key is PRE-BOB - cam.pos below is the
+        // unbobbed eye, and the two matrix compares are
+        // cam.viewRotationMatrix and cam.projectionMatrix. So a frame whose
+        // only change is the view bob or the hurt tilt reads as "nothing
+        // changed" while the DRAWN matrix has moved, and post-c1 those are
+        // precisely the frames on which the half-res rasters now arm. A
+        // standing player taking damage has cam.pos bit-stable for the
+        // whole 10-tick, up-to-18-degree tilt while the convergence counter
+        // keeps running.
+        //
+        // The direction is FAIL-OPEN: the hard draw cull in terrain.task
+        // runs on the pre-bob planes built in uploadScene, which is parity
+        // with vanilla's own pre-bob prepareCullFrustum, so nothing vanilla
+        // draws is dropped. Do not "fix" it here, and do not let a red
+        // walking run be spent rediscovering it.
         boolean changed = !pbSkipKeyValid;
         long posX = Double.doubleToRawLongBits(cam.pos.x);
         long posY = Double.doubleToRawLongBits(cam.pos.y);
@@ -2614,6 +2794,14 @@ public final class TerrainDrawer {
             pbSkipExtentW = extentW;
             pbSkipExtentH = extentH;
         }
+        // NEXT (c): the frame's raster VARIANT, as the arm's per-frame
+        // result. Exactness, not safety: the sections a flip adds were
+        // culled the frame before, so a missed skip would delay hidden
+        // sections one frame at worst.
+        if (halfMode != pbSkipHalfMode) {
+            changed = true;
+            pbSkipHalfMode = halfMode;
+        }
         if (cachedEpoch != pbSkipEpoch) {
             changed = true;
             pbSkipEpoch = cachedEpoch;
@@ -2638,6 +2826,7 @@ public final class TerrainDrawer {
         // arms; lastPhaseBStatsFrame -1 with reads after c means every
         // slot read since standup showed zero, which IS evidence.
         boolean skip = lastReadStatsFrame >= c + 2 && lastPhaseBStatsFrame <= c;
+        phaseBCpuSkipArmed = skip;
         if (skip) {
             phaseBCpuSkipFrames++;
         }
@@ -3342,7 +3531,7 @@ public final class TerrainDrawer {
             transDrawnMark = new boolean[Math.max(snapCount, transDrawnMark.length * 2)];
         }
         // P2: THE TRANSLUCENT PASS GETS THE OPAQUE PASS'S OWN VISIBILITY
-        // FEED WHENEVER THERE IS ONE (docs/FARFIELD-WAVES.md, "P2 AND P9
+        // FEED WHENEVER THERE IS ONE (docs/unreleased/farfield/FARFIELD-WAVES.md, "P2 AND P9
         // ANSWERED"). Owner, occlusion culling ON: "when you fly up, the
         // surface of the water can go missing until you fly higher" —
         // WATER specifically, with the land beside it intact.
@@ -3583,11 +3772,13 @@ public final class TerrainDrawer {
      * Quads one translucent draw carries: {@link #TRANS_QUADS_DEFAULT}
      * clamped to the REAL device's mesh-output caps. The vertex and
      * primitive spec minimums admit the default (256 / 256 against 64x4 /
-     * 64x2), but the OUTPUT MEMORY minimum does not: 64 quads x
-     * {@value #MESH_OUTPUT_BYTES_PER_QUAD} B = 36864 B against a guaranteed
-     * floor of 32768, which admits 56. That gap arrived with the
-     * greedy-merge varyings and was found by review; the clamp makes the
-     * shape legal per device instead of hoping every card is generous.
+     * 64x2), and the OUTPUT MEMORY minimum did not at the nine-location
+     * layout that introduced this clamp: 64 quads x 576 B = 36864 B against
+     * a guaranteed floor of 32768, which admitted 56. At the current
+     * layouts (MESH_OUTPUT_BYTES_PER_QUAD = 320 packed / 448 unpacked) the
+     * floor admits 102 / 73, so the clamp is a no-op today; it stays so the
+     * next growth is caught per device instead of hoping every card is
+     * generous. That gap was found by review.
      */
     private static int transQuadCapacity() {
         MesheliumVulkanState.MeshShaderCaps caps = MesheliumVulkanState.caps();
@@ -3707,6 +3898,22 @@ public final class TerrainDrawer {
      * (Camera.createProjectionMatrixForCulling — wave-5 notes item 6);
      * culling with the render volume instead is pixel-safe by the
      * clip-volume argument in the class javadoc.
+     *
+     * <p>NEXT (c1), 2026-09-16, PRE-EXISTING and out of scope for c1, but
+     * recorded here so a walking run is not spent rediscovering it: the
+     * sentence above is about the RENDER volume, and a BOBBED frame quietly
+     * falsifies it on this host, because these planes are built from
+     * {@code cam.projectionMatrix} (pre-bob, the line below) while the
+     * frame is DRAWN with the bob-multiplied copy. The direction is
+     * harmless - it is parity with vanilla's own cull frustum, which is
+     * also pre-bob ({@code Camera.update} ip 114-131 calls
+     * {@code prepareCullFrustum(viewRot, createProjectionMatrixForCulling(),
+     * position)}) - and the Sodium host builds ITS planes from the BOBBED
+     * projection ({@code SodiumTerrainDrawer.putFrustumPlanes}), so a
+     * walking draw-count difference between the two hosts is EXPECTED and
+     * is not the half-res lever. Neither host deletes terrain vanilla
+     * draws. Do not fix it here; do not let it be read as a lever
+     * fault.</p>
      */
     private static GpuBufferSlice uploadScene(CommandEncoder encoder, CameraRenderState cam,
             int atlasWidth, int atlasHeight) {

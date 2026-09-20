@@ -11,7 +11,6 @@ import com.deds.meshelium.gui.MesheliumOptionsScreen;
 import net.minecraft.commands.Commands;
 
 import net.neoforged.api.distmarker.Dist;
-import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.loading.FMLConfig;
 import net.neoforged.fml.loading.FMLPaths;
@@ -113,15 +112,16 @@ public final class MesheliumNeoForge {
      * in any bug report, and the Fabric entrypoint has always logged it.
      * Falls back rather than throwing: a version string is not worth
      * failing a load over.
+     *
+     * <p>Through the platform service since 2026-09-14, so that this
+     * line and the version the Sodium adapter shows in Sodium's options
+     * screen ({@code MesheliumSodiumConfigEntry}) are one lookup; the
+     * {@code ModList} body that used to live here moved into
+     * {@link NeoForgePlatformServices#modVersion}. Safe to call here:
+     * the services are installed on the first line of the constructor.
      */
     private static String version() {
-        try {
-            return ModList.get().getModContainerById("meshelium")
-                    .map(c -> c.getModInfo().getVersion().toString())
-                    .orElse("(unknown version)");
-        } catch (Throwable t) {
-            return "(unknown version)";
-        }
+        return MesheliumPlatform.modVersion("meshelium").orElse("(unknown version)");
     }
 
     /**

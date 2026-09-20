@@ -70,7 +70,63 @@
 // No subgroup ops anywhere: the one cross-invocation step (prefix-summing
 // 32 group counts) is done by invocation 0 between barriers — portable to
 // any subgroup size, revisit in wave 9 if profiling says so.
+//
+// ---- THE SODIUM ARM (MESHELIUM_SODIUM_TASK == 1, D-023 stages 2-3) ----
+// Every declaration and the whole main() body below have a second arm
+// that selects Sodium's geometry instead of Meshelium's. WHY: stage 0
+// measured our per-section CPU enumeration at up to half the frame at
+// aerial rd96 (MEASUREMENTS.md 0k); the stage-1 run cache removed most of
+// it and left a GPU-bound frame (0l) whose pass scales with quads, not
+// per-vertex ALU (0m); under the canopy the box rasters cut the
+// standalone's draw by 0.256 ms for a 0.103 ms tax (0n). So the section
+// selection moves here: the CPU writes one 64-byte list entry per LISTED
+// REGION and one indirect command of ceil(popcount/32) workgroups, and
+// this stage reads Sodium's 48-byte section records out of a DEVICE_LOCAL
+// mirror (a verbatim memcpy of SectionRenderDataUnsafe's heap, committed
+// in-stream before the frame's first opaque pass - contract §3) and does
+// per lane what MesheliumSodiumDrawList.walkRegion/emitRuns did per
+// section on the CPU. Layout literals below carry a
+// "SodiumGpuVisibilityLayout.X" comment; that Java class is authoritative.
+//
+// Lane -> slot: lane k of this region maps to the k-th SET bit of the
+// region row's 256-bit occupancy mask by prefix popcount (fewest fill
+// workgroups: a region with 40 occupied slots dispatches 2 workgroups,
+// not 8). Slot s is Sodium's LocalSectionIndex: x = (s>>5)&7, y = s&3,
+// z = (s>>2)&7.
+//
+// The four gates, each with its parity argument (contract §6):
+//  VisMode 0  the BFS-parity bit: bit slot of the list entry's mask,
+//             drained from Sodium's own sectionsWithGeometryIterator for
+//             this region - the drawn set equals the list path's exactly.
+//  VisMode 1/2  the stamp tests of the standalone path, verbatim (below).
+//  frustum    (VisMode 1/2 only) the same inflated-box test as the
+//             standalone arm; VisMode 0's set already passed Sodium's
+//             cull-frustum test, so it is drawn ungated (see the gate).
+//  distance   (Flags & DIST_GATE, VisMode 1/2 only) OcclusionCuller
+//             .visitNode's test with `precise` arithmetic so the float
+//             ops match Java's fmul/fadd (no FMA contraction).
+//  facing     DefaultChunkRenderer.getVisibleFaces as six integer
+//             comparisons on CameraTransform.intX/Y/Z - exact parity,
+//             checked against Sodium's method on a lattice every suite
+//             run (MesheliumSodiumFacing.latticeFailure).
+// The record walk is emitRuns line for line: seven runs in facing-list
+// order, a zero-count run's facing byte never consulted, the VERTEX
+// cursor advancing over every run including culled ones (D-010's trap),
+// bins in vertex units because Sodium's base vertex need not be a
+// multiple of four.
+//
+// Belt and braces (contract I4): a row whose bufferKey is not the bound
+// geometry buffer's GroupKey emits nothing - a region in the wrong draw
+// group can only be omitted, never read from the wrong buffer.
 #extension GL_EXT_mesh_shader : require
+#if MESHELIUM_SODIUM_TASK
+// gl_DrawIDARB in the TASK stage: one indirect draw covers every listed
+// region of one geometry buffer, and the draw index names the region's
+// list slot. Verified legal with glslc + spirv-val (vulkan1.2) 2026-09-07
+// rather than assumed; shaderDrawParameters and multiDrawIndirect are
+// vanilla-enabled features (VulkanBackend.<clinit>).
+#extension GL_ARB_shader_draw_parameters : require
+#endif
 
 layout(local_size_x = MESHELIUM_TASK_WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 
@@ -89,8 +145,63 @@ layout(set = 0, binding = 1, std140) uniform MesheliumScene {
                             // (mesh stage only); a slider at 0 uploads
                             // 3.4e38, which every real distance compares
                             // under, so the gate keeps everything
+#if MESHELIUM_SODIUM_TASK
+    // The Sodium tail (SodiumTerrainDrawer.uploadScene grows 208 -> 240 B
+    // on the rung-0 path only). SodiumGpuVisibilityLayout.SCENE_CAMERA_FRAC
+    // (208) / SCENE_CAMERA_BLOCK (224).
+    vec4 CameraFrac;        // xyz = CameraTransform.fracX/Y/Z, w = Sodium's
+                            // search distance D in blocks (getSearchDistance)
+    ivec4 CameraBlock;      // xyz = CameraTransform.intX/Y/Z verbatim (the
+                            // d2i truncation getVisibleFaces was called with)
+#endif
 };
 
+#if MESHELIUM_SODIUM_TASK
+// ---- Sodium arm, bindings 7 and 8 (SodiumGpuVisibilityLayout.B_MIRROR /
+// B_LIST). Exactly FOUR task-stage storage buffers on this pipeline
+// (7, 8, 9, 10 - the spec minimum, TASK_STAGE_STORAGE_BUFFERS), which is
+// why the stats live in the mirror's header instead of a fifth binding.
+//
+// The mirror (SodiumMirrorGpu), bound whole from offset 0: a 256-byte
+// header, then capacity rows of 64 B, then the SOLID and CUTOUT record
+// tables of capacity*256 records of 48 B each. Everything after the
+// header is addressed as uvec4 data[]: row(mid) = data[mid*4 + 0..3],
+// record(mid, slot) = data[RecordBase + (mid*256 + slot)*3 + 0..2] with
+// RecordBase the push constant (= recordBaseUvec4(capacity, pass)).
+//   row:    [0] ivec4 {chunkX, chunkY, chunkZ, flags (bit0 live)}
+//           [1] uvec4 occupancy words 0-3   (bit s at word s>>5, bit s&31)
+//           [2] uvec4 occupancy words 4-7
+//           [3] uvec4 {bufferKey, popcount, occMinPacked, occMaxPacked}
+//   record: Sodium's SectionRenderDataUnsafe bytes, verbatim:
+//           w0 = {baseElement, baseVertex, facing bytes 0-3, facing bytes
+//                 4-6 | isLocalIndex<<24}
+//           w1 = {sliceMask, count0, count1, count2}
+//           w2 = {count3, count4, count5, count6}
+// stats[0..2] += 1 per surviving section in VisMode 0/1/2, stats[3] +=
+// quads emitted (all modes): TerrainOcclusion.recordStatsTransfer reads
+// them through the mirror. hdr[] is the layout words (debug/readback).
+layout(set = 0, binding = 7, std430) buffer SodiumMirror {
+    uint stats[4];      // SodiumGpuVisibilityLayout.MIRROR_STATS_OFFSET 0
+    uint hdr[60];       // MIRROR_LAYOUT_OFFSET 16 .. MIRROR_HEADER_BYTES 256
+    uvec4 data[];       // byte 256 onward
+};
+
+// The per-frame list (SodiumFrameRing slot), one 64-B entry per LISTED
+// region in draw order, written by MesheliumRegionMirror.buildFrame:
+// SodiumGpuVisibilityLayout.LIST_ENTRY_BYTES / LIST_ORIGIN / LIST_META_* /
+// LIST_BFS_MASK. Entry FirstSlot + gl_DrawIDARB is this draw's region.
+struct OccRegion {
+    vec3 origin;    // region MIN corner rel camera (blocks)
+    uint groupEnd;  // SodiumGpuVisibilityLayout.LIST_GROUP_END: cumulative task
+                    // workgroups of this entry's group through this entry    // xyz = region MIN corner in blocks, camera-relative
+    uvec4 meta;     // x = mid, y = popcount(occupancy), z/w = occ AABB packed
+    uvec4 mask0;    // 256-bit BFS mask, slots 0-127 (VisMode 0 only)
+    uvec4 mask1;    // slots 128-255
+};
+layout(set = 0, binding = 8, std430) readonly buffer SodiumList {
+    OccRegion list[];
+};
+#else
 // The wave-3 section-record buffer (MesheliumTerrainGpu.sectionBuffer): 256
 // records of 32 B per region id, i.e. two ivec4 per record —
 // [0] = header, [1] = renderRanges (layout: SectionRecord javadoc /
@@ -123,6 +234,7 @@ layout(set = 0, binding = 8, std140) uniform VisibilityMasks {
     uvec4 visMasks[MESHELIUM_VIS_UVEC4S];
 };
 #endif
+#endif
 
 // ---- wave-6 occlusion visibility (read ONLY when VisMode != 0; bfs/cpu
 // frames bind a harmless dummy SSBO that is never dynamically accessed).
@@ -141,6 +253,43 @@ layout(set = 0, binding = 9, std430) readonly buffer PrevStamps {
 layout(set = 0, binding = 10, std430) readonly buffer CurStamps {
     uint curStamps[];
 };
+#if MESHELIUM_SODIUM_TASK
+// No binding 11 on the Sodium arm: the stats are the mirror header's
+// first four words (binding 7), keeping the task stage at four storage
+// buffers.
+
+// Per-draw data: one indirect draw = every listed region of one geometry
+// buffer; the draw index selects the region. 32 B, TASK|MESH, offsets per
+// SodiumGpuVisibilityLayout.PUSH_*; the mesh stage reads none of it.
+layout(push_constant) uniform MesheliumPush {
+    uint FirstSlot;        // PUSH_FIRST_SLOT 0: list index of this draw's
+                           // first region (groupStart[g])
+    uint GroupKey;         // PUSH_GROUP_KEY 4: bufferKey of the geometry
+                           // buffer bound at binding 0 for this draw
+    uint VisMode;          // PUSH_VIS_MODE 8: 0 BFS-parity mask / 1 phase A
+                           // / 2 phase B (VIS_MODE_*)
+    uint FrameStamp;       // PUSH_FRAME_STAMP 12: the owned frame's stamp
+    uint Flags;            // PUSH_FLAGS 16: FLAG_STATS 1, FLAG_FACE_ALL 2,
+                           // FLAG_DIST_GATE 4
+    uint RecordBase;       // PUSH_RECORD_BASE 20: uvec4 index of this
+                           // pass's record table inside data[]
+    uint RegionCount;      // PUSH_REGION_COUNT 24: this draw's list-entry
+                           // count (FLAG_ONE_DRAW), else 0
+    uint Reserved1;        // PUSH_RESERVED1 28
+};
+const uint SODIUM_FLAG_STATS     = 1u;   // SodiumGpuVisibilityLayout.FLAG_STATS
+const uint SODIUM_FLAG_FACE_ALL  = 2u;   // SodiumGpuVisibilityLayout.FLAG_FACE_ALL
+const uint SODIUM_FLAG_DIST_GATE = 4u;   // SodiumGpuVisibilityLayout.FLAG_DIST_GATE
+// Measurement only (SodiumTerrainDrawer.PROPERTY_DIAG_TASK_SKIP): never
+// set by a shipped path; see SodiumGpuVisibilityLayout.FLAG_DIAG_*.
+const uint SODIUM_FLAG_DIAG_SKIP_ALL    = 8u;
+const uint SODIUM_FLAG_DIAG_SKIP_STAMPS = 16u;
+// One indirect draw per buffer group (SodiumTerrainDrawer.PROPERTY_ONE_DRAW):
+// the workgroup finds its region by searching the group's entries on
+// groupEnd; RegionCount (push) is the group's entry count.
+const uint SODIUM_FLAG_ONE_DRAW         = 32u;
+const uint SODIUM_ROW_FLAG_LIVE  = 1u;   // SodiumGpuVisibilityLayout.ROW_FLAG_LIVE
+#else
 // Tiny GPU stats: [VisMode] += 1 per section that survives all gates —
 // the wave-6 readback consumer (TerrainOcclusion copies + zeroes it each
 // stats frame). [0] = mask mode, [1] = phase A, [2] = phase B.
@@ -162,6 +311,7 @@ layout(push_constant) uniform MesheliumPush {
     uint FrameStamp;       // this frame's occlusion stamp (VisMode 1/2)
     uint StatsFlags;       // bit 0: count surviving sections into occStats
 };
+#endif
 
 // One entry per task invocation (= per compacted section slot).
 struct MesheliumSectionTask {
@@ -177,6 +327,14 @@ struct MesheliumSectionTask {
 
 struct MesheliumTaskPayload {
     MesheliumSectionTask sections[MESHELIUM_TASK_WG_SIZE];
+#if MESHELIUM_SODIUM_TASK
+    // The region origin travels in the payload instead of a push constant
+    // because one draw now covers many regions. +16 B; terrain.mesh's
+    // declaration must match byte for byte, and TerrainDrawPipeline
+    // .createSodiumTask asserts 80 * MESHELIUM_TASK_WG_SIZE + 16 against
+    // the device's maxTaskPayloadSize.
+    vec4 regionOrigin;
+#endif
 };
 
 // taskPayloadSharedEXT qualifies a VARIABLE of struct type (the EXT spec's
@@ -211,8 +369,235 @@ void putBin(inout uint idx, inout uint lastIndex, uint absStart, uint len, uint 
     lastIndex += len;
 }
 
+#if MESHELIUM_SODIUM_TASK
+// The k-th set bit of a 256-bit occupancy mask (word i covers slots
+// 32i..32i+31): per word, if k < bitCount, clear k low set bits with
+// x &= x-1 and take findLSB; else subtract and move on. The SAME text is
+// duplicated in occlusion/section_raster.mesh (no #include exists in
+// MesheliumShaderCompiler) - keep the two identical. Returns 255 only for
+// k >= popcount, which the caller's k < row.popcount check excludes.
+uint meshelium_sodiumSlotOfRank(uvec4 m0, uvec4 m1, uint k) {
+    uint w[8] = uint[8](m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w);
+    for (uint i = 0u; i < 8u; ++i) {
+        uint c = uint(bitCount(w[i]));
+        if (k < c) {
+            uint x = w[i];
+            for (uint j = 0u; j < k; ++j) {
+                x &= x - 1u;
+            }
+            return i * 32u + uint(findLSB(x));
+        }
+        k -= c;
+    }
+    return 255u;
+}
+
+// OcclusionCuller.nearestToZero(a, b) = a > 0 ? a : (b < 0 ? b : 0)
+// (contract §1.4, bytecode @0-15).
+int meshelium_sodiumNearestToZero(int a, int b) {
+    return a > 0 ? a : (b < 0 ? b : 0);
+}
+
+// One of Sodium's seven facing runs, MesheliumSodiumDrawList.emitRuns'
+// loop body: a populated run whose facing the camera can see becomes a
+// bin of count/4 quads starting at the current VERTEX cursor; the cursor
+// advances over EVERY run, kept or culled - skipping the advance draws
+// the wrong geometry, not less of it (D-010's trap). The facing byte of
+// an empty run is never consulted (count != 0 is tested first), and the
+// shift count is masked to 5 bits exactly as Java's >>> masks it, so an
+// out-of-range byte keeps or drops precisely what the list path would.
+void meshelium_sodiumRun(uint count, uint facing, uint mask,
+        inout uint cursor, inout uint idx, inout uint lastIndex, uint t) {
+    if (count != 0u && ((mask >> (facing & 31u)) & 1u) != 0u) {
+        putBin(idx, lastIndex, cursor, count >> 2u, t);
+    }
+    cursor += count;
+}
+#endif
+
 void main() {
     uint t = gl_LocalInvocationIndex;
+#if MESHELIUM_SODIUM_TASK
+    // ---- Sodium arm: lane k of the region at list slot FirstSlot +
+    // gl_DrawIDARB. Every address below the record reads is uniform
+    // across the workgroup (draw index + workgroup-uniform mid), so the
+    // row loads are scalar loads out of the constant cache - the shape
+    // the batched mesh stage measured 0.5 ms/frame for getting wrong.
+    uint slot;
+    uint localWg;
+    if ((Flags & SODIUM_FLAG_ONE_DRAW) != 0u) {
+        // One draw covers the group's [FirstSlot, FirstSlot + RegionCount)
+        // entries; workgroup g belongs to the first entry whose cumulative
+        // groupEnd exceeds g (an entry with no workgroups has groupEnd ==
+        // its predecessor's and is never selected). Uniform inputs, so
+        // scalar loads; RegionCount >= 1 whenever the group is drawn.
+        uint g = gl_WorkGroupID.x;
+        uint lo = FirstSlot;
+        uint hi = FirstSlot + RegionCount - 1u;
+        while (lo < hi) {
+            uint m = (lo + hi) >> 1u;
+            if (list[m].groupEnd > g) {
+                hi = m;
+            } else {
+                lo = m + 1u;
+            }
+        }
+        slot = lo;
+        uint start = (slot == FirstSlot) ? 0u : list[slot - 1u].groupEnd;
+        localWg = g - start;
+    } else {
+        slot = FirstSlot + uint(gl_DrawIDARB);
+        localWg = gl_WorkGroupID.x;
+    }
+    OccRegion e = list[slot];
+    uint mid = e.meta.x;
+    uint k = localWg * uint(MESHELIUM_TASK_WG_SIZE) + t;
+
+    // NO early returns: EmitMeshTasksEXT and barrier() below demand that
+    // every invocation arrives (uniform control flow).
+    uint groups = 0u;
+
+    // Measurement only: with DIAG_SKIP_ALL set, no row, record or stamp
+    // is read and nothing is emitted - the launch and payload cost alone.
+    if ((Flags & SODIUM_FLAG_DIAG_SKIP_ALL) == 0u) {
+    uvec4 r0 = data[mid * 4u + 0u];   // ivec4 {chunkX, chunkY, chunkZ, flags}
+    uvec4 r1 = data[mid * 4u + 1u];   // occupancy words 0-3
+    uvec4 r2 = data[mid * 4u + 2u];   // occupancy words 4-7
+    uvec4 r3 = data[mid * 4u + 3u];   // {bufferKey, popcount, occMin, occMax}
+
+    // The group check (contract I4, §5.4 step 2): a row whose key is not
+    // the buffer bound at binding 0 for this draw emits nothing. A dead
+    // row (live bit clear, or zero-filled after delete) emits nothing.
+    bool regionOk = (r0.w & SODIUM_ROW_FLAG_LIVE) != 0u && r3.x == GroupKey;
+    if (regionOk && k < r3.y) {
+        uint slot = meshelium_sodiumSlotOfRank(r1, r2, k);
+        // LocalSectionIndex.pack(x,y,z) = (x&7)<<5 | (y&3) | (z&7)<<2.
+        uint lx = (slot >> 5u) & 7u;
+        uint ly = slot & 3u;
+        uint lz = (slot >> 2u) & 7u;
+
+        // VisMode 0: the BFS-parity bit (the list entry's mask, drained
+        // from Sodium's sectionsWithGeometryIterator for this region).
+        // VisMode 1/2: the standalone arm's stamp tests verbatim - drawn
+        // iff prev==FrameStamp-1 (A) or cur==FrameStamp && !prevFresh (B);
+        // union = every marked section, intersection empty, staleness
+        // can only ADD a depth-tested draw of a current record (I5).
+        bool visible;
+        if (VisMode == 0u) {
+            uint w = slot >> 5u;
+            uint word = (w < 4u) ? e.mask0[w] : e.mask1[w - 4u];
+            visible = ((word >> (slot & 31u)) & 1u) != 0u;
+        } else if ((Flags & SODIUM_FLAG_DIAG_SKIP_STAMPS) != 0u) {
+            visible = false;   // measurement only: the stamp loads priced out
+        } else {
+            uint gidx = mid * 256u + slot;
+            bool prevFresh = prevStamps[gidx] == FrameStamp - 1u;
+            if (VisMode == 1u) {
+                visible = prevFresh;
+            } else {
+                visible = curStamps[gidx] == FrameStamp && !prevFresh;
+            }
+        }
+
+        if (visible) {
+            // Frustum: the full 16³ box inflated 0.5 blocks, the
+            // pixel-safe superset the standalone arm uses (see (a) above).
+            vec3 lo = e.origin + vec3(float(lx), float(ly), float(lz)) * 16.0 - 0.5;
+            // VisMode 0: no frustum here — every masked section already passed
+            // Sodium's own test (TraversableTree.testLeafNode ->
+            // Viewport.isBoxVisibleDirect(x,y,z, 9.125f) against the CULL
+            // frustum, a superset of this render-frustum box), and Sodium draws
+            // that list with no draw-time frustum either; applying this gate
+            // would make the drawn set a strict subset of the list path's and
+            // break the 97_01 counter equality. VisMode 1/2 keep it: their
+            // section set comes from the stamps, not from a Sodium-tested list.
+            if (VisMode == 0u || inFrustum(lo, lo + 17.0)) {
+                ivec3 sc = ivec3(r0.xyz) + ivec3(int(lx), int(ly), int(lz));
+                ivec3 cam = CameraBlock.xyz;
+
+                // Distance (VisMode 1/2 only - the CPU sets DIST_GATE):
+                // OcclusionCuller.visitNode's test, contract §1.4 / §6.3.
+                // Per axis d = sectionOrigin - cam.int (blocks), n =
+                // float(nearestToZero(d-1, d+17)) - cam.frac; keep iff
+                // n.x²+n.z² < D² and |n.y| < D. `precise` forbids FMA
+                // contraction so distSq is Java's fmul, fmul, fadd.
+                bool inRange = true;
+                if ((Flags & SODIUM_FLAG_DIST_GATE) != 0u) {
+                    ivec3 d = (sc << 4) - cam;
+                    precise float nx = float(meshelium_sodiumNearestToZero(d.x - 1, d.x + 17)) - CameraFrac.x;
+                    precise float ny = float(meshelium_sodiumNearestToZero(d.y - 1, d.y + 17)) - CameraFrac.y;
+                    precise float nz = float(meshelium_sodiumNearestToZero(d.z - 1, d.z + 17)) - CameraFrac.z;
+                    precise float distSq = nx * nx + nz * nz;
+                    float D = CameraFrac.w;
+                    inRange = distSq < D * D && abs(ny) < D;
+                }
+
+                if (inRange) {
+                    // Facing: DefaultChunkRenderer.getVisibleFaces
+                    // (contract §1.4, bytecode @0-149) as six integer
+                    // comparisons - origin = coord<<4, end = origin+16,
+                    // POS_axis kept iff cam > origin-3, NEG_axis iff cam
+                    // < end+3, UNASSIGNED always. Ordinals POS_X 0, POS_Y
+                    // 1, POS_Z 2, NEG_X 3, NEG_Y 4, NEG_Z 5, UNASSIGNED 6.
+                    // FACE_ALL = the list path's "faceCull off" (mask =
+                    // ModelQuadFacing.ALL, 0x7F).
+                    uint mask = 1u << 6u;
+                    if ((Flags & SODIUM_FLAG_FACE_ALL) != 0u) {
+                        mask = 0x7Fu;
+                    } else {
+                        ivec3 o = sc << 4;
+                        ivec3 en = o + 16;
+                        mask |= (uint(cam.x > o.x - 3) << 0u)
+                              | (uint(cam.y > o.y - 3) << 1u)
+                              | (uint(cam.z > o.z - 3) << 2u)
+                              | (uint(cam.x < en.x + 3) << 3u)
+                              | (uint(cam.y < en.y + 3) << 4u)
+                              | (uint(cam.z < en.z + 3) << 5u);
+                    }
+
+                    // The record walk (emitRuns line for line). Facing of
+                    // run i = byte 8+i: i < 4 in w0.z at bits 8i, else in
+                    // w0.w at bits 8(i-4); byte 15 (isLocalIndex) is never
+                    // read because i <= 6. Adjacent kept runs are NOT
+                    // merged - each is its own bin (at most 7; the payload
+                    // holds 8).
+                    uint base = RecordBase + (mid * 256u + slot) * 3u;
+                    uvec4 w0 = data[base];
+                    uvec4 w1 = data[base + 1u];
+                    uvec4 w2 = data[base + 2u];
+                    uint cursor = w0.y;                // baseVertex, VERTEX units
+                    uint idx = 0u;
+                    uint lastIndex = 0u;
+                    payload.sections[t].binIa = uvec4(0u);
+                    payload.sections[t].binIb = uvec4(0u);
+                    meshelium_sodiumRun(w1.y, (w0.z       ) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 0
+                    meshelium_sodiumRun(w1.z, (w0.z >>  8u) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 1
+                    meshelium_sodiumRun(w1.w, (w0.z >> 16u) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 2
+                    meshelium_sodiumRun(w2.x, (w0.z >> 24u) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 3
+                    meshelium_sodiumRun(w2.y, (w0.w       ) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 4
+                    meshelium_sodiumRun(w2.z, (w0.w >>  8u) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 5
+                    meshelium_sodiumRun(w2.w, (w0.w >> 16u) & 0xFFu, mask, cursor, idx, lastIndex, t); // run 6
+
+                    if (lastIndex > 0u) {
+                        // Repacked into Meshelium's posKey layout (y bits
+                        // 6-7, z bits 3-5, x bits 0-2) so terrain.mesh's
+                        // decode is unchanged.
+                        payload.sections[t].posAndCount = (lastIndex << 8u) | ((ly << 6u) | (lz << 3u) | lx);
+                        groups = (lastIndex + uint(MESHELIUM_WG_SIZE) - 1u) / uint(MESHELIUM_WG_SIZE);
+                        if ((Flags & SODIUM_FLAG_STATS) != 0u) {
+                            atomicAdd(stats[VisMode], 1u);
+                            atomicAdd(stats[3], lastIndex);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    } // DIAG_SKIP_ALL
+    if (t == 0u) {
+        payload.regionOrigin = vec4(e.origin, 0.0);
+    }
+#else
     uint slot = gl_WorkGroupID.x * uint(MESHELIUM_TASK_WG_SIZE) + t;
     uint recordBase = (RegionIndex * 256u + slot) * 2u;
     ivec4 header = sectionRecords[recordBase];
@@ -333,6 +718,7 @@ void main() {
             }
         }
     }
+#endif
 
     payload.sections[t].groupEnd = groups;
     barrier();

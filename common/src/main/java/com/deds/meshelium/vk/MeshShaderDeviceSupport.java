@@ -12,6 +12,7 @@ import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import com.mojang.blaze3d.vulkan.init.VulkanPNextStruct;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.EXTConservativeRasterization;
 import org.lwjgl.vulkan.EXTMemoryBudget;
 import org.lwjgl.vulkan.EXTMeshShader;
 import org.lwjgl.vulkan.KHRPushDescriptor;
@@ -29,6 +30,7 @@ import org.lwjgl.vulkan.VkPhysicalDeviceMemoryProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderFeaturesEXT;
 import org.lwjgl.vulkan.EXTConditionalRendering;
 import org.lwjgl.vulkan.VkPhysicalDeviceConditionalRenderingFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDeviceConservativeRasterizationPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderPropertiesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
@@ -118,6 +120,19 @@ public final class MeshShaderDeviceSupport {
             BASE_FEATURES_STRUCT, "fragmentStoresAndAtomics",
             VkPhysicalDeviceFeatures.FRAGMENTSTORESANDATOMICS);
 
+    // multiDrawIndirect and shaderDrawParameters are NOT declared here, and
+    // the absence is deliberate. Both are in vanilla's own
+    // VulkanBackend.REQUIRED_DEVICE_FEATURES (javap 26.2: "multiDrawIndirect"
+    // on the VK10 base struct, "shaderDrawParameters" on the sType-49
+    // VkPhysicalDeviceVulkan11Features struct), so any device vanilla can
+    // create already has both enabled. A first version of the Sodium
+    // batching re-requested them through a standalone
+    // VkPhysicalDeviceShaderDrawParametersFeatures struct — which, chained
+    // beside vanilla's Vulkan11Features, violates
+    // VUID-VkDeviceCreateInfo-pNext-02829. Redundant AND invalid; caught by
+    // review, not by any driver, which is the usual way with that class of
+    // mistake.
+
     private static final VulkanPNextStruct MESH_SHADER_PROPERTIES_STRUCT = new VulkanPNextStruct(
             EXTMeshShader.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT,
             VkPhysicalDeviceMeshShaderPropertiesEXT.SIZEOF);
@@ -160,6 +175,26 @@ public final class MeshShaderDeviceSupport {
     public static final VulkanFeature CONDITIONAL_RENDERING_FEATURE = new VulkanFeature(
             CONDITIONAL_RENDERING_FEATURES_STRUCT, "conditionalRendering",
             VkPhysicalDeviceConditionalRenderingFeaturesEXT.CONDITIONALRENDERING);
+
+    /**
+     * NEXT (c) part B: {@code VK_EXT_conservative_rasterization}.
+     * OVERESTIMATE mode emits a fragment for every pixel a primitive
+     * touches, which closes the half-res coverage hole (a box silhouette
+     * that covers a full-res sample but misses the half-res pixel centre)
+     * without the mesh-stage inflation. It has NO feature struct -
+     * lwjgl-vulkan 3.4.1 has no
+     * {@code VkPhysicalDeviceConservativeRasterizationFeaturesEXT} class,
+     * checked with javap - so only the extension string and the properties
+     * struct are involved.
+     */
+    static final String CONSERVATIVE_RASTERIZATION_EXTENSION =
+            EXTConservativeRasterization.VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME;
+
+    private static final VulkanPNextStruct CONSERVATIVE_RASTERIZATION_PROPERTIES_STRUCT =
+            new VulkanPNextStruct(
+                    EXTConservativeRasterization
+                            .VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT,
+                    VkPhysicalDeviceConservativeRasterizationPropertiesEXT.SIZEOF);
 
     private static final VulkanPNextStruct MAINTENANCE_3_PROPERTIES_STRUCT = new VulkanPNextStruct(
             VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
@@ -253,6 +288,14 @@ public final class MeshShaderDeviceSupport {
             // fails device creation and takes the whole game down with it.
             // If it is genuinely absent, mesh-shader terrain still works
             // and only occlusion culling is unavailable.
+            // gl_DrawID + multi-draw-indirect for the batched Sodium draw.
+            // Nothing to probe or request: vanilla's REQUIRED_DEVICE_FEATURES
+            // carries both (see the note above the mesh-shader feature
+            // structs), so on any device this code is running on they are
+            // enabled. Recorded as a fact rather than assumed at the use
+            // site, so the pipeline that compiles gl_DrawID reads one flag.
+            MesheliumVulkanState.setDrawIndirectSupported(true);
+
             if (isFeatureSupported(vk, FRAGMENT_STORES_AND_ATOMICS)) {
                 features.add(FRAGMENT_STORES_AND_ATOMICS);
             } else {
@@ -272,6 +315,54 @@ public final class MeshShaderDeviceSupport {
                 features.add(CONDITIONAL_RENDERING_FEATURE);
             }
             MesheliumVulkanState.setConditionalRenderingSupported(condRender);
+
+            // NEXT (c) part B, a BOOT-TIME lever. The extension is appended
+            // ONLY when the property is true, unlike the conditional
+            // rendering above, which appends whenever the device offers it:
+            // appending an extension changes VkDeviceCreateInfo, and with
+            // the property absent every shipped boot must stay
+            // byte-identical to what the parity baseline and the lever-off
+            // suite runs measured. The PRESENCE is still probed and logged
+            // on every boot, so "does this driver expose it at all" is
+            // answered by any run rather than left UNVERIFIED.
+            boolean consRasterWanted =
+                    Boolean.getBoolean(TerrainOcclusion.PROPERTY_CONSERVATIVE_RASTER);
+            boolean consRasterPresent =
+                    physicalDevice.hasDeviceExtension(CONSERVATIVE_RASTERIZATION_EXTENSION);
+            boolean consRaster = consRasterWanted && consRasterPresent;
+            if (consRaster) {
+                extensions.add(CONSERVATIVE_RASTERIZATION_EXTENSION);
+            }
+            // No feature struct exists for this extension (lwjgl-vulkan
+            // 3.4.1 has no VkPhysicalDeviceConservativeRasterizationFeaturesEXT,
+            // javap: class not found), so `features` is untouched.
+            MesheliumVulkanState.setConservativeRasterizationSupported(consRasterPresent);
+            MesheliumVulkanState.setConservativeRasterizationEnabled(consRaster);
+            MesheliumVulkanState.ConservativeRasterCaps consCaps =
+                    consRasterPresent ? queryConservativeRasterCaps(vk) : null;
+            MesheliumVulkanState.setConservativeRasterCaps(consCaps);
+            if (consRasterWanted && !consRasterPresent) {
+                MesheliumLog.LOGGER.warn(
+                        "Meshelium: -D{}=true but this device did not offer {}; the box rasters "
+                                + "keep the mesh-stage coverage inflation alone (which is the "
+                                + "load-bearing ingredient - part B was always additive)",
+                        TerrainOcclusion.PROPERTY_CONSERVATIVE_RASTER,
+                        CONSERVATIVE_RASTERIZATION_EXTENSION);
+            }
+            MesheliumLog.LOGGER.info(
+                    "Meshelium conservative rasterization: {} {}, {}; overestimation size {} "
+                            + "(max extra {}, granularity {}), degenerate triangles rasterized {}, "
+                            + "post-depth coverage {}",
+                    CONSERVATIVE_RASTERIZATION_EXTENSION,
+                    consRasterPresent ? "present" : "ABSENT",
+                    consRaster ? "enabled by property" : "not requested",
+                    consCaps == null ? "n/a" : consCaps.primitiveOverestimationSize(),
+                    consCaps == null ? "n/a" : consCaps.maxExtraPrimitiveOverestimationSize(),
+                    consCaps == null ? "n/a"
+                            : consCaps.extraPrimitiveOverestimationSizeGranularity(),
+                    consCaps == null ? "n/a" : consCaps.degenerateTrianglesRasterized(),
+                    consCaps == null ? "n/a"
+                            : consCaps.conservativeRasterizationPostDepthCoverage());
 
             MesheliumVulkanState.MeshShaderCaps caps = queryCaps(vk);
             MesheliumVulkanState.recordDeviceCreation(name, driver, true, caps, localHeapBytes,
@@ -560,6 +651,33 @@ public final class MeshShaderDeviceSupport {
      * Vulkan 1.1, and vanilla's instance requests 1.2 (seam doc Q6), so the
      * core entry point is always present here.
      */
+    /**
+     * NEXT (c) part B: what the device reports about overestimate mode.
+     * Shaped exactly like {@link #queryCaps} and called ONLY when the
+     * extension is present - a zeroed struct would read as "the driver said
+     * zero", and the ArenaLimits rule is that a number the driver did not
+     * give us is not a number.
+     */
+    private static MesheliumVulkanState.ConservativeRasterCaps queryConservativeRasterCaps(
+            VkPhysicalDevice device) {
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkPhysicalDeviceProperties2 properties2 =
+                    VkPhysicalDeviceProperties2.calloc(stack).sType$Default();
+            long address = CONSERVATIVE_RASTERIZATION_PROPERTIES_STRUCT
+                    .findOrCreateStructInPNextChain(properties2, stack);
+            VK11.vkGetPhysicalDeviceProperties2(device, properties2);
+            VkPhysicalDeviceConservativeRasterizationPropertiesEXT props =
+                    VkPhysicalDeviceConservativeRasterizationPropertiesEXT.create(address);
+            return new MesheliumVulkanState.ConservativeRasterCaps(
+                    props.primitiveOverestimationSize(),
+                    props.maxExtraPrimitiveOverestimationSize(),
+                    props.extraPrimitiveOverestimationSizeGranularity(),
+                    props.degenerateTrianglesRasterized(),
+                    props.fullyCoveredFragmentShaderInputVariable(),
+                    props.conservativeRasterizationPostDepthCoverage());
+        }
+    }
+
     private static MesheliumVulkanState.MeshShaderCaps queryCaps(VkPhysicalDevice device) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkPhysicalDeviceProperties2 properties2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default();

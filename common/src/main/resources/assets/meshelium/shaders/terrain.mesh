@@ -43,6 +43,18 @@
 //     workgroups in ONE draw per section and every workgroup slices by
 //     gl_WorkGroupID.x — see the main() comment for the identity argument
 //     when the property is off.
+//   MESHELIUM_SODIUM_TASK=1 (D-023, the Sodium GPU-visibility pipeline):
+//     MESHELIUM_SODIUM=1 + MESHELIUM_TASK_CULL=1 together. terrain.task's
+//     Sodium arm selects the sections out of a mirror of Sodium's own
+//     48-byte records and hands this stage the same bin-table payload as
+//     the standalone task path, plus the region origin (one draw covers
+//     every listed region of one geometry buffer, so the origin cannot be
+//     a push constant) and with bins in VERTEX units (Sodium's base vertex
+//     need not divide by four). Three lines differ, each under the macro:
+//     the push block, the origin, and the bin-to-quad step; the vertex
+//     fetch takes a vertex index. Everything below the fetch is the
+//     stage-1 Sodium code, so the pixel-parity argument
+//     (docs/unreleased/sodium/VERTEX-FORMAT.md §4) is inherited whole.
 //
 // Everything below the quad-mapping preamble (vertex math, lightmap,
 // fog distances, winding) is the wave-4 code unchanged — pixel parity
@@ -51,6 +63,14 @@
 // derivation (vanilla terrain.vsh operation order, lightmap +8 centring,
 // {0,1,2, 2,3,0} winding vs CW front + BACK cull).
 #extension GL_EXT_mesh_shader : require
+#if MESHELIUM_SODIUM_DRAWID
+// gl_DrawID in a mesh shader. Verified legal rather than assumed: glslc at
+// -fshader-stage=mesh emits OpCapability DrawParameters with BuiltIn
+// DrawIndex, and spirv-val --target-env vulkan1.2 accepts the module. The
+// host only compiles this variant when it has probed and enabled both
+// shaderDrawParameters and multiDrawIndirect.
+#extension GL_ARB_shader_draw_parameters : require
+#endif
 
 layout(local_size_x = MESHELIUM_WG_SIZE, local_size_y = 1, local_size_z = 1) in;
 #if MESHELIUM_TRANSLUCENT
@@ -59,6 +79,286 @@ layout(triangles, max_vertices = 4 * MESHELIUM_TRANS_QUADS, max_primitives = 2 *
 layout(triangles, max_vertices = 4 * MESHELIUM_WG_SIZE, max_primitives = 2 * MESHELIUM_WG_SIZE) out;
 #endif
 
+// Per-draw data. Task path: one draw = one region (OriginRelCamera is the
+// REGION origin; section offset comes from the payload posKey). CPU path:
+// one draw = one contiguous quad run of one section (wave-4 meaning).
+// Translucent path: one draw = one ≤MESHELIUM_TRANS_QUADS slice of one
+// section's translucent prefix (OriginRelCamera is the SECTION origin).
+layout(push_constant) uniform MesheliumPush {
+#if MESHELIUM_SODIUM_TASK
+    // The Sodium GPU-visibility arm (D-023): one indirect draw covers every
+    // listed region of one geometry buffer, so there is no per-draw origin
+    // - it arrives in the task payload. 32 B, offsets per
+    // SodiumGpuVisibilityLayout.PUSH_*; declared to keep the layout's
+    // TASK|MESH range honest, read by the task stage only.
+    uint FirstSlot;
+    uint GroupKey;
+    uint VisMode;
+    uint FrameStamp;
+    uint Flags;
+    uint RecordBase;
+    uint RegionCount;
+    uint Reserved1;
+#else
+    vec3 OriginRelCamera;
+#if MESHELIUM_TASK_CULL
+    uint RegionIndex;      // unused here (task stage consumed it)
+    uint MaskSlot;         // unused here
+#elif MESHELIUM_TRANSLUCENT
+    uint FirstQuad;        // absolute quad index into the terrain arena
+    uint QuadCount;        // quads in THIS draw (single workgroup, looped)
+    uint GateIndex;        // posKey<<20 | regionId*256+slot, or 0xFFFFFFFF
+                           // = no occlusion gate (bfs/cpu frames, occlusion
+                           // list overflow, slot unknown) — fails OPEN
+    uint FrameStamp;       // this frame's occlusion stamp (gate compare)
+#elif MESHELIUM_SODIUM
+#if MESHELIUM_SODIUM_BATCH
+    // Batched: one draw covers every run that lives in one of Sodium's
+    // geometry buffers, and the workgroup finds its own run in the table.
+    // OriginRelCamera above is unused here — the origin is per run, so it
+    // travels in the table instead.
+    uint FirstRun;         // index of this draw's first run in the table
+    uint RunCount;         // runs this draw covers
+    uint GroupBase;        // workgroups already dispatched for this buffer
+                           // group by earlier draws. Non-zero only when a
+                           // group had to be split to stay inside
+                           // maxMeshWorkGroupCount; see the host.
+#else
+    uint FirstVertex;      // base VERTEX index of this section's geometry
+                           // inside Sodium's region buffer. A vertex index
+                           // and not a quad index on purpose: Sodium's
+                           // BufferSegment offsets are counted in vertices
+                           // and carry no four-vertex alignment guarantee,
+                           // so dividing one by four can land mid-quad.
+    uint QuadCount;        // quads in this draw (all workgroups)
+#endif
+#else
+    uint FirstQuad;        // absolute quad index into the terrain arena
+    uint QuadCount;        // quads in this draw (all workgroups)
+#endif
+#endif
+};
+
+#if MESHELIUM_SODIUM
+// ---- Sodium host variant: the geometry is Sodium's, where Sodium put it -
+//
+// Binding 0 is not Meshelium's arena here. It is the Blaze3D GpuBuffer
+// that Sodium's own RenderRegion.DeviceResources.getGeometryBuffer()
+// hands out, bound straight through as a storage buffer and read in
+// Sodium's 20-byte CompactChunkVertex layout. Nothing is re-encoded,
+// nothing is copied, and there is no second copy of the world in VRAM -
+// that is the entire point of this variant: Meshelium draws the geometry
+// Sodium already built, in place.
+//
+// ONE buffer, not the arena's block array. The block split exists because
+// a single storage buffer can only reach maxStorageBufferRange bytes and
+// Meshelium's arena outgrows that past render distance 96. Sodium's
+// buffers are per-region arenas (sometimes shared between a few regions)
+// and are orders of magnitude below that limit, and the host rebinds
+// whenever the region's buffer changes, so the whole block-addressing
+// scheme has no counterpart here.
+//
+// Declared uint[] rather than uvec4[] because the stride is 20 bytes -
+// five uints - which no vector type divides.
+layout(set = 0, binding = 0, std430) readonly buffer SodiumGeometry {
+    uint sodiumData[];
+};
+
+#if MESHELIUM_SODIUM_BATCH
+// One entry per contiguous run of geometry the host wants drawn. Must
+// match MesheliumSodiumRunTable.RUN_BYTES and the host's writer exactly.
+//
+// groupEnd is the CUMULATIVE workgroup count, inclusive, counted from the
+// start of this buffer group rather than from the start of the table —
+// which is what lets gl_WorkGroupID.x (plus GroupBase) index straight into
+// it with no per-draw subtraction.
+struct MesheliumRun {
+    uint firstVertex;
+    uint quadCount;
+    uint groupEnd;
+    uint pad;
+    vec4 origin;
+};
+layout(set = 0, binding = 9, std430) readonly buffer MesheliumRunTable {
+    MesheliumRun runs[];
+};
+
+// Workgroup -> run, in one read: runIndex << 12 | localGroup, relative to
+// the draw's FirstRun.
+//
+// This replaces a binary search over the run table. The search was eleven
+// DEPENDENT reads per workgroup and measured at roughly a quarter of a
+// millisecond a frame even with the table in device memory; a flat lookup
+// is one read, and adjacent workgroups read adjacent entries so the line
+// is already warm. Declared even on the gl_DrawID variant, which does not
+// read it — an unused descriptor costs nothing and keeping one layout for
+// both variants keeps the host's push path single.
+layout(set = 0, binding = 10, std430) readonly buffer MesheliumGroupMap {
+    uint groupToRun[];
+};
+
+// EVERY invocation runs the search. No shared memory, no barrier.
+//
+// The first version of this did the opposite — invocation 0 searched into
+// shared memory and the rest waited on a barrier() — reasoning that
+// SetMeshOutputsEXT's arguments had to be PROVABLY workgroup-uniform, the
+// way the translucent variant's occlusion gate does it.
+//
+// Measured 2026-09-04: that cost about 0.5 ms a frame, half again on top
+// of the whole frame, and it swallowed the entire draw-call saving that
+// batching had just won. Two reasons, both structural rather than
+// incidental. Thirty-one of thirty-two lanes sat idle through an
+// eleven-deep chain of DEPENDENT memory loads. And putting the loads
+// inside `if (gl_LocalInvocationIndex == 0u)` buries them in divergent
+// control flow, where a compiler cannot see that the address is the same
+// for the whole wave — so they issue as vector loads instead of scalar
+// ones and miss the scalar cache entirely.
+//
+// Run in every invocation, the address IS wave-uniform by construction:
+// gl_WorkGroupID and the push constants are the only inputs. RDNA lowers
+// that to scalar loads out of the constant cache, and the wave stops
+// waiting on one lane.
+//
+// This is also the shape the task-cull variant has always used — its
+// header says wgQuads "stays uniform (derived from payload and
+// gl_WorkGroupID only), so the EXT contract is unchanged". Same argument
+// here: same inputs, same memory, same answer in every invocation.
+struct MesheliumResolved {
+    uint firstVertex;
+    uint quadBase;
+    uint quads;
+    vec3 origin;
+};
+
+// Which run owns workgroup g: the first whose cumulative end exceeds it.
+// Bounded to the draw's own [FirstRun, FirstRun+RunCount) window, so a
+// table shared by several draws needs no per-draw copy.
+MesheliumResolved meshelium_resolveRun(uint g) {
+#if MESHELIUM_SODIUM_DRAWID
+    // No search at all. Each run is its own indirect draw, so gl_DrawID
+    // names it outright and gl_WorkGroupID restarts inside it — which also
+    // means the cumulative groupEnd column is unused on this path.
+    //
+    // This is the whole reason the drawParameters feature is requested.
+    // The search below costs about eleven DEPENDENT reads per workgroup
+    // over tens of thousands of workgroups; measured, that was worth more
+    // than the draw calls the batching removed. One read replaces it.
+    uint lo = FirstRun + uint(gl_DrawIDARB);
+    uint base = g * uint(MESHELIUM_WG_SIZE);
+#else
+    uint packed = groupToRun[g];
+    uint lo = FirstRun + (packed >> 12u);
+    uint base = (packed & 0xFFFu) * uint(MESHELIUM_WG_SIZE);
+#endif
+    MesheliumResolved r;
+    r.firstVertex = runs[lo].firstVertex;
+    r.quadBase = base;
+    r.quads = min(uint(MESHELIUM_WG_SIZE), runs[lo].quadCount - base);
+    r.origin = runs[lo].origin.xyz;
+    return r;
+}
+
+// The resolved run for this invocation's workgroup. A module-scope
+// variable rather than a parameter threaded through emitQuad, so the
+// shared vertex-emit code stays identical across every variant.
+MesheliumResolved meshelium_run;
+#endif
+
+// Sodium's 20-byte vertex to Meshelium's 16-byte one, as pure integer
+// shuffling - no float round trip and no re-quantization.
+//
+// Converting HERE, in the fetch, is what keeps everything below this
+// function untouched: meshelium_emitQuad and the four decoders are the
+// parity-proven wave-4 code, and they never learn where the bytes came
+// from. It is also why the port costs nothing on the CPU - there is no
+// decode pass, no encoder, no upload, and no second arena; the price is a
+// dozen ALU ops on a stage that is memory-bound anyway.
+//
+// Every field below was read off the 0.9.2-beta.1 jar (CompactChunkVertex
+// bytecode plus its chunk_vertex.glsl); the derivations and the two traps
+// are written up in docs/unreleased/sodium/VERTEX-FORMAT.md.
+//
+//   +0/+4  Position, 20 bits per component, DE-INTERLEAVED across two
+//          dwords: the first holds bits 10-19 of x/y/z at bit 0/10/20, the
+//          second holds bits 0-9 the same way. Both formats quantize the
+//          identical (8.0 + v) domain over a 32-block range, Sodium at
+//          2^20 and Meshelium at 2^16, so the conversion is an exact
+//          q20 >> 4 - which, de-interleaved, is (hi << 6) | (lo >> 4).
+//          Worst case this discards 1/2048 of a block (~0.49 mm), which is
+//          the resolution Meshelium's own encoder has always had.
+//   +8     Colour, ABGR in memory order R,G,B,A, with ambient occlusion
+//          ALREADY folded into RGB on Sodium's build threads. Mask the
+//          alpha off and put skylight in the top byte where Meshelium
+//          keeps it. Do not premultiply again - the multiply has happened.
+//          (Opaque-only v1 pins alpha to 1.0 downstream regardless.)
+//   +12    Texture - and this is the trap. It is NOT two 16-bit UVs. Each
+//          half is a 15-bit magnitude plus a SIGN BIT at bit 15: Sodium
+//          stores round(uv * 32768) + bias, where bias is +1 for the
+//          vertex on the low side of the quad's UV centroid and -1 for the
+//          high side, and its fragment stage subtracts the bias back out
+//          scaled by u_TexCoordShrink. Passing the halfword straight
+//          through would read bit 15 as part of the coordinate and add
+//          exactly 1.0 to two of every quad's four vertices. Undoing the
+//          bias (stored + 2*bit15 - 1) recovers precisely the value
+//          Meshelium's own encoder would have written. The clamp catches
+//          the two representable ends: 32768 is UV exactly 1.0, which
+//          Sodium's 15-bit field cannot hold and Meshelium's 16-bit one
+//          can, and the low end would otherwise wrap to 65535.
+//   +16    Bits 0-7 block light, 8-15 sky light. Both are already
+//          +8-centred and clamped to [8,248], which is exactly the
+//          convention Meshelium's sampleLightmap expects, so they move
+//          byte for byte with no adjustment.
+//          Bits 16-23 are the material byte, and its bit ORDER differs:
+//          Sodium packs {mip at 0, alpha-cutoff index at 1-2}, Meshelium
+//          packs {alpha-cutoff index at 0-1, mip at 2}. The cutoff index
+//          VALUES agree (0, 0.1, 0.5), so only the positions move. Getting
+//          this wrong is silent and ugly rather than loud: foliage would
+//          take the 0.1 cutoff instead of 0.5 and fringe.
+//          Bits 24-31 are Sodium's draw id, its stand-in for the section
+//          translation. Meshelium does not need it - the section origin
+//          arrives per draw in OriginRelCamera.
+uvec4 meshelium_fetchVertex(uint quad, uint i) {
+#if MESHELIUM_SODIUM_BATCH
+    uint base = (meshelium_run.firstVertex + quad * 4u + i) * 5u;
+#elif MESHELIUM_SODIUM_TASK
+    // On the GPU-visibility arm `quad` is the quad's first VERTEX index,
+    // not a quad index: the task stage's bins carry Sodium's base vertex
+    // plus a vertex cursor, and Sodium's base vertex need not be a
+    // multiple of four (see FirstVertex's note above), so the quad
+    // index arithmetic happens in vertex units end to end.
+    uint base = (quad + i) * 5u;
+#else
+    uint base = (FirstVertex + quad * 4u + i) * 5u;
+#endif
+    uint w0 = sodiumData[base + 0u];
+    uint w1 = sodiumData[base + 1u];
+    uint w2 = sodiumData[base + 2u];
+    uint w3 = sodiumData[base + 3u];
+    uint w4 = sodiumData[base + 4u];
+
+    uint px = ((w0 & 0x3FFu) << 6u) | ((w1 & 0x3FFu) >> 4u);
+    uint py = (((w0 >> 10u) & 0x3FFu) << 6u) | (((w1 >> 10u) & 0x3FFu) >> 4u);
+    uint pz = (((w0 >> 20u) & 0x3FFu) << 6u) | (((w1 >> 20u) & 0x3FFu) >> 4u);
+
+    int u15 = int(w3 & 0x7FFFu);
+    int v15 = int((w3 >> 16u) & 0x7FFFu);
+    int uBias = int((w3 >> 15u) & 1u);
+    int vBias = int((w3 >> 31u) & 1u);
+    uint u = uint(clamp(u15 + 2 * uBias - 1, 0, 32768));
+    uint v = uint(clamp(v15 + 2 * vBias - 1, 0, 32768));
+
+    uint sodiumMaterial = (w4 >> 16u) & 0xFFu;
+    uint material = ((sodiumMaterial >> 1u) & 3u) | ((sodiumMaterial & 1u) << 2u);
+    uint blockLight = w4 & 0xFFu;
+    uint skyLight = (w4 >> 8u) & 0xFFu;
+
+    return uvec4(
+            px | (py << 16u),
+            pz | (material << 16u) | (blockLight << 24u),
+            (w2 & 0x00FFFFFFu) | (skyLight << 24u),
+            u | (v << 16u));
+}
+#else
 // The terrain arena, bound as an ARRAY of std430 SSBOs (NO
 // buffer_device_address — wave-3b bytecode finding: vanilla's
 // device/allocator lack the feature).
@@ -176,6 +476,7 @@ uvec4 meshelium_fetchVertex(uint quad, uint i) {
     // wrong-looking terrain is far harder to diagnose than missing terrain.
     return uvec4(0u);
 }
+#endif
 
 // Meshelium's per-frame scene UBO (wave-5 layout — must match terrain.task /
 // terrain.frag and TerrainDrawer.uploadScene byte-for-byte; frag and the
@@ -203,28 +504,6 @@ layout(set = 0, binding = 2, std140) uniform Projection {
 // Vanilla's lightmap, sampled per vertex exactly like terrain.vsh does.
 layout(set = 0, binding = 6) uniform sampler2D Sampler2;
 
-// Per-draw data. Task path: one draw = one region (OriginRelCamera is the
-// REGION origin; section offset comes from the payload posKey). CPU path:
-// one draw = one contiguous quad run of one section (wave-4 meaning).
-// Translucent path: one draw = one ≤MESHELIUM_TRANS_QUADS slice of one
-// section's translucent prefix (OriginRelCamera is the SECTION origin).
-layout(push_constant) uniform MesheliumPush {
-    vec3 OriginRelCamera;
-#if MESHELIUM_TASK_CULL
-    uint RegionIndex;      // unused here (task stage consumed it)
-    uint MaskSlot;         // unused here
-#elif MESHELIUM_TRANSLUCENT
-    uint FirstQuad;        // absolute quad index into the terrain arena
-    uint QuadCount;        // quads in THIS draw (single workgroup, looped)
-    uint GateIndex;        // posKey<<20 | regionId*256+slot, or 0xFFFFFFFF
-                           // = no occlusion gate (bfs/cpu frames, occlusion
-                           // list overflow, slot unknown) — fails OPEN
-    uint FrameStamp;       // this frame's occlusion stamp (gate compare)
-#else
-    uint FirstQuad;        // absolute quad index into the terrain arena
-    uint QuadCount;        // quads in this draw (all workgroups)
-#endif
-};
 
 #if MESHELIUM_TASK_CULL
 // Must match terrain.task's payload declaration exactly (struct + variable
@@ -240,6 +519,10 @@ struct MesheliumSectionTask {
 };
 struct MesheliumTaskPayload {
     MesheliumSectionTask sections[MESHELIUM_TASK_WG_SIZE];
+#if MESHELIUM_SODIUM_TASK
+    vec4 regionOrigin;  // the draw's region origin, camera-relative (task
+                        // stage lane 0 writes it; must match terrain.task)
+#endif
 };
 taskPayloadSharedEXT MesheliumTaskPayload payload;
 #endif
@@ -292,11 +575,35 @@ uint meshelium_translucentGate() {
 }
 #endif
 
+// Whether the sprite rectangle varying exists at all. Sodium geometry
+// carries no greedy-merged quads (its material bits are at most 7, so the
+// repeat pair is always 0), which makes the rectangle dead on that path;
+// under the packed layout it is dropped there and the fragment stage's
+// tiling branch is compiled out with it.
+#if MESHELIUM_PACKED_VARYINGS && MESHELIUM_SODIUM
+#define MESHELIUM_SPRITE_RECT 0
+#else
+#define MESHELIUM_SPRITE_RECT 1
+#endif
+
 layout(location = 0) out vec4 vertexColor[];
+#if MESHELIUM_PACKED_VARYINGS
+// 2026-09-06: the atlas UV and the two fog distances share one location.
+// The output-size formula charges a full 16 B location whether it holds a
+// float or a vec4, and mesh output memory gates how many workgroups a
+// compute unit can hold in flight: at 7 locations a 32-quad workgroup
+// wrote 14336 B, at 5 it writes 10240 B (4 on the Sodium path, 8192 B).
+// All three are smooth-interpolated floats, so packing them changes no
+// arithmetic - each component is interpolated on its own either way.
+// -Dmeshelium.unpackedVaryings=true restores the old layout for A/B.
+layout(location = 1) out vec4 texFog[]; // xy = texCoord0, z = spherical, w = cylindrical
+layout(location = 2) flat out uint materialBits[];
+#else
 layout(location = 1) out vec2 texCoord0[];
 layout(location = 2) out float sphericalVertexDistance[];
 layout(location = 3) out float cylindricalVertexDistance[];
 layout(location = 4) flat out uint materialBits[];
+#endif
 // The quad's sprite rectangle in atlas space (xy = min, zw = max), for
 // greedy-merged quads.
 //
@@ -315,7 +622,13 @@ layout(location = 4) flat out uint materialBits[];
 // 7 locations puts the same shape at 28672 B, legal on the spec floor, and
 // the fragment stage re-derives the repeat pair from materialBits with a
 // handful of integer ops on merged-quad fragments only.
+#if MESHELIUM_SPRITE_RECT
+#if MESHELIUM_PACKED_VARYINGS
+layout(location = 3) flat out vec4 spriteRect[];
+#else
 layout(location = 5) flat out vec4 spriteRect[];
+#endif
+#endif
 
 // ---- 16-byte packed-vertex decoders (docs/TERRAIN-DATA.md §1; the GLSL
 // twins of TerrainVertexCodec, ported from vertex_format.glsl) ----
@@ -387,7 +700,9 @@ void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
     for (uint i = 0u; i < 4u; ++i) {
         uvec4 v = vs[i];
         uint vi = vertBase + i;
+#if MESHELIUM_SPRITE_RECT
         spriteRect[vi] = vec4(uvMin, uvMax);
+#endif
         vec3 pos = decodeVertexPosition(v) + origin;
         vec4 clipPos = ProjMat * (ModelViewMat * vec4(pos, 1.0));
         gl_MeshVerticesEXT[vi].gl_Position = clipPos;
@@ -408,10 +723,21 @@ void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
             }
         }
         // Vanilla fog.glsl: fog_spherical_distance / fog_cylindrical_distance.
+#if MESHELIUM_PACKED_VARYINGS
+#if MESHELIUM_DIAG_NOFOG
+        texFog[vi] = vec4(decodeVertexUV(v), 0.0, 0.0); // diagnostic: no fog distances
+#else
+        texFog[vi] = vec4(decodeVertexUV(v), length(pos), max(length(pos.xz), abs(pos.y)));
+#endif
+        vertexColor[vi] = vec4(decodeVertexColor(v), 1.0) * sampleLightmap(v);
+#else
+        // Write order preserved from the shipped shader so that the A/B
+        // lever reproduces its SPIR-V byte for byte (shader_parity.sh).
         sphericalVertexDistance[vi] = length(pos);
         cylindricalVertexDistance[vi] = max(length(pos.xz), abs(pos.y));
         vertexColor[vi] = vec4(decodeVertexColor(v), 1.0) * sampleLightmap(v);
         texCoord0[vi] = decodeVertexUV(v);
+#endif
         materialBits[vi] = (v.y >> 16) & 0xFFu; // flat; provoking vertices
                                                 // (vertBase+0/+2) are this quad's
     }
@@ -433,6 +759,24 @@ void meshelium_emitQuad(uint slot, uint quad, vec3 origin) {
     gl_PrimitiveTriangleIndicesEXT[slot * 2u + 0u] = uvec3(vertBase + 0u, vertBase + 1u, vertBase + 2u);
     gl_PrimitiveTriangleIndicesEXT[slot * 2u + 1u] = uvec3(vertBase + 2u, vertBase + 3u, vertBase + 0u);
 }
+
+#if MESHELIUM_SODIUM_MESH_FRUSTUM
+// Keep iff dot(n, p) >= -w for all six planes, p the box corner selected
+// per axis by the plane coefficient's sign (the max corner where it is
+// >= 0): JOML FrustumIntersection.testAab's p-vertex rule, the test
+// terrain.task's inFrustum runs on the standalone path. Duplicated
+// rather than shared because MesheliumShaderCompiler has no #include.
+bool meshelium_sodiumInFrustum(vec3 lo, vec3 hi) {
+    for (int i = 0; i < 6; ++i) {
+        vec4 plane = FrustumPlanes[i];
+        vec3 p = mix(lo, hi, greaterThanEqual(plane.xyz, vec3(0.0)));
+        if (dot(plane.xyz, p) < -plane.w) {
+            return false;
+        }
+    }
+    return true;
+}
+#endif
 
 void main() {
 #if MESHELIUM_TRANSLUCENT
@@ -486,8 +830,46 @@ void main() {
     uint wgQuads = min(uint(MESHELIUM_WG_SIZE), sectionQuads - localGroup * uint(MESHELIUM_WG_SIZE));
     // Section origin = region origin + 16 * local section coords (posKey
     // decode mirrors RegionStore.posKey: y bits 6-7, z bits 3-5, x bits 0-2).
+#if MESHELIUM_SODIUM_TASK
+    // The region origin comes from the payload (one draw, many regions);
+    // the task stage repacked Sodium's LocalSectionIndex into this posKey
+    // layout so the decode below is the same line.
+    vec3 origin = payload.regionOrigin.xyz
+            + vec3(float(pc & 7u), float((pc >> 6u) & 3u), float((pc >> 3u) & 7u)) * 16.0;
+#else
     vec3 origin = OriginRelCamera
             + vec3(float(pc & 7u), float((pc >> 6u) & 3u), float((pc >> 3u) & 7u)) * 16.0;
+#endif
+#elif MESHELIUM_SODIUM_BATCH
+    // ---- batched Sodium path: one draw, many runs --------------------
+    // Resolved independently by every invocation from workgroup-uniform
+    // inputs — see the note on meshelium_resolveRun for why this is both
+    // legal and much faster than the barriered version it replaced.
+#if MESHELIUM_SODIUM_DRAWID
+    // GroupBase is meaningless here: each run has its own dispatch.
+    meshelium_run = meshelium_resolveRun(gl_WorkGroupID.x);
+#else
+    meshelium_run = meshelium_resolveRun(gl_WorkGroupID.x + GroupBase);
+#endif
+    uint wgBase = meshelium_run.quadBase;
+    uint wgQuads = meshelium_run.quads;
+    vec3 origin = meshelium_run.origin;
+#if MESHELIUM_SODIUM_MESH_FRUSTUM
+    // The frustum lever's gpu mode (SodiumTerrainDrawer.PROPERTY_FRUSTUM):
+    // a run whose section box lies outside the six scene planes emits
+    // nothing. origin is workgroup-uniform (resolved from gl_DrawID or the
+    // group map and the run table alone), so the branch is uniform and
+    // SetMeshOutputsEXT(0, 0) is called exactly once per workgroup, by
+    // every invocation, before any output is written - the EXT contract.
+    // The box is the section's 16-block cube plus
+    // MESHELIUM_SODIUM_FRUSTUM_SLACK on every side; the CPU-side modes
+    // test the same box against the same rows.
+    if (!meshelium_sodiumInFrustum(origin - MESHELIUM_SODIUM_FRUSTUM_SLACK,
+            origin + (16.0 + MESHELIUM_SODIUM_FRUSTUM_SLACK))) {
+        SetMeshOutputsEXT(0u, 0u);
+        return;
+    }
+#endif
 #else
     // ---- wave-4 CPU-culled direct path (the cpuCull escape hatch) ----
     uint wgBase = gl_WorkGroupID.x * uint(MESHELIUM_WG_SIZE);
@@ -514,11 +896,24 @@ void main() {
         uint end = (r < 4u) ? payload.sections[s].binIa[r] : payload.sections[s].binIb[r - 4u];
         if (!found && idx < end) {
             uint start = (r < 4u) ? payload.sections[s].binVa[r] : payload.sections[s].binVb[r - 4u];
+#if MESHELIUM_SODIUM_TASK
+            // Bins carry VERTEX starts on the Sodium arm (base vertex +
+            // cursor, neither a multiple of four): the quad's first
+            // vertex is start + 4 * its index within the bin, and the
+            // fetch adds the corner index in vertex units.
+            quad = start + (idx - prevEnd) * 4u;
+#else
             quad = start + (idx - prevEnd);
+#endif
             found = true;
         }
         prevEnd = max(prevEnd, end);
     }
+#elif MESHELIUM_SODIUM
+    // Run-relative. The run's base vertex is applied inside the fetch,
+    // because Sodium's base offset is a vertex index that need not divide
+    // by four.
+    uint quad = wgBase + t;
 #else
     uint quad = FirstQuad + wgBase + t;
 #endif

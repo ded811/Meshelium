@@ -99,6 +99,33 @@ public final class MesheliumBenchRecorder {
      * alignment that matters.</p>
      */
     private static long[] frameCpuNanos = new long[0];
+    /**
+     * Per-frame run counts of the Sodium list path: runs pushed and runs
+     * the CPU frustum test rejected, summed over the frame's opaque passes
+     * ({@code SodiumTerrainDrawer.reportFrustum}). Same length and order
+     * as {@link #frameNanos}; zeros on every other host and in every mode
+     * that does not run the CPU test.
+     */
+    private static int[] frameRuns = new int[0];
+    private static int[] frameRunsRejected = new int[0];
+    private static int pendingRuns;
+    private static int pendingRunsRejected;
+
+    /**
+     * {@code -Dmeshelium.bench.jitter=true}: measurement-only. Every
+     * rendered frame nudges the player's yaw by {@link #JITTER_DEGREES}
+     * on alternate frames, so the camera is never "still" for a host that
+     * keys its culling on that (Sodium reads its render list from a
+     * different tree on a frame whose rotation changed; recon 2026-09-13)
+     * while the picture stays the same to a thirtieth of a pixel at 1080p
+     * (one pixel is about 0.036 degrees at a 70-degree FOV). Separates
+     * "the view is moving" from "the view points somewhere else", which a
+     * spin cannot.
+     */
+    public static final boolean JITTER = Boolean.getBoolean("meshelium.bench.jitter");
+    static final float JITTER_DEGREES = 0.001f;
+    private static float jitterBaseYaw = Float.NaN;
+    private static long jitterFrames;
     private static volatile int filled;
     private static volatile boolean capturing;
     private static long lastFrameNanoTime;
@@ -116,6 +143,15 @@ public final class MesheliumBenchRecorder {
      * a capture of N deltas spans N+1 frames.
      */
     public static void onRenderFrame() {
+        if (JITTER) {
+            jitter();
+        }
+        // The passes of the frame that just ended accumulated into these;
+        // the delta recorded below spans that same frame.
+        int runs = pendingRuns;
+        int rejected = pendingRunsRejected;
+        pendingRuns = 0;
+        pendingRunsRejected = 0;
         if (!capturing) {
             lastFrameNanoTime = 0;
             return;
@@ -126,7 +162,9 @@ public final class MesheliumBenchRecorder {
             if (i < frameNanos.length) {
                 frameNanos[i] = now - lastFrameNanoTime;
                 frameCpuNanos[i] = cpuFrameNanos();
-                filled = i + 1; // volatile publish AFTER both element writes
+                frameRuns[i] = runs;
+                frameRunsRejected[i] = rejected;
+                filled = i + 1; // volatile publish AFTER the element writes
                 if (i + 1 == frameNanos.length) {
                     capturing = false;
                 }
@@ -145,10 +183,33 @@ public final class MesheliumBenchRecorder {
         return minecraft == null ? 0L : minecraft.getFrameTimeNs();
     }
 
+    /**
+     * The yaw nudge (see {@link #JITTER}). The base is re-read whenever the
+     * player's yaw is more than a nudge away from it, so the bench's own
+     * yaw resets between legs are honoured; both the current and the
+     * previous-tick yaw are set so the interpolated camera follows exactly.
+     */
+    private static void jitter() {
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft == null || minecraft.player == null) {
+            return;
+        }
+        float yaw = minecraft.player.getYRot();
+        if (Float.isNaN(jitterBaseYaw) || Math.abs(yaw - jitterBaseYaw) > 2.0f * JITTER_DEGREES) {
+            jitterBaseYaw = yaw;
+        }
+        jitterFrames++;
+        float nudged = jitterBaseYaw + ((jitterFrames & 1L) == 0L ? 0.0f : JITTER_DEGREES);
+        minecraft.player.setYRot(nudged);
+        minecraft.player.yRotO = nudged;
+    }
+
     /** Arm capture of the next {@code frames} frame deltas (client thread). */
     public static void arm(int frames) {
         frameNanos = new long[frames];
         frameCpuNanos = new long[frames];
+        frameRuns = new int[frames];
+        frameRunsRejected = new int[frames];
         filled = 0;
         lastFrameNanoTime = 0;
         capturing = true;
@@ -175,5 +236,32 @@ public final class MesheliumBenchRecorder {
      */
     public static long[] snapshotCpu() {
         return Arrays.copyOf(frameCpuNanos, filled);
+    }
+
+    /**
+     * Render thread, once per opaque pass of the Sodium list path:
+     * accumulates into the frame in progress (see {@link #frameRuns}).
+     */
+    public static void addRuns(int runs, int rejected) {
+        pendingRuns += runs;
+        pendingRunsRejected += rejected;
+    }
+
+    /** Runs pushed per captured frame, same length and order as {@link #snapshot()}. */
+    public static long[] snapshotRuns() {
+        return widen(frameRuns, filled);
+    }
+
+    /** Runs the CPU frustum test rejected per captured frame; see {@link #snapshotRuns()}. */
+    public static long[] snapshotRunsRejected() {
+        return widen(frameRunsRejected, filled);
+    }
+
+    private static long[] widen(int[] values, int n) {
+        long[] out = new long[n];
+        for (int i = 0; i < n; i++) {
+            out[i] = values[i];
+        }
+        return out;
     }
 }

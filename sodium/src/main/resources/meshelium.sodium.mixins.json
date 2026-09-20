@@ -1,0 +1,21 @@
+{
+	"required": false,
+	"minVersion": "0.8",
+	"package": "com.deds.meshelium.sodium.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"plugin": "com.deds.meshelium.sodium.mixin.MesheliumSodiumMixinPlugin",
+	"client": [
+		"RenderRegionManagerMixin",
+		"RenderRegionMixin",
+		"RenderSectionManagerMixin",
+		"RenderSectionManagerInvoker",
+		"ChunkRenderListAccessor",
+		"VKIndirectContextMixin",
+		"VulkanGpuBufferDirectMixin",
+		"ConfigLoaderFabricMixin",
+		"ConfigLoaderForgeMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

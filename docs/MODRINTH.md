@@ -8,13 +8,13 @@ and you can push the render distance far past the slider's usual limit.
 
 ## How much faster?
 
-Measured at 1920x1080 on an AMD Radeon RX 9070 XT, same world, same view. One
-run with the mod and one without:
+Measured at 1920x1080 on an AMD Radeon RX 9070 XT, same world, same view, one
+run with the mod and one without. Measured without Sodium.
 
 ![Bar chart of how many times more frames per second Meshelium gives at six render distances, the bars rising from 1.5x at 12 chunks to 5.3x at 64](https://raw.githubusercontent.com/ded811/Meshelium/master/docs/fps-chart.png)
 
 | Render distance | Minecraft | Meshelium | Difference |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | 12, Minecraft's default | 1,621 FPS | **2,437 FPS** | 1.50× (+50%) |
 | 16 | 1,115 FPS | **2,126 FPS** | 1.91× (+91%) |
 | 24 | 641 FPS | **1,709 FPS** | 2.67× (+167%) |
@@ -22,37 +22,46 @@ run with the mod and one without:
 | 48 | 205 FPS | **761 FPS** | 3.71× (+271%) |
 | 64 | 114 FPS | **607 FPS** | 5.32× (+432%) |
 
-The further you look, the bigger the difference. At render distance 64,
-Meshelium runs more than five times faster than Minecraft's own renderer.
+The further you look, the bigger the difference. Both columns are Minecraft's
+Vulkan renderer, so the only thing that changes between them is Meshelium
+itself.
 
-Both columns are Minecraft's Vulkan renderer, the one Meshelium runs on, so the
-only thing that changes between them is Meshelium itself. Minecraft's own slider
-stops at 32, so the last two rows use a test build that lets it go further,
-giving the plain renderer something to be compared against.
+**These numbers are from one computer.** Yours will land somewhere else.
 
-## Using less graphics memory
+## Works better with Sodium!
 
-Meshelium keeps exactly one copy of the terrain in graphics memory, packed
-tight, and hands back anything it is not using after half a minute of
-standing still. At render distance 64 the terrain itself sits around 540 MB,
-a full 64-chunk scene fits in under 2 GB, and even 120 chunks runs
-comfortably around 8.7 GB with the whole world loaded.
+They used to be a choice: one replaced the other. Now you get both.
+Sodium keeps doing what it is best at - building the chunks - and Meshelium
+draws them with mesh shaders. Install both and it happens on its own; there is
+nothing to switch on.
 
-On laptops and handhelds with integrated graphics this counts double, because
-their graphics memory is your system RAM. Whatever the terrain does not take,
-the rest of your game and your computer keep.
+You also get **GPU Visibility**, which only exists on this path: Meshelium
+works out what you can actually see on the graphics card itself, instead of
+drawing everything it is handed.
+
+Use **Sodium 0.9.2-beta.1**. Modrinth lists it under Versions as a beta, so you
+have to pick it deliberately rather than taking the top entry. Meshelium plugs
+into parts of Sodium that were never meant for other mods to touch, so another
+version may not fit; the Meshelium settings screen shows which one you have and
+says whether it matches.
+
+With Sodium installed the Meshelium settings screen is **shorter**. The settings
+that only change how Meshelium builds chunks have nothing to do while Sodium is
+doing that job, so they are hidden - including the memory settings described
+below. They come back if you remove Sodium.
 
 ## What you need
 
-- **Minecraft 26.2** with **Fabric** and [Fabric API](https://modrinth.com/mod/fabric-api)
-- Windows or Linux. Sorry, no Mac: Macs don't do mesh shaders on Vulkan yet
-- A graphics card with mesh shaders. Meshelium asks your driver for the feature
-  rather than checking a list of models, so anything that reports it will work.
-  In practice that means **AMD** RX 6000 or newer, **NVIDIA** GTX 16xx / RTX 20xx or newer,
-  and **Intel** Arc, plus recent laptop and handheld chips. Keeping your
-  graphics driver current matters as much as the card
-- If the feature is missing, Meshelium turns itself off and tells you why. Your
-  game keeps working normally
+- **Minecraft 26.2**, on **Fabric** or **NeoForge** - pick the matching download
+- On Fabric, [**Fabric API**](https://modrinth.com/mod/fabric-api) as well.
+  NeoForge needs no extra mod
+- Windows or Linux. No Mac: Macs don't do mesh shaders on Vulkan yet
+- A graphics card with mesh shaders: **AMD** RX 6000 or newer, **NVIDIA** GTX
+  16xx / RTX 20xx or newer, **Intel** Arc, and recent laptop and handheld chips
+  including the Steam Deck. Meshelium asks your driver rather than checking a
+  list of models, so anything that reports the feature will work - and if it is
+  missing, Meshelium turns itself off, tells you why, and your game keeps
+  working normally
 
 Client side only. Your friends do not need it, and neither does your server.
 
@@ -61,113 +70,88 @@ Client side only. Your friends do not need it, and neither does your server.
 Minecraft starts in the old drawing mode, OpenGL. Meshelium only works in the
 new one, Vulkan.
 
-1. Open **Options**
-2. Go to **Video Settings**
-3. Find **Graphics API**
-4. Choose **Prefer Vulkan (Experimental)**, which is Minecraft's own name for it
-5. **Restart Minecraft.** It only changes while the game is loading
+1. **Options** → **Video Settings** → **Graphics API**
+2. Choose **Prefer Vulkan (Experimental)** - that is Minecraft's own name for it
+3. **Restart Minecraft.** It only changes while the game is loading
 
 Skip this and it looks like the mod did nothing. If that happens, Meshelium puts
 a message on screen with a button that does it for you.
 
-## Settings
-
-There is a **Meshelium Settings** button at the top of Video Settings. There is
-also a reset button, which asks twice before it does anything.
-
-**Distance Cap** is how you get past 32. It widens Minecraft's own render
-distance slider, up to 120 chunks. Raising the cap changes nothing on its own;
-you still move the normal slider afterwards.
-
-**Distance Fog** ships **Off**, and that is a change from how Minecraft looks.
-Minecraft fades distant terrain to fog at a fixed 1024 blocks no matter how far
-you can see, which is invisible at short distances and covers most of the view
-past 64 chunks. Off removes that haze and keeps the short fade at the very edge,
-so the horizon still softens instead of ending in a wall. Match View Distance
-keeps a haze but moves it out with your render distance. Minecraft Default puts
-it back exactly as the game has it.
-
-**Occlusion Culling** asks your graphics card which terrain is hidden behind
-other terrain and skips it. Asking costs a little while you are moving and
-almost nothing while you stand still, so it wins when plenty really is
-hidden. Measured here, it pays when you are on the ground
-looking out across a long view, and costs a little from a high camera looking
-down, where almost nothing is behind anything. Left on **Auto** it switches
-itself on at 48 chunks. If you mostly play at ground level, try lowering that.
-If you spend a lot of time flying, leave it alone or raise it. Nothing breaks
-either way, so it is safe to try both and watch your frame counter.
-
-Behind **Advanced**: **Idle Memory Trim** is the give-back described above,
-on by default; turn it off only if another mod misbehaves when graphics
-memory shrinks. **Greedy Meshing** merges neighbouring block faces that look
-identical so there is less to draw. It helps most with Smooth Lighting off,
-where it removes about one face in six, and the picture stays exactly the
-same; it ships off while it proves itself. **Duplicate Terrain Memory** is
-what frees Minecraft's unused second copy of the world; leave it on Freed
-unless another mod needs Minecraft's own terrain buffers. **Cull Tiny
-Plants Beyond** and **Cull Sub-Pixel Detail Beyond** are two distance
-sliders that skip drawing things too small to see at range, from grass
-tufts down to any face smaller than one pixel on your screen. Both ship
-Off and apply instantly, so drag until you notice the picture change and
-back off a step. **Smart Leaves Beyond** skips the leaf faces buried
-inside tree canopies past a distance, keeping the see-through look; it
-ships on at 16 chunks because the buried faces cannot be seen from
-outside, trees regain full detail as you approach, and 0 turns it off.
-**Solid Leaves Beyond** goes further: past your chosen distance leaves
-build fully solid, the way Fast graphics draws them; it ships Off.
-
-Everything applies as soon as you change it, apart from the backend popup, which
-waits for the next launch. Switching Meshelium off and on, changing Duplicate
-Terrain Memory, or flipping Greedy Meshing reloads the terrain, so chunks
-rebuild for a few seconds.
-
 ## Playing online?
 
 [Bobby](https://modrinth.com/mod/bobby) is what makes long distances work on a
-server. A server only sends you the land close by, so a huge render distance has
-nothing out there to draw no matter how fast your graphics card is. Bobby
-remembers the places the server already showed you and puts them back. Bobby
-remembers the world, Meshelium draws it.
+server. A server only sends you the land close by, so a huge render distance
+has nothing out there to draw no matter how fast your card is. Bobby remembers
+the places the server already showed you and puts them back. Bobby remembers
+the world, Meshelium draws it.
 
-## Performance may vary
+## Settings
 
-These numbers are from one computer. Yours will land somewhere else. Meshelium
-helps at every distance measured here, and it earns its place when you push the
-slider out.
+A **Meshelium Settings** button at the top of Video Settings, and a **Meshelium**
+row at the bottom of Options if Sodium has replaced that screen.
 
-## This release is a beta
+**Distance Cap** is how you get past 32. It widens Minecraft's own render
+distance slider, up to 120 chunks. Raising the cap changes nothing on its own -
+you still move the normal slider afterwards. Raise it gradually: past about 64
+Minecraft itself needs more memory than a default launcher gives it, and at 120
+it can run out and close. Give Minecraft more memory before pushing it far.
 
-Meshelium 1.6 is out as a beta while it gets tested on more machines than
-the one it was built on. It is the first release to run on **NeoForge** as
-well as Fabric, and that half in particular has only been proven on one
-setup so far. The renderer underneath is the same code the Fabric releases
-have been running.
+**GPU Visibility** (Sodium only, on by default) works out what you can actually
+see on the graphics card instead of drawing everything Sodium hands it.
 
-**More is coming.** The next thing on the list is **Sodium compatibility**,
-so the two can run together instead of one replacing the other. Nothing to
-announce on timing yet.
+**Distance Fog** ships **Off**, and that is a change from how Minecraft looks.
+Minecraft fades distant terrain at a fixed 1024 blocks however far you can see,
+which covers most of the view past 64 chunks. Off keeps a short fade at the very
+edge, so the horizon still softens. Match View Distance moves the haze out with
+your render distance; Minecraft Default puts it back exactly as the game has it.
 
-**Please report anything odd.** Bug reports, crashes, or just something
-that looks wrong go on the issue tracker:
-<https://github.com/ded811/Meshelium/issues>. The log is the useful part to
-attach - Meshelium writes down what it decided about your hardware, and
-why, every time the game starts.
+**Occlusion Culling** asks your graphics card which terrain is hidden behind
+other terrain and skips it. On **Auto** it switches itself on at 48 chunks. It
+pays most at ground level looking across a long view, and costs a little from a
+high camera looking down. Nothing breaks either way, so try both and watch your
+frame counter.
+
+Behind **Advanced**, off unless noted: **Greedy Meshing** merges identical
+neighbouring block faces. **Cull Tiny Plants Beyond** and **Cull Sub-Pixel
+Detail Beyond** skip things too small to see at range. **Smart Leaves Beyond**
+(on, 16 chunks) skips leaf faces buried inside canopies, keeping the
+see-through look. **Solid Leaves Beyond** builds leaves fully solid past a
+distance.
+
+**Using less graphics memory** - these two are hidden while Sodium is
+installed, because Sodium owns that memory instead. **Idle Memory Trim** (on)
+hands back graphics memory Meshelium is not using after half a minute of
+standing still. **Duplicate Terrain Memory** (Freed) releases the second copy
+of the terrain Minecraft keeps even though Meshelium is the one drawing from
+it, which saves gigabytes at long render distances. On laptops and handhelds
+with integrated graphics this counts double, because their graphics memory is
+your system RAM.
+
+Everything applies as soon as you change it, apart from the startup notice,
+which waits for the next launch. Switching Meshelium off and on, changing
+Duplicate Terrain Memory, or flipping Greedy Meshing reloads the terrain, so
+chunks rebuild for a few seconds.
 
 ## Thanks
 
 [Nvidium](https://modrinth.com/mod/nvidium) by **MCRcortex** is why this was
 worth attempting. They pioneered mesh-shader terrain in Minecraft and proved
-you really could see for miles without the game falling over.
+the idea works. Meshelium is its own mod, not a port of theirs: it targets the
+cross-vendor `VK_EXT_mesh_shader` extension rather than the NVIDIA dialect,
+runs on Minecraft's Vulkan backend, and its architecture, memory model and
+culling are its own. MCRcortex has no involvement in Meshelium and has not
+endorsed it.
 
-Meshelium is its own mod, not a port of theirs. It targets a different
-extension, runs on Minecraft's Vulkan backend, and its architecture, memory
-model and culling are ours. Some shader logic is derived from Nvidium and says
-so in the header of each file it applies to, which is why Meshelium carries the
-same LGPL-3.0 licence.
+[Sodium](https://modrinth.com/mod/sodium) by **CaffeineMC**, for the chunk
+builder Meshelium now draws from. CaffeineMC has no involvement in Meshelium
+and has not endorsed it.
 
-MCRcortex has no involvement in Meshelium, has not endorsed it, and is not
-responsible for anything it does. Any bug you find here is ours. Go and star
-their project anyway.
+## Found a problem?
+
+Bug reports, crashes, or just something that looks wrong:
+<https://github.com/ded811/Meshelium/issues>. The log is the useful part to
+attach - Meshelium writes down what it decided about your hardware, and why,
+every time the game starts.
 
 ## NeoForge and the early loading screen
 

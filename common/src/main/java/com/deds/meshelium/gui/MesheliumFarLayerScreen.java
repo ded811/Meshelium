@@ -99,7 +99,7 @@ import java.util.function.IntSupplier;
  * <h2>What "applies" means on each row, and why this page does not do it</h2>
  * <p>The owner's pre8 report was "when i change settings they dont apply
  * immedietly, they should probably reload when you change settings"
- * (docs/FARFIELD-WAVES.md, item J4). They do now, and the work is NOT
+ * (docs/unreleased/farfield/FARFIELD-WAVES.md, item J4). They do now, and the work is NOT
  * driven from here: {@code FarFieldResidency} watches
  * {@code FarFieldConfig.farMeshSignature()} and
  * {@code farSaveSignature()} once per pump. That is deliberate — a hand
@@ -245,7 +245,13 @@ public class MesheliumFarLayerScreen extends Screen {
         }
 
         if (this.gateLocked) {
-            rows.addChild(banner(Component.translatable("meshelium.options.advanced.locked")
+            // Same choice as the Far Terrain page: "Meshelium is not
+            // running" is false while the adapter draws Sodium's chunks
+            // (owner report 2026-09-08 (beta.8)).
+            String lockedKey = MesheliumGate.sodiumAdapterArmed()
+                    ? "meshelium.options.advanced.locked.sodium"
+                    : "meshelium.options.advanced.locked";
+            rows.addChild(banner(Component.translatable(lockedKey)
                             .withStyle(ChatFormatting.YELLOW)),
                     s -> s.paddingTop(2).paddingBottom(2));
         }
@@ -743,7 +749,11 @@ public class MesheliumFarLayerScreen extends Screen {
             // the row holding it down.
             semanticsKey = "meshelium.options.applies.superseded";
         } else if (this.gateLocked) {
-            semanticsKey = "meshelium.options.applies.vulkan";
+            // Held because Sodium builds the terrain, never "needs Vulkan"
+            // on what may be a Vulkan game (owner report 2026-09-08 (beta.8)).
+            semanticsKey = MesheliumGate.state() == MesheliumGate.State.SODIUM_PRESENT
+                    ? "meshelium.options.applies.sodium"
+                    : "meshelium.options.applies.vulkan";
         } else {
             semanticsKey = appliesKey;
         }

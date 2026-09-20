@@ -572,15 +572,33 @@ instead of one very good driver.
 
 ## Settings and configuration
 
-Reach the settings two ways: the **Meshelium Settings...** button in vanilla's
-Video Settings, which is the primary route, or the `/meshelium` client command.
-The Video Settings button is injected at the top of the options list, above the
-Display section so it is visible without scrolling, and it is added on **both**
-graphics backends on purpose, so an OpenGL session can still open the screen and
-read why the mod is off. There is no ModMenu integration: the adapter that used
-to provide a third route to this same screen was deleted at 1.0.0, because it
-compiled against a jar on one developer's disk and was the only thing stopping a
-fresh clone from building.
+Reach the settings three ways, and one of them depends on what else is
+installed:
+
+- The **Meshelium Settings...** button in vanilla's Video Settings. The
+  primary route, on every install. It is injected at the top of the options
+  list, above the Display section so it is visible without scrolling, and it
+  is added on **both** graphics backends on purpose, so an OpenGL session can
+  still open the screen and read why the mod is off.
+- A **Meshelium...** row at the bottom of vanilla's Options screen, **only
+  while Sodium is installed**. Sodium substitutes the Video Settings screen,
+  so the button above has nowhere to attach there.
+- The `/meshelium` client command, on every install and both loaders.
+
+There is no ModMenu integration: the adapter that used to provide a further
+route to this same screen was deleted at 1.0.0, because it compiled against a
+jar on one developer's disk and was the only thing stopping a fresh clone from
+building.
+
+**With Sodium installed the screen is shorter, and says so.** Sodium builds
+the chunks, so every row that only Meshelium's own chunk builder reads - the
+master switch, occlusion culling and its crossover, greedy meshing, the
+tiny-plant cull, the two leaf tiers, terrain memory and idle trim - is not
+shown rather than shown greyed out. The banner at the top names all of them
+in one line, says they come back if Sodium is removed, and names
+`-Dmeshelium.sodium.adapter=false` for anyone who wants Sodium to draw the
+terrain on its own. Underneath the status line the screen also says which
+Sodium is installed and whether it is the one this build was made for.
 
 The first line of that screen answers the only question that matters: **ACTIVE**
 with a live count of the chunk sections being drawn, **READY**, checking, or
@@ -597,6 +615,10 @@ went passive).
 | **Backend popup** | on | On/off. Re-arms the one time Vulkan notice if you dismissed it. |
 
 Every row has a hover tooltip that says what it does and when it applies.
+With Sodium installed, **Reset Meshelium Settings** says in as many words
+that it also resets the settings that screen is not showing: it rewrites
+every Meshelium value, including the chunk-builder ones behind the shorter
+Sodium layout.
 Every toggle except the backend popup applies on the next frame with no
 restart; the popup row is about startup, so it lands at the next game start.
 Closing the settings screen after a cap change hands you a freshly built Video

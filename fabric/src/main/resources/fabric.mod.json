@@ -3,7 +3,7 @@
 	"id": "meshelium",
 	"version": "${version}",
 	"name": "Meshelium",
-	"description": "Mesh-shader terrain rendering for every GPU that has them, on Minecraft's own Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. See a great deal further without the game falling over.",
+	"description": "Mesh-shader terrain rendering for every GPU that has them, on Minecraft's own Vulkan backend (VK_EXT_mesh_shader): AMD RDNA2+, NVIDIA Turing+, Intel Arc. See a great deal further without the game falling over. Works with Sodium: Sodium builds the chunks, Meshelium draws them.",
 	"authors": [
 		"Ded811"
 	],
@@ -21,7 +21,8 @@
 		]
 	},
 	"mixins": [
-		"meshelium.client.mixins.json"
+		"meshelium.client.mixins.json",
+		"meshelium.sodium.mixins.json"
 	],
 	"depends": {
 		"fabricloader": ">=0.19.0",

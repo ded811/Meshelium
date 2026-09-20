@@ -46,7 +46,7 @@ import java.util.function.IntConsumer;
 
 /**
  * The FAR-ARMED frame-time bench: Phase 1 of
- * {@code docs/FARFIELD-PERF-BRIEF.md}, and the instrument every other
+ * {@code docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md}, and the instrument every other
  * phase of that plan is gated on.
  *
  * <h2>Why it exists</h2>
@@ -55,7 +55,7 @@ import java.util.function.IntConsumer;
  * and this project could not measure it. {@code -Pmeshelium.bench=<scene>}
  * arms the near renderer and NOT the far field (the harness gap recorded
  * under "AFTER THE REBUILD: the open ledger" in
- * {@code docs/FARFIELD-WAVES.md}), and its camera is pinned, so it never
+ * {@code docs/unreleased/farfield/FARFIELD-WAVES.md}), and its camera is pinned, so it never
  * loads a chunk and never saves one. Every fps number this project has
  * published therefore describes a session in which the far field did
  * nothing. There is no before-number for the defect the whole pre21
@@ -1722,7 +1722,7 @@ public final class MesheliumFarFieldBenchTest implements FabricClientGameTest {
         Map<String, Object> target = new LinkedHashMap<>();
         target.put("frameFraction", TARGET_FRAME_FRACTION);
         target.put("hardCapMs", TARGET_HARD_CAP_MS);
-        target.put("source", "docs/FARFIELD-PERF-BRIEF.md section 3");
+        target.put("source", "docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 3");
         root.put("briefTarget", target);
         root.put("note", "per-frame nanoTime deltas at the render-thread frame hook, "
                 + "plus vanilla's own CPU frame span at the same instants (cpu*, which "

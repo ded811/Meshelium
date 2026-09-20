@@ -6,6 +6,7 @@ package com.deds.meshelium.gametest.client;
 
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumGate;
+import com.deds.meshelium.MesheliumPlatform;
 import com.deds.meshelium.farfield.FarFieldConfig;
 import com.deds.meshelium.gui.MesheliumAdvancedScreen;
 import com.deds.meshelium.gui.MesheliumFarFieldScreen;
@@ -16,6 +17,8 @@ import com.deds.meshelium.vk.TerrainDrawer;
 
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.fabricmc.fabric.api.client.gametest.v1.context.TestDedicatedServerContext;
+import net.fabricmc.fabric.api.client.gametest.v1.context.TestServerConnection;
 import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
 import net.fabricmc.fabric.api.client.gametest.v1.screenshot.TestScreenshotOptions;
 import net.minecraft.client.PreferredGraphicsApi;
@@ -25,6 +28,7 @@ import net.minecraft.client.gui.components.events.ContainerEventHandler;
 import net.minecraft.client.gui.components.events.GuiEventListener;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.gui.screens.TitleScreen;
+import net.minecraft.client.gui.screens.options.OptionsScreen;
 import net.minecraft.client.gui.screens.options.VideoSettingsScreen;
 import net.minecraft.client.input.MouseButtonInfo;
 import net.minecraft.network.chat.Component;
@@ -97,6 +101,7 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         // in any player-facing string; tooltips carry detail, dashes don't.
         assertLangHasNoLongDashes();
         assertShippedDefaults();
+        assertSodiumVersionComparisonIsWholeVersion();
 
         // Wave-15: large retention-limit values round-trip through the
         // resolver (pure CPU, both backends), and the live-grow machinery
@@ -142,7 +147,13 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         // with the renderer rows locked and the status header saying WHY
         // (the silent-refusal / silent-dormancy classes from the owner
         // playtests).
+        assertFogOverrideRaisesTheDevBanner(context);
         assertVideoSettingsButton(context, !vulkanRun);
+        // The "Meshelium..." row on vanilla's Options screen exists ONLY
+        // with Sodium installed (OptionsScreenMixin); this is the negative
+        // half of that predicate, the positive half lives in
+        // MesheliumSodiumStandDownTest.
+        assertOptionsMenuButtonAbsentStandalone(context);
         // Wave 2: armed by build.gradle's -Pmeshelium.hello=true →
         // -Dmeshelium.helloMeshlet=true (same double gate the renderer uses).
         boolean hello = vulkanRun && Boolean.getBoolean("meshelium.helloMeshlet");
@@ -238,6 +249,13 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
             if (screen.gateLocked() != expectLocked) {
                 throw new AssertionError("MesheliumOptionsScreen.gateLocked()="
                         + screen.gateLocked() + " but this run expects " + expectLocked
+                        + " (gate=" + MesheliumGate.state() + ")");
+            }
+            // Without Sodium the cap rows follow the renderer rows exactly;
+            // only SODIUM_PRESENT separates the two flags.
+            if (screen.capLocked() != expectLocked) {
+                throw new AssertionError("MesheliumOptionsScreen.capLocked()="
+                        + screen.capLocked() + " but this run expects " + expectLocked
                         + " (gate=" + MesheliumGate.state() + ")");
             }
         });
@@ -612,6 +630,149 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
                 Component.literal("")).getString();
     }
 
+    /**
+     * The negative half of the Options-screen row's predicate: without
+     * Sodium, vanilla's Options screen carries NO "Meshelium..." row.
+     * {@code OptionsScreenMixin} adds that row only while Sodium is
+     * installed (owner directive 2026-09-13, "when sodium is on"), because
+     * the vanilla-install layout was playtested and signed off as it
+     * stands and the Video Settings row (B0/B1) is the route there.
+     *
+     * <p>The pairing is the point: {@code MesheliumSodiumStandDownTest}
+     * proves the row is present with Sodium, this leg proves it is absent
+     * without, and either alone would pass with a mixin that never applies
+     * or one that always applies. Runs on both no-Sodium forms, from the
+     * TitleScreen {@link #assertVideoSettingsButton} leaves behind, and
+     * returns there. The vanilla grid is found first as a control, so the
+     * absence below is a real absence rather than a walk that saw nothing.
+     * If the decision ever flips to "always", invert this leg and mirror
+     * the Sodium leg's press-through here.
+     */
+    private static void assertOptionsMenuButtonAbsentStandalone(ClientGameTestContext context) {
+        context.runOnClient(client -> {
+            // Vacuous-pass guard: with Sodium on the classpath the row is
+            // SUPPOSED to be there and this leg would fail for the wrong
+            // reason. -Pmeshelium.sodium swaps the entrypoint list to the
+            // stand-down test alone, so this cannot fire on a Sodium run;
+            // it is here for the day that wiring changes.
+            if (MesheliumPlatform.isModLoaded(MesheliumGate.SODIUM_MOD_ID)) {
+                throw new AssertionError("this negative check is only meaningful without Sodium; "
+                        + "the positive half lives in MesheliumSodiumStandDownTest");
+            }
+            client.gui.setScreen(new OptionsScreen(client.gui.screen(), client.options, false));
+        });
+        context.waitForScreen(OptionsScreen.class);
+        context.waitTicks(2);
+        context.takeScreenshot(TestScreenshotOptions.of("B4_meshelium_options_menu_standalone"));
+        context.runOnClient(client -> {
+            Screen screen = client.gui.screen();
+            if (!(screen instanceof OptionsScreen)) {
+                throw new AssertionError("expected vanilla's Options screen, got " + screen);
+            }
+            // Control: the walk sees vanilla's own grid, so an absence below
+            // is a real absence.
+            if (findButton(screen, "options.video") == null) {
+                throw new AssertionError("the widget walk did not see vanilla's own Options grid "
+                        + "(no Video Settings button), so it could not judge the Meshelium row");
+            }
+            if (findButton(screen, "meshelium.options.menu") != null) {
+                throw new AssertionError("vanilla's Options screen has a 'Meshelium...' row "
+                        + "without Sodium installed. The row is shown only with Sodium "
+                        + "(OptionsScreenMixin); if that decision flips to always, invert this "
+                        + "leg and mirror the Sodium leg's press-through here.");
+            }
+        });
+        context.clickScreenButton("gui.done");
+        context.waitForScreen(TitleScreen.class);
+    }
+
+    /**
+     * The ONE declared behaviour change to the standalone settings screen
+     * in this commit: {@code -Dmeshelium.fogMode} now raises the "some rows
+     * are locked" banner.
+     *
+     * <p>It always locked two rows - {@code fog.active} and the fog-end
+     * slider pair - on both shapes, and it was missing from the
+     * dev-override census, so a {@code -Dmeshelium.fogMode} run greyed two
+     * rows out with nothing on screen saying why. That is the silent-refusal
+     * class, and it gets its own name and its own failure message rather
+     * than riding along under "nothing else moved".
+     *
+     * <p>The property is set for this leg's own scope and cleared in a
+     * {@code finally}. {@code MesheliumConfig.fogMode()} reads it live on
+     * every call and caches nothing, so nothing outlives the clear.
+     */
+    private static void assertFogOverrideRaisesTheDevBanner(ClientGameTestContext context) {
+        String previous = System.getProperty("meshelium.fogMode");
+        if (previous != null) {
+            // The coordinator armed it for the whole run; the banner is
+            // then already up everywhere and this leg would prove nothing
+            // about the census it is named after.
+            System.out.println("[Meshelium] meshelium.fogMode is set for the whole run ("
+                    + previous + "); the fog dev-override census leg was not exercised");
+            return;
+        }
+        try {
+            System.setProperty("meshelium.fogMode", "off");
+            context.runOnClient(client ->
+                    client.gui.setScreen(new MesheliumOptionsScreen(client.gui.screen())));
+            context.waitForScreen(MesheliumOptionsScreen.class);
+            context.runOnClient(client -> {
+                Screen screen = client.gui.screen();
+                java.util.List<net.minecraft.client.gui.components.AbstractWidget> widgets =
+                        new java.util.ArrayList<>();
+                collectWidgets(screen, widgets);
+                String banner = Component.translatable("meshelium.options.dev_override")
+                        .getString();
+                boolean found = false;
+                for (net.minecraft.client.gui.components.AbstractWidget widget : widgets) {
+                    if (widget.getMessage().getString().contains(banner)) {
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    throw new AssertionError("-Dmeshelium.fogMode greys the two fog rows out but "
+                            + "raises no dev-override banner, so the screen refuses a setting "
+                            + "with nothing on it saying why");
+                }
+                String fogLabel = Component.translatable("meshelium.options.fog").getString();
+                for (net.minecraft.client.gui.components.AbstractWidget widget : widgets) {
+                    if (widget.getMessage().getString().startsWith(fogLabel) && widget.active) {
+                        throw new AssertionError("the Distance Fog row is live under "
+                                + "-Dmeshelium.fogMode, so the banner this leg just found is "
+                                + "pointing at nothing");
+                    }
+                }
+            });
+            context.clickScreenButton("gui.done");
+            context.waitForScreen(TitleScreen.class);
+        } finally {
+            System.clearProperty("meshelium.fogMode");
+        }
+    }
+
+    /**
+     * The first Button on the screen whose translated label EQUALS the
+     * key's translation, or null. A probe, never a press: fabric's
+     * {@code clickScreenButton} presses on match, so it cannot be used to
+     * ask whether a button exists.
+     */
+    private static Button findButton(Screen screen, String translationKey) {
+        if (screen == null) {
+            return null;
+        }
+        String label = Component.translatable(translationKey).getString();
+        java.util.List<net.minecraft.client.gui.components.AbstractWidget> widgets =
+                new java.util.ArrayList<>();
+        collectWidgets(screen, widgets);
+        for (net.minecraft.client.gui.components.AbstractWidget widget : widgets) {
+            if (widget instanceof Button button && button.getMessage().getString().equals(label)) {
+                return button;
+            }
+        }
+        return null;
+    }
+
     /** Depth-first over the REAL event tree: screen, scroll container, rows. */
     private static void collectWidgets(ContainerEventHandler container,
             java.util.List<net.minecraft.client.gui.components.AbstractWidget> out) {
@@ -625,7 +786,18 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         }
     }
 
-    /** Fails with the missing label unless some widget's message contains it. */
+    /**
+     * Fails with the missing label unless some widget's message contains it.
+     *
+     * <p>Prose counts here, deliberately: this helper checks the Advanced
+     * screen's BANNER as well as its rows, and a banner is a text widget.
+     * Its twin in MesheliumSodiumStandDownTest needed a row-only variant
+     * because the Sodium banner quotes row labels verbatim; this screen's
+     * banner names no row, so the ambiguity does not arise here. If one ever
+     * appears, split this the way that one is split rather than skipping
+     * text and breaking the banner checks (which is what happened when the
+     * skip was tried here, 2026-09-16).
+     */
     private static void requireRowWidget(
             java.util.List<net.minecraft.client.gui.components.AbstractWidget> widgets,
             String label, Screen screen) {
@@ -686,6 +858,48 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         if (!MesheliumConfig.terrainRenderingEnabled()) {
             throw new AssertionError("terrain rendering defaults to OFF, so the mod ships "
                     + "doing nothing");
+        }
+    }
+
+    /**
+     * ITEM (3): {@code MesheliumSodiumVersion.matches} compares the WHOLE
+     * version before the {@code +}, not a numeric prefix.
+     *
+     * <p>Loader-free and Sodium-free, so it runs on every client run
+     * including the standalone ones. The case it exists for is a
+     * pre-release bump: a first draft compared "the numeric prefix only",
+     * which reduces {@code 0.9.2-beta.1} and {@code 0.9.2-beta.11} to
+     * {@code 0.9.2} alike - so a Sodium eleven betas later would raise no
+     * WARN, and the settings screen would print the GRAY line that
+     * affirmatively tells the player their Sodium is the one this build was
+     * made for. The adapter's five hooks ride on exactly the internals that
+     * pre-release tag moves.
+     */
+    private static void assertSodiumVersionComparisonIsWholeVersion() {
+        String builtAgainst = com.deds.meshelium.MesheliumSodiumVersion.BUILT_AGAINST;
+        if (!com.deds.meshelium.MesheliumSodiumVersion.matches(builtAgainst)) {
+            throw new AssertionError("MesheliumSodiumVersion does not match its own "
+                    + "BUILT_AGAINST (" + builtAgainst + ")");
+        }
+        if (!com.deds.meshelium.MesheliumSodiumVersion.matches(
+                com.deds.meshelium.MesheliumSodiumVersion.builtAgainstBase()
+                        + "+something-else")) {
+            throw new AssertionError("MesheliumSodiumVersion.matches rejected the same version "
+                    + "with different build metadata; the metadata after '+' is the Minecraft "
+                    + "version the loader has already matched for us");
+        }
+        String tenTimesLater = "0.9.2-beta.11+mc26.2";
+        if ("0.9.2-beta.1+mc26.2".equals(builtAgainst)
+                && com.deds.meshelium.MesheliumSodiumVersion.matches(tenTimesLater)) {
+            throw new AssertionError("matches(\"" + tenTimesLater + "\") is TRUE against "
+                    + builtAgainst + ". A prefix comparison reduces both to 0.9.2, so a Sodium "
+                    + "ten betas later would raise no WARN and the settings screen would tell "
+                    + "the player it is the version this build was made for");
+        }
+        if (com.deds.meshelium.MesheliumSodiumVersion.matches(null)
+                || com.deds.meshelium.MesheliumSodiumVersion.matches("")) {
+            throw new AssertionError("matches() answered yes for an absent version; "
+                    + "'we could not tell' must never render as 'yes, that is the one'");
         }
     }
 
@@ -904,6 +1118,371 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         context.takeScreenshot(TestScreenshotOptions.of("12_meshelium_popup_dismissed"));
 
         assertOnlyTheOptOutSpendsThePrompt(context);
+        context.runOnClient(client -> {
+            if (MesheliumGate.popupOwed()) {
+                throw new AssertionError("a popup is still owed after the title-screen popup was "
+                        + "shown and dismissed. One attempt spends it, whatever it decides - "
+                        + "that is the no-nag-loop half of the standing directive");
+            }
+        });
+
+        // THE RELEASE BLOCKER (2026-09-16): a player who never sees a title
+        // screen. Two legs, because there are two worlds and the mod
+        // behaves differently in each by design.
+        assertPopupArrivesWithNoTitleScreen(context, "meshelium.popup.opengl.body", "13");
+        assertRemoteWorldTellsWithoutAModal(context, "15");
+    }
+
+    /**
+     * ITEM (1): the popup reaches a player who never saw a title screen.
+     *
+     * <p>The harness cannot boot into a world - {@code
+     * ClientGameTestContext} has no quick-play entry point, {@code grep -E
+     * 'quickPlay|quickplay|QuickPlay'} over fabric/src and common/src finds
+     * four prose hits and nothing in any gametest class, and {@code
+     * MesheliumSmokeRun}'s javadoc records that the Fabric equivalent does
+     * not work - so this enters a world and then puts the gate into the
+     * state such a session leaves it in. What regressed was the PREDICATE,
+     * and the predicate is what this drives. The end-to-end boot stays the
+     * NeoForge quick-play recipe, read by the coordinator.
+     *
+     * <p>IT RUNS AFTER THE [Enable Vulkan] HALF OF {@code assertOpenGlPath},
+     * which left {@code preferredGraphicsBackend = VULKAN} behind and which
+     * nothing in either file restores. So this leg restores it itself and
+     * ASSERTS THE READ-BACK: with the option reading VULKAN,
+     * {@code MesheliumGate.showPopupIfNeeded} takes the VULKAN_FAILED
+     * branch instead of ENABLE_VULKAN, a popup still appears so
+     * {@code waitForScreen} still passes, and the leg would then be
+     * asserting against the wrong popup - whose only button is
+     * {@code meshelium.popup.ok}, so even the dismiss click would miss. The
+     * read-back assertion is what makes a future edit to
+     * {@code assertOpenGlPath} fail loudly instead of silently swapping the
+     * variant.
+     *
+     * <p>Everything it changes is restored in a {@code finally}, INCLUDING
+     * on the failures this leg is designed to produce. {@code
+     * pauseOnLostFocus} is shared state the suite already documents as a
+     * vacuous-pass cause for the later walk legs, and a leg that leaves
+     * OPENGL saved to disk moves its own failure downstream and out of
+     * sight.
+     *
+     * @param expectedBodyKey the popup body this install should render, so
+     *                        the caller pins the Sodium wording or the
+     *                        standalone one rather than accepting either
+     * @param shotPrefix      the screenshot number prefix. Both callers run
+     *                        on the same {@code -Pmeshelium.backend=opengl}
+     *                        invocation and write into the same directory,
+     *                        so a shared filename would have the coordinator
+     *                        read one PNG believing they had read two.
+     */
+    static void assertPopupArrivesWithNoTitleScreen(ClientGameTestContext context,
+            String expectedBodyKey, String shotPrefix) {
+        try (TestSingleplayerContext world = context.worldBuilder().create()) {
+            world.getClientLevel().waitForChunksRender();
+
+            boolean[] pauseOnLostFocusWas = new boolean[1];
+            context.runOnClient(client ->
+                    pauseOnLostFocusWas[0] = client.options.pauseOnLostFocus);
+            boolean[] bodyOk = new boolean[1];
+            try {
+                context.runOnClient(client -> {
+                    if (client.gui.screen() != null || client.level == null
+                            || client.player == null) {
+                        throw new AssertionError("the in-world popup leg must start at the HUD "
+                                + "in a live world, got screen=" + client.gui.screen()
+                                + " level=" + client.level + " player=" + client.player);
+                    }
+                    // fabric/run/options.txt line 78 is pauseOnLostFocus:true,
+                    // and Minecraft.pauseIfInactive opens a PauseScreen the
+                    // moment the desktop is used. tryShowOwedPopup resets the
+                    // settle on any non-null screen and a PauseScreen does not
+                    // close itself, so ONE focus loss parks the popup for good
+                    // and waitForScreen burns DEFAULT_TIMEOUT. The field is a
+                    // plain public boolean on Options (javap), not an
+                    // OptionInstance, so rather than make the coordinator
+                    // maintain a run-dir precondition the leg removes the
+                    // dependency and puts it back in the finally.
+                    client.options.pauseOnLostFocus = false;
+
+                    // NON-VACUITY, and it is the whole reason this probe
+                    // exists: in a world a modal would NOT pause, the gate
+                    // deliberately shows no modal at all and this leg would
+                    // wait DEFAULT_TIMEOUT for a screen that is never coming.
+                    // worldBuilder().create() makes a private integrated-server
+                    // world, so this must be true.
+                    if (!MesheliumGate.testPopupWouldPauseThisWorld(client)) {
+                        throw new AssertionError("HARNESS: this world would not pause for a "
+                                + "modal (hasSingleplayerServer="
+                                + client.hasSingleplayerServer() + "), so the gate takes the "
+                                + "toast-and-chat branch and no popup is owed here - the leg "
+                                + "would time out proving nothing");
+                    }
+
+                    client.options.preferredGraphicsBackend().set(PreferredGraphicsApi.OPENGL);
+                    client.options.save();
+                    var config = com.deds.meshelium.MesheliumConfig.get();
+                    config.showVulkanPrompt = true;
+                    config.vulkanFailedNoticeShown = false;
+                    config.save();
+                    if (client.options.preferredGraphicsBackend().get()
+                            != PreferredGraphicsApi.OPENGL) {
+                        throw new AssertionError("the backend option did not read back OPENGL; "
+                                + "with VULKAN set the gate takes the VULKAN_FAILED branch and "
+                                + "this leg would assert against the wrong popup");
+                    }
+                    MesheliumGate.testRearmPopup();
+                });
+
+                // HALF ONE: it must never replace a screen the player opened.
+                context.runOnClient(client ->
+                        client.gui.setScreen(new MesheliumOptionsScreen(null)));
+                context.waitForScreen(MesheliumOptionsScreen.class);
+                context.waitTicks(MesheliumGate.IN_WORLD_SETTLE_TICKS * 2);
+                context.runOnClient(client -> {
+                    if (!(client.gui.screen() instanceof MesheliumOptionsScreen)) {
+                        throw new AssertionError("an owed popup replaced a screen the player had "
+                                + "open (" + client.gui.screen() + "). The rule is that it "
+                                + "waits, and a settings screen is exactly where it must not "
+                                + "appear - that screen already carries [Enable Vulkan]");
+                    }
+                    if (!MesheliumGate.popupOwed()) {
+                        throw new AssertionError("the popup was spent while a screen was open, "
+                                + "so the player will never see it");
+                    }
+                    client.gui.setScreen(null);
+                });
+
+                // HALF TWO: the settle, then the popup. Half the window
+                // rather than one tick short of it: the point is that the
+                // popup does not land the instant the HUD appears, and an
+                // assertion timed to the last tick of the window would be
+                // a coin flip on a busy frame.
+                context.waitTicks(MesheliumGate.IN_WORLD_SETTLE_TICKS / 2);
+                context.runOnClient(client -> {
+                    if (client.gui.screen() != null) {
+                        throw new AssertionError("the popup landed inside the settle window ("
+                                + MesheliumGate.IN_WORLD_SETTLE_TICKS + " ticks); it must not "
+                                + "arrive while the world is still coming up");
+                    }
+                });
+                context.waitForScreen(MesheliumPopupScreen.class);
+                // The pause flag is recomputed once per runTick (putfield
+                // pause, ip 566), after the tick loop, so isPaused() is
+                // owed a tick on both sides of the screen change.
+                context.waitTicks(2);
+                context.runOnClient(client -> {
+                    MesheliumPopupScreen popup = (MesheliumPopupScreen) client.gui.screen();
+                    if (popup.variant() != MesheliumPopupScreen.Variant.ENABLE_VULKAN) {
+                        throw new AssertionError("in-world popup variant " + popup.variant()
+                                + " with preferredGraphicsBackend="
+                                + client.options.preferredGraphicsBackend().get()
+                                + ". ENABLE_VULKAN is owed only while that option does NOT read "
+                                + "VULKAN; if something set it again before this leg, fix the "
+                                + "restore above rather than this assertion");
+                    }
+                    String expected = Component.translatable(expectedBodyKey).getString();
+                    if (!popup.bodyText().equals(expected)) {
+                        throw new AssertionError("in-world popup body: '" + popup.bodyText()
+                                + "' (expected the " + expectedBodyKey + " wording)");
+                    }
+                    if (!client.isPaused()) {
+                        throw new AssertionError("the in-world popup did not pause the "
+                                + "singleplayer world. Screen.isPauseScreen feeds "
+                                + "Gui.isPausing, which feeds Minecraft.runTick's pause flag "
+                                + "(ip 533-566); without it the world keeps ticking under a "
+                                + "modal the player is reading");
+                    }
+                });
+                context.takeScreenshot(TestScreenshotOptions.of(
+                        shotPrefix + "_meshelium_popup_in_world"));
+
+                // Dismiss: back to the HUD, never to a title screen.
+                context.clickScreenButton("meshelium.popup.not_now");
+                context.waitFor(client -> client.gui.screen() == null);
+                context.waitTicks(2);
+                context.runOnClient(client -> {
+                    if (MesheliumGate.popupOwed()) {
+                        throw new AssertionError("popupOwed survived the popup; the next tick "
+                                + "would put it straight back up, which is the nag loop the "
+                                + "standing directive forbids");
+                    }
+                    if (client.isPaused()) {
+                        throw new AssertionError("the world did not resume after the popup "
+                                + "closed");
+                    }
+                });
+
+                // THE NO-NAG GUARD the suite could not express before.
+                context.waitTicks(MesheliumGate.IN_WORLD_SETTLE_TICKS * 3);
+                context.runOnClient(client -> {
+                    if (client.gui.screen() != null) {
+                        throw new AssertionError("the popup came back as " + client.gui.screen()
+                                + " after " + (MesheliumGate.IN_WORLD_SETTLE_TICKS * 3)
+                                + " ticks. ENABLE_VULKAN persists nothing when shown, so a "
+                                + "re-arming predicate has no latch to stop it");
+                    }
+                    if (!com.deds.meshelium.MesheliumConfig.get().showVulkanPrompt) {
+                        throw new AssertionError("showing the popup in a world spent "
+                                + "showVulkanPrompt; only [Don't Show This Again] may");
+                    }
+                });
+                context.takeScreenshot(TestScreenshotOptions.of(
+                        shotPrefix + "_meshelium_popup_in_world_gone"));
+                bodyOk[0] = true;
+            } finally {
+                restoreAfterInWorldPopupLeg(context, pauseOnLostFocusWas[0], bodyOk[0]);
+            }
+        }
+        context.waitForScreen(TitleScreen.class);
+    }
+
+    /**
+     * ITEM (1), the other world: a server, where nothing can pause.
+     *
+     * <p>The one genuinely new branch, and the path a quick-play-to-server
+     * tester actually takes, so it does not ship untested. The harness CAN
+     * produce a remote level: {@code TestWorldBuilder.createServer()}
+     * returns a {@code TestDedicatedServerContext} whose {@code connect()}
+     * gives a {@code TestServerConnection} with {@code getClientLevel()}
+     * (javap of fabric-client-gametest-api-v1-5.1.1+37925be69e), and its
+     * only documented precondition is EULA acceptance, which
+     * {@code fabricApi.configureTests { eula = true }} already sets.
+     *
+     * <p>Three things are asserted, and they are the three halves of the
+     * promise: NO modal seizes the mouse; the player IS told anyway; and
+     * for ENABLE_VULKAN the window with the button is still owed and really
+     * does land on the next title screen. The last of those is why the
+     * backend option is restored AFTER the disconnect rather than inside
+     * the connection's try-with-resources: restoring it to VULKAN first
+     * would make the owed popup arrive as VULKAN_FAILED.
+     *
+     * <p>The cost is one in-process dedicated server per GL run. It is
+     * called from this class only, not from the Sodium run, because the
+     * branch under test is the gate's and does not vary with Sodium.
+     */
+    static void assertRemoteWorldTellsWithoutAModal(ClientGameTestContext context,
+            String shotPrefix) {
+        boolean[] pauseOnLostFocusWas = new boolean[1];
+        context.runOnClient(client -> pauseOnLostFocusWas[0] = client.options.pauseOnLostFocus);
+        boolean[] bodyOk = new boolean[1];
+        try {
+            try (TestDedicatedServerContext server = context.worldBuilder().createServer();
+                    TestServerConnection connection = server.connect()) {
+                connection.getClientLevel().waitForChunksRender();
+                context.runOnClient(client -> {
+                    client.options.pauseOnLostFocus = false;
+                    // Non-vacuity, the mirror image of the singleplayer
+                    // leg's: if this world WOULD pause, the gate shows a
+                    // modal and this leg proves nothing about the branch it
+                    // is named after.
+                    if (MesheliumGate.testPopupWouldPauseThisWorld(client)) {
+                        throw new AssertionError("HARNESS: the dedicated-server leg is on a "
+                                + "world a modal WOULD pause (hasSingleplayerServer="
+                                + client.hasSingleplayerServer() + "); it would exercise the "
+                                + "singleplayer branch and prove nothing");
+                    }
+                    if (client.level == null || client.player == null) {
+                        throw new AssertionError("no remote level or player after "
+                                + "waitForChunksRender: level=" + client.level + " player="
+                                + client.player);
+                    }
+                    client.options.preferredGraphicsBackend().set(PreferredGraphicsApi.OPENGL);
+                    client.options.save();
+                    var config = com.deds.meshelium.MesheliumConfig.get();
+                    config.showVulkanPrompt = true;
+                    config.vulkanFailedNoticeShown = false;
+                    config.save();
+                    MesheliumGate.testRearmPopup();
+                });
+                context.waitTicks(MesheliumGate.IN_WORLD_SETTLE_TICKS * 2);
+                context.runOnClient(client -> {
+                    if (client.gui.screen() != null) {
+                        throw new AssertionError("a modal (" + client.gui.screen() + ") took the "
+                                + "screen on a server, where Minecraft.runTick's pause test "
+                                + "cannot be satisfied. The world keeps ticking under it, and "
+                                + "on a quick-play join that is a player who may be falling or "
+                                + "mid-fight");
+                    }
+                    if (!MesheliumGate.inWorldNoticeShown()) {
+                        throw new AssertionError("no modal AND no telling: the remote branch "
+                                + "did nothing at all, which is the silent-nothing-happens the "
+                                + "standing directive forbids");
+                    }
+                    if (!MesheliumGate.popupOwed()) {
+                        throw new AssertionError("the toast spent the ENABLE_VULKAN modal. A "
+                                + "toast has no [Enable Vulkan] button, so it cannot be the "
+                                + "whole telling for that variant - the window is still owed");
+                    }
+                });
+                context.takeScreenshot(TestScreenshotOptions.of(
+                        shotPrefix + "_meshelium_remote_toast"));
+            }
+
+            // Disconnected. The modal was owed, so it lands here - which is
+            // the sentence the changelog, SPEC.md and the gate javadoc all
+            // make, and the only place it can be checked end to end.
+            context.waitForScreen(MesheliumPopupScreen.class);
+            context.runOnClient(client -> {
+                MesheliumPopupScreen popup = (MesheliumPopupScreen) client.gui.screen();
+                if (popup.variant() != MesheliumPopupScreen.Variant.ENABLE_VULKAN) {
+                    throw new AssertionError("the popup owed from the server session arrived as "
+                            + popup.variant() + "; the restore of preferredGraphicsBackend must "
+                            + "happen AFTER this assertion or the gate takes the VULKAN_FAILED "
+                            + "branch instead");
+                }
+            });
+            context.takeScreenshot(TestScreenshotOptions.of(
+                    shotPrefix + "_meshelium_remote_popup_at_title"));
+            context.clickScreenButton("meshelium.popup.not_now");
+            context.waitForScreen(TitleScreen.class);
+            bodyOk[0] = true;
+        } finally {
+            restoreAfterInWorldPopupLeg(context, pauseOnLostFocusWas[0], bodyOk[0]);
+        }
+    }
+
+    /**
+     * Put back everything the two in-world popup legs spend, and assert the
+     * read-back.
+     *
+     * <p>A restore that silently fails is worse than no restore: the next
+     * leg passes vacuously and the cause is three legs upstream. When the
+     * leg body already failed the restore failure is PRINTED rather than
+     * thrown, so it cannot mask the real assertion.
+     */
+    private static void restoreAfterInWorldPopupLeg(ClientGameTestContext context,
+            boolean pauseOnLostFocusWas, boolean bodyOk) {
+        Throwable restoreFailure = null;
+        try {
+            context.runOnClient(client -> {
+                client.options.pauseOnLostFocus = pauseOnLostFocusWas;
+                client.options.preferredGraphicsBackend().set(PreferredGraphicsApi.VULKAN);
+                client.options.save();
+                com.deds.meshelium.MesheliumConfig.get().showVulkanPrompt = true;
+                com.deds.meshelium.MesheliumConfig.get().save();
+                if (client.options.pauseOnLostFocus != pauseOnLostFocusWas) {
+                    throw new AssertionError("pauseOnLostFocus did not read back "
+                            + pauseOnLostFocusWas + "; the later walk legs treat it as shared "
+                            + "state and pass vacuously when a screen is open");
+                }
+                if (client.options.preferredGraphicsBackend().get()
+                        != PreferredGraphicsApi.VULKAN) {
+                    throw new AssertionError("preferredGraphicsBackend did not read back VULKAN; "
+                            + "OPENGL is now saved in the run dir and the next leg is testing "
+                            + "something else");
+                }
+            });
+        } catch (Throwable t) {
+            restoreFailure = t;
+        }
+        if (restoreFailure != null) {
+            if (bodyOk) {
+                throw new AssertionError("the in-world popup leg passed but could not put the "
+                        + "run back as it found it", restoreFailure);
+            }
+            System.out.println("[Meshelium] the in-world popup leg failed AND could not restore: "
+                    + restoreFailure);
+        }
     }
 
     /**
@@ -954,6 +1533,51 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
     }
 
     /**
+     * UNKNOWN self-heal, best effort. A settings screen opened during the
+     * loading-overlay fade is built while the gate is still UNKNOWN and
+     * must rebuild itself once the gate decides, or it says the backend is
+     * still being checked for as long as it stays open (owner report
+     * 2026-09-08 (beta.8)).
+     *
+     * <p>The harness's first client call may already be past the fade, in
+     * which case there is nothing to exercise; that is logged rather than
+     * passed over in silence (memory: census blind spots).
+     */
+    private static void assertOptionsScreenSelfHealsFromUnknown(ClientGameTestContext context) {
+        MesheliumOptionsScreen[] early = new MesheliumOptionsScreen[1];
+        context.runOnClient(client -> {
+            if (MesheliumGate.state() == MesheliumGate.State.UNKNOWN) {
+                early[0] = new MesheliumOptionsScreen(client.gui.screen());
+                client.gui.setScreen(early[0]);
+            }
+        });
+        if (early[0] == null) {
+            System.out.println("[Meshelium] gate already decided before the first client call; "
+                    + "the settings screen's UNKNOWN self-heal was not exercised");
+            return;
+        }
+        context.waitFor(client -> MesheliumGate.state() != MesheliumGate.State.UNKNOWN);
+        context.waitTicks(2);
+        context.runOnClient(client -> {
+            Screen screen = client.gui.screen();
+            if (screen == early[0] || !(screen instanceof MesheliumOptionsScreen healed)) {
+                throw new AssertionError("a settings screen opened while the gate was undecided "
+                        + "did not rebuild itself once it decided (" + MesheliumGate.state()
+                        + "); screen is " + screen);
+            }
+            if (healed.gateBannerText().contains("checking")) {
+                throw new AssertionError("the rebuilt settings screen still says the backend is "
+                        + "being checked: " + healed.gateBannerText());
+            }
+        });
+        // Back to the title screen the rest of the path expects; the
+        // no-popup assertion that follows then sees the real title screen.
+        context.clickScreenButton("gui.done");
+        context.waitForScreen(TitleScreen.class);
+        context.waitTicks(2);
+    }
+
+    /**
      * State (c) on the dev rig (RX 9070 XT): no popup, gate reports
      * Vulkan + mesh shaders (the caps INFO block lands in the log at device
      * creation — the coordinator reads it as the wave's acceptance
@@ -961,6 +1585,7 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
      * loudly rather than passing vacuously.
      */
     private static void assertVulkanPath(ClientGameTestContext context) {
+        assertOptionsScreenSelfHealsFromUnknown(context);
         context.waitFor(client -> MesheliumGate.state() != MesheliumGate.State.UNKNOWN);
         context.runOnClient(client -> {
             if (MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS) {
@@ -971,6 +1596,15 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
             if (screen instanceof MesheliumPopupScreen) {
                 throw new AssertionError("No popup may appear on the Vulkan path, but got "
                         + ((MesheliumPopupScreen) screen).variant());
+            }
+            // And none is OWED either. The old predicate could only put a
+            // popup over a title screen, so "no popup here" was most of the
+            // guarantee; the new one lands in a world too, which makes an
+            // owed-but-unseen popup a real state worth asserting against.
+            if (MesheliumGate.popupOwed()) {
+                throw new AssertionError("a popup is owed on the healthy Vulkan path. Nothing "
+                        + "arms it there, so something is arming it that should not - and it "
+                        + "would land in the world the smoke run opens next");
             }
             // Wave-14 memory probe: a created Vulkan device must have
             // recorded its largest DEVICE_LOCAL heap, and the derived

@@ -27,12 +27,36 @@
 
 #extension GL_EXT_mesh_shader : require
 
+// Boxes per section-raster mesh workgroup on the Sodium host
+// (TerrainOcclusion.ensureSodiumPipelines injects it from
+// SodiumTerrainDrawer.OCC_BOXES_PER_WG; 1 = the original one-box
+// workgroups, and the text under "> 1" is then not compiled, so every
+// existing variant's SPIR-V is unchanged). Defaulted here so the
+// standalone compiles, which never define it, stay well-formed.
+#ifndef MESHELIUM_OCC_BOXES_PER_WG
+#define MESHELIUM_OCC_BOXES_PER_WG 1
+#endif
+
 layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 
+#if MESHELIUM_SODIUM
+// The Sodium host's 64-B list entry (D-023 stage 3; rationale in
+// region_raster.mesh). meta.x is Meshelium's dense mid, meta.y the
+// occupancy popcount = the mesh workgroups to launch: the section raster
+// mesh stage maps workgroup k to the k-th occupied slot by prefix
+// popcount over the region row, so no empty slot is ever dispatched.
+struct OccRegion {
+    vec4 origin;
+    uvec4 meta;    // x = mid, y = popcount(occupancy), z/w = occ AABB
+    uvec4 mask0;   // VisMode-0 BFS mask, never read here
+    uvec4 mask1;
+};
+#else
 struct OccRegion {
     vec4 origin;   // xyz = region MIN corner in blocks, camera-relative
     uvec4 meta;    // x = regionId, y = compacted count, z/w = occ AABB
 };
+#endif
 // Wave-10: same UBO-vs-SSBO split as region_raster.mesh (rationale +
 // layout-equivalence note there).
 #if MESHELIUM_LISTS_SSBO
@@ -59,6 +83,10 @@ layout(push_constant) uniform OccPush {
 struct OccSectionPayload {
     vec3 origin;    // region MIN corner rel camera (blocks)
     uint regionId;  // Meshelium region id → section-record block index
+#if MESHELIUM_SODIUM && MESHELIUM_OCC_BOXES_PER_WG > 1
+    uint popcount;  // occupied slots of the region: the packed mesh
+                    // stage clips its last workgroup's box count on it
+#endif
 };
 taskPayloadSharedEXT OccSectionPayload payload;
 
@@ -69,7 +97,16 @@ void main() {
         OccRegion e = occRegions[slot];
         payload.origin = e.origin.xyz;
         payload.regionId = e.meta.x;
+#if MESHELIUM_SODIUM && MESHELIUM_OCC_BOXES_PER_WG > 1
+        // ceil(popcount / boxes per workgroup) workgroups, each taking
+        // the next MESHELIUM_OCC_BOXES_PER_WG ranks (2026-09-13: one
+        // 8-lane workgroup per box left three quarters of every wave idle
+        // and priced the raster by launches, not pixels).
+        payload.popcount = e.meta.y;
+        count = (e.meta.y + uint(MESHELIUM_OCC_BOXES_PER_WG) - 1u) / uint(MESHELIUM_OCC_BOXES_PER_WG);
+#else
         count = e.meta.y;
+#endif
     }
     EmitMeshTasksEXT(count, 1u, 1u);
 }

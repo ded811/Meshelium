@@ -53,6 +53,24 @@
 
 #extension GL_EXT_mesh_shader : require
 
+// NEXT (c), 2026-09-15: the half-resolution occlusion depth. Defined 0 -
+// or undefined - this file preprocesses to its earlier text byte for byte,
+// which is what keeps every shipped raster row of tools/shader_parity.sh
+// byte-identical (the parity rule, GPU-VISIBILITY-CONTRACT.md 12.1).
+// Armed by TerrainOcclusion.PROPERTY_HALF_RES, default OFF.
+#ifndef MESHELIUM_OCC_HALFRES
+#define MESHELIUM_OCC_HALFRES 0
+#endif
+// The FLAT depth arm: the only arm whose superset holds BY CONSTRUCTION,
+// and therefore the only one a default flip could ever act on. The slope
+// depth bias measured beside it is a comparator only - its biased depth
+// can leave [0, 1], where Vulkan leaves z_f undefined without depth
+// clamping. See TerrainOcclusion.PROPERTY_HALF_RES_ARM. Only ever 1
+// together with MESHELIUM_OCC_HALFRES 1.
+#ifndef MESHELIUM_OCC_HALFRES_FLAT
+#define MESHELIUM_OCC_HALFRES_FLAT 0
+#endif
+
 layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
 layout(triangles, max_vertices = 8, max_primitives = 12) out;
 
@@ -71,12 +89,28 @@ layout(location = 0) perprimitiveEXT out uint vBoxId[];
 // MesheliumFrameLists' host-visible ring (transient memory cannot mint
 // STORAGE usage — wave-3b finding); the vec4+uvec4 struct is 32 B under
 // std140 AND std430, so the CPU byte layout is identical either way.
+#if MESHELIUM_SODIUM
+// The Sodium host's list entry (D-023 stage 3): the terrain task stage
+// needs a 256-bit BFS mask per listed region for its VisMode-0 parity
+// draw, and a second array would cost it a fifth task-stage storage
+// buffer, so the entry is 64 B and this raster reads its first 32 B
+// through the same field names - origin and meta.x/y/z/w are unchanged.
+// SodiumGpuVisibilityLayout.LIST_ENTRY_BYTES / LIST_ORIGIN / LIST_META_*.
+struct OccRegion {
+    vec4 origin;   // xyz = region MIN corner in blocks, camera-relative
+    uvec4 meta;    // x = mid (Meshelium's dense region id), y = popcount
+                   // of the occupancy mask, z = occMin packed, w = occMax
+    uvec4 mask0;   // VisMode-0 BFS mask, never read here
+    uvec4 mask1;
+};
+#else
 struct OccRegion {
     vec4 origin;   // xyz = region MIN corner in blocks, camera-relative
     uvec4 meta;    // x = regionId, y = compacted section count,
                    // z = occMin packed (x | y<<8 | z<<16, section-local),
                    // w = occMax packed
 };
+#endif
 #if MESHELIUM_LISTS_SSBO
 layout(set = 0, binding = 0, std430) readonly buffer OccRegions {
     OccRegion occRegions[];
@@ -111,7 +145,131 @@ layout(set = 0, binding = 3, std430) buffer StampOut {
 
 layout(push_constant) uniform OccPush {
     uint FrameStamp;
+#if MESHELIUM_OCC_HALFRES
+    // k of the coverage inflation (the host's arm(): 2.8284 /
+    // min(halfW*|m00|, halfH*|m11|) - one WHOLE half-res pixel of
+    // clearance at the box's farthest corner, twice the 0.707 the
+    // argument needs).
+    float InflateK;
+    // The near-tip radius: zNear * sqrt(1 + 1/m00^2 + 1/m11^2) + slack.
+    float NearR;
+    // Test-only: the word index, in the stamp buffer THIS raster binds,
+    // of the forcedNear counter pair. 0 = off, and then no atomic runs
+    // and no buffer is a byte longer than the shipped one.
+    uint DiagBase;
+#endif
 };
+
+#if MESHELIUM_OCC_HALFRES
+// ---- NEXT (c): the half-resolution occlusion depth ----
+//
+// Near-plane force (plan revision 3, objection 1). A box that can lose a
+// VIEWPORT fragment to near clipping intersects the frustum's near tip,
+// and every point of the near tip lies within NearR of the camera (the
+// host's arm(): R = zNear * sqrt(1 + 1/m00^2 + 1/m11^2) + slack, zNear =
+// 0.05 from net.minecraft.client.Camera.PROJECTION_Z_NEAR). Coordinates
+// here are camera-relative, so the box widened by NearR containing the
+// ORIGIN is exactly the condition. It SUBSUMES the camera-inside test it
+// replaces (NearR >= 0), it is fail-open (forcing only ever adds a
+// stamp), and it never forces a box farther than NearR*sqrt(3) from the
+// camera - the hemisphere behind the camera is untouched, which the
+// withdrawn clip-space straddle test of plan revision 2 could not say.
+bool meshelium_nearForced(vec3 lo, vec3 hi) {
+    return all(lessThanEqual(lo - NearR, vec3(0.0)))
+        && all(greaterThanEqual(hi + NearR, vec3(0.0)));
+}
+
+// The forced-box diagnostic (plan revision 4, objections 3/8): wide is
+// this arm's widened test on the INFLATED box, and the second test below
+// is the un-widened one on the UN-inflated box - exactly what the
+// full-res variant fires. 97_18 asserts the two counts are EQUAL, which
+// is the MEASURED form of the claim that the near force and the inflation
+// contributed nothing to the printed re-admission. A pose argument cannot
+// say that: the widened force also applies to the REGION box, whose
+// inflation is k * D_far of a 128x64x128-block occupancy AABB and reaches
+// ~1.83 blocks at the harness resolution - further than the one-block rule
+// plan revision 3 asserted. Entirely off - no atomic, no extra word
+// touched, no byte allocated - unless DiagBase is non-zero, which only
+// the test-only stamps readback ever makes it.
+void meshelium_countForced(bool wide, vec3 rawLo, vec3 rawHi) {
+    if (DiagBase == 0u) {
+        return;
+    }
+    if (wide) {
+        atomicAdd(stampOut[DiagBase], 1u);
+    }
+    if (all(lessThanEqual(rawLo, vec3(0.0))) && all(greaterThanEqual(rawHi, vec3(0.0)))) {
+        atomicAdd(stampOut[DiagBase + 1u], 1u);
+    }
+}
+#endif
+#if MESHELIUM_OCC_HALFRES_FLAT
+// FLAT depth (plan revision 3 objection 7c; promoted to THE arm by
+// revision 4 objection 1). The whole box rasters at the depth of its
+// NEAREST corner - under reversed-Z the LARGEST NDC z over the eight
+// corners - so every fragment of it is at least as near as every point of
+// the box. That closes the BOX side of the superset (the min-of-window
+// downsample closes the terrain side) without a slope depth bias.
+//
+// WHY NOT THE BIAS. Vulkan ADDS the bias to the fragment's depth, and
+// fragops.adoc (Depth Clamping and Range Adjustment) says: if z_f is not
+// in the range [z_min, z_max], then z_f is undefined. depthClampEnable is
+// false (TerrainOcclusion.buildBoxPipeline) and vanilla's viewport range
+// is minDepth 0 / maxDepth 1, so a near-eye box's BIASED depth can exceed
+// 1.0 and what the driver then does is not a statement about this
+// construction. FLAT's depth provably never leaves [0, 1]: in the in-front
+// branch every corner satisfies 0 <= z_c <= w_c so zmax is in [0, 1], and
+// the KAPPA branch lands in [1 - KAPPA, 1].
+//
+// THE STRADDLERS. A box with any corner at or nearer than the near plane
+// (z_c > w_c: view depth < zNear, including behind the camera) has visible
+// points nearer than any of its in-front corners - a face grazing past the
+// camera - so a zmax over corners would UNDERESTIMATE them, and that is a
+// hole, not a re-admission. Such a box keeps its clipping EXACTLY
+// (z' - w = KAPPA * (z - w) has the sign of z - w, so the near crossing
+// z = w is preserved) and lands in [1 - KAPPA, 1]: it passes against
+// anything farther than zNear * (1 + KAPPA) = 0.0500008 blocks, and a
+// scene point nearer than that forces the box through the near force above
+// (whose slack covers KAPPA * R). No vertex with w = 0 ever survives the
+// near clip, so the perspective divide is never undefined.
+//
+// Cost: eight mat-vec per lane on the pre-multiplied matrix instead of
+// one. No shared memory, no barrier, no subgroup extension.
+const float OCC_FLAT_KAPPA = 1.0 / 65536.0;
+
+vec4 meshelium_flatPosition(vec3 lo, vec3 hi, vec3 corner) {
+    mat4 mvp = ProjMat * ModelViewMat;
+    // Seed NEGATIVE, not 0.0 (plan revision 4, objection 5). With a 0.0
+    // seed a box whose every corner lies BEYOND the far plane - all in
+    // front by the z_c > w_c test, all with z_c < 0 - kept zmax = 0 and
+    // emitted z' = 0 at every vertex: ON the inclusive clip boundary
+    // 0 <= z_c <= w_c, so it rastered at depth 0.0 and GEQUAL-passed
+    // against every cleared sky texel. Fail-open, but it re-admitted the
+    // whole far-horizon row that full res clips away and polluted the
+    // printed re-admission exactly there. With -1.0 such a box gets
+    // z' = -w < 0 at every vertex and is clipped as at full res (a convex
+    // box's nearest point is a corner, so all-corners-beyond means
+    // all-beyond); a box with any in-range corner takes that corner's
+    // zmax >= 0 and is unaffected.
+    float zmax = -1.0;
+    bool nearOrBehind = false;
+    for (uint i = 0u; i < 8u; ++i) {
+        vec3 ci = vec3(((i & 1u) == 0u) ? lo.x : hi.x,
+                       ((i & 4u) == 0u) ? lo.y : hi.y,
+                       ((i & 2u) == 0u) ? lo.z : hi.z);
+        vec4 cc = mvp * vec4(ci, 1.0);
+        if (cc.z > cc.w) {
+            nearOrBehind = true;
+        } else {
+            zmax = max(zmax, cc.z / cc.w);
+        }
+    }
+    vec4 p = mvp * vec4(corner, 1.0);
+    p.z = nearOrBehind ? (1.0 - OCC_FLAT_KAPPA) * p.w + OCC_FLAT_KAPPA * p.z
+                       : zmax * p.w;
+    return p;
+}
+#endif
 
 // Nvidium's 0.1-block inflation (ADD_SIZE 0.1f/16 chunk units × 16).
 const float BOX_INFLATE = 0.1;
@@ -136,6 +294,24 @@ void main() {
     uvec3 occMax = (e.meta.www >> uvec3(0u, 8u, 16u)) & uvec3(0xFFu);
     vec3 lo = e.origin.xyz + vec3(occMin) * 16.0 - BOX_INFLATE;
     vec3 hi = e.origin.xyz + (vec3(occMax) + 1.0) * 16.0 + BOX_INFLATE;
+#if MESHELIUM_OCC_HALFRES
+    // OCC_HALFRES_INFLATE: the coverage ingredient. A silhouette that
+    // covers a full-res sample p_i can miss the half-res pixel centre c,
+    // and the section whose only passing sample sat in that gap would be
+    // DROPPED, and at a static pose it would STAY dropped - the
+    // terrain-deleting class. Moving the box out by InflateK * D_far
+    // gives the farthest corner one WHOLE half-res pixel of clearance,
+    // twice the 0.707 the bound needs; it is paid as re-admission, never
+    // as a hole.
+    float dFar = length(max(abs(lo), abs(hi)));
+    float inflate = InflateK * dFar;
+    // The PRE-inflation box, kept only so meshelium_countForced can
+    // report what the FULL-RES variant would have forced. Two registers.
+    vec3 rawLo = lo;
+    vec3 rawHi = hi;
+    lo -= inflate;
+    hi += inflate;
+#endif
 
     // Uniform by construction (every invocation reads the same entry).
     SetMeshOutputsEXT(8u, 12u);
@@ -145,7 +321,12 @@ void main() {
             ((t & 1u) == 0u) ? lo.x : hi.x,
             ((t & 4u) == 0u) ? lo.y : hi.y,
             ((t & 2u) == 0u) ? lo.z : hi.z);
+#if MESHELIUM_OCC_HALFRES_FLAT
+    // OCC_HALFRES_FLATPOS
+    gl_MeshVerticesEXT[t].gl_Position = meshelium_flatPosition(lo, hi, corner);
+#else
     gl_MeshVerticesEXT[t].gl_Position = ProjMat * (ModelViewMat * vec4(corner, 1.0));
+#endif
 
     gl_PrimitiveTriangleIndicesEXT[t] = BOX_TRIS[t];
     vBoxId[t] = slot;
@@ -158,7 +339,14 @@ void main() {
         // Camera inside the inflated box (coords are camera-relative, so
         // "inside" = the box contains the origin) → forced visible; same
         // value as the fragment writes, so ordering is irrelevant.
+#if MESHELIUM_OCC_HALFRES
+        // OCC_HALFRES_NEARCLIP
+        bool nf = meshelium_nearForced(lo, hi);
+        meshelium_countForced(nf, rawLo, rawHi);
+        if (nf) {
+#else
         if (all(lessThanEqual(lo, vec3(0.0))) && all(greaterThanEqual(hi, vec3(0.0)))) {
+#endif
             atomicExchange(stampOut[slot], FrameStamp);
         }
     }

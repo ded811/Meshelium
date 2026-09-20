@@ -35,7 +35,7 @@ import java.util.Locale;
 
 /**
  * Far Terrain: the horizon past the render distance, drawn from shells
- * of chunks the player has already seen (docs/FAR-FIELD-DESIGN.md, and
+ * of chunks the player has already seen (docs/unreleased/farfield/FAR-FIELD-DESIGN.md, and
  * items D1 to D3 of the owner's pre1 playtest list).
  *
  * <h2>The page the owner asked for</h2>
@@ -264,7 +264,14 @@ public class MesheliumFarFieldScreen extends Screen {
         }
 
         if (this.gateLocked) {
-            rows.addChild(banner(Component.translatable("meshelium.options.advanced.locked")
+            // Far terrain is standalone-only (LevelRendererMixin gates on
+            // VULKAN_MESH_SHADERS), but "Meshelium is not running" is false
+            // while the adapter draws Sodium's chunks (owner report
+            // 2026-09-08 (beta.8)).
+            String lockedKey = MesheliumGate.sodiumAdapterArmed()
+                    ? "meshelium.options.advanced.locked.sodium"
+                    : "meshelium.options.advanced.locked";
+            rows.addChild(banner(Component.translatable(lockedKey)
                             .withStyle(ChatFormatting.YELLOW)),
                     s -> s.paddingTop(2).paddingBottom(2));
         }
@@ -809,8 +816,14 @@ public class MesheliumFarFieldScreen extends Screen {
      * is a locked row's only truthful annotation.
      */
     private Tooltip tip(String descriptionKey, String appliesKey) {
-        return Tooltip.create(withSemantics(Component.translatable(descriptionKey),
-                this.gateLocked ? "meshelium.options.applies.vulkan" : appliesKey));
+        // Under Sodium a held row is held because Sodium builds the terrain,
+        // never because the renderer is missing; the game may be on Vulkan
+        // (owner report 2026-09-08 (beta.8)).
+        String semantics = !this.gateLocked ? appliesKey
+                : MesheliumGate.state() == MesheliumGate.State.SODIUM_PRESENT
+                        ? "meshelium.options.applies.sodium"
+                        : "meshelium.options.applies.vulkan";
+        return Tooltip.create(withSemantics(Component.translatable(descriptionKey), semantics));
     }
 
     private static Component withSemantics(MutableComponent description, String semanticsKey) {

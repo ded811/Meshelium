@@ -38,7 +38,8 @@ import org.lwjgl.vulkan.VkDevice;
  *   <li>the hello-meshlet pipelines (wave 2's five handles, if the dev
  *       property ever armed a build);</li>
  *   <li>the three terrain pipelines + Meshelium's descriptor-set layouts
- *       (waves 4/5/7) and the two static occlusion pipelines (wave 6);</li>
+ *       (waves 4/5/7), the two static occlusion pipelines (wave 6), and
+ *       the Sodium-host pipeline when that path ran;</li>
  *   <li>defensively, any per-world buffers that somehow outlived their
  *       dispose hook (WARN — the normal path already freed them).</li>
  * </ol>

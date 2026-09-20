@@ -109,7 +109,7 @@ public final class SectionRecord {
     /**
      * {@link #write(ByteBuffer, int, int, int, int, int, int, int, int,
      * int, boolean, int, int, short[])} plus the far-field SCALE TAG in
-     * header.y bits 26-31 (wave W3, docs/FARFIELD-WAVES.md: 0 = full
+     * header.y bits 26-31 (wave W3, docs/unreleased/farfield/FARFIELD-WAVES.md: 0 = full
      * scale, 1 = half, 2 = quarter — the pre3 ladder). The bits are
      * zero-safe by construction: no shader reads them today (chunkY
      * decodes as {@code (header.y << 15) >> 23}, terrain.task:232-233 /

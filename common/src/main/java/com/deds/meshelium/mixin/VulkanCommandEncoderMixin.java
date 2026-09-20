@@ -5,6 +5,7 @@
 package com.deds.meshelium.mixin;
 
 import com.deds.meshelium.MesheliumCpuStages;
+import com.deds.meshelium.vk.SodiumTerrainDrawer;
 
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 
@@ -25,6 +26,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  * inference into a measured series. A Vulkan-backend class, so this mixin
  * never applies on the GL path (the class never loads there);
  * {@code MesheliumCpuStages} is pure JDK either way.
+ *
+ * <p>2026-09-05: the RETURN hook also resets
+ * {@link SodiumTerrainDrawer#onEncoderSubmit() the Sodium run table's
+ * per-submit advance counter}. Still no change to vanilla's behaviour —
+ * the counter only decides whether Meshelium records a pass or hands it
+ * to Sodium. It is reset at RETURN, after the wait for the previous
+ * submit, because that is the moment the ring's oldest slots become
+ * provably free.
  */
 @Mixin(VulkanCommandEncoder.class)
 abstract class VulkanCommandEncoderMixin {
@@ -41,6 +50,7 @@ abstract class VulkanCommandEncoderMixin {
 
     @Inject(method = "submit()V", at = @At("RETURN"))
     private void meshelium$submitReturn(CallbackInfo ci) {
+        SodiumTerrainDrawer.onEncoderSubmit();
         if (MesheliumCpuStages.ARMED && meshelium$submitT0 != 0) {
             MesheliumCpuStages.record(MesheliumCpuStages.STAGE_ENCODER_SUBMIT,
                     System.nanoTime() - meshelium$submitT0);

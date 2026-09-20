@@ -9,7 +9,9 @@ import com.deds.meshelium.MesheliumBenchRecorder;
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumCpuStages;
 import com.deds.meshelium.MesheliumGate;
+import com.deds.meshelium.MesheliumProofRun;
 import com.deds.meshelium.terrain.host.TerrainResidency;
+import com.deds.meshelium.vk.MesheliumProjectionCapture;
 import com.deds.meshelium.vk.MesheliumTerrainPump;
 import com.deds.meshelium.vk.TerrainDrawer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
@@ -105,6 +107,33 @@ abstract class LevelRendererMixin {
     @Unique
     private static boolean meshelium$frameStateHookBroken;
 
+    /**
+     * NEXT (c1), 2026-09-16. 0 = not resolved yet, 1 = stash the pre-bob
+     * perspective, 2 = this session never will.
+     *
+     * <p>Resolved ONCE, but only on a frame where the gate has actually
+     * decided. {@code MesheliumGate.state} is initialised
+     * {@code State.UNKNOWN} (MesheliumGate.java:190) and is written only
+     * inside {@code onEndTick} (229-305), which returns early while
+     * {@code minecraft.gui.overlay() != null} (243-245, "still loading; the
+     * device may not exist yet") and while
+     * {@code RenderSystem.tryGetDevice() == null} (246-249). Frames and
+     * ticks are different clocks, so "the inputs are boot-time facts"
+     * (MesheliumGate.java:158-161) does NOT mean "the answer is decided by
+     * the first frame that reaches this hook". Latching an UNKNOWN would
+     * stamp 2 for the whole session and the stash would never run again -
+     * a red suite on {@code halfResArmSkipsNoPreBob}, and on a player's
+     * machine a silent, permanent lever-off, which is the exact failure
+     * this change exists to remove. Leaving the byte at 0 costs one enum
+     * compare on the frames before the decision and nothing after.</p>
+     */
+    @Unique
+    private static byte meshelium$preBobGate;
+
+    /** One throw at this hook is a dead frame; latch and degrade to G0. */
+    @Unique
+    private static boolean meshelium$preBobHookBroken;
+
     // 2026-08-18 attribution wave brackets (ARMED-gated, JIT-dead otherwise).
     @Unique
     private static long meshelium$levelRenderT0;
@@ -189,6 +218,71 @@ abstract class LevelRendererMixin {
         if (MesheliumCpuStages.ARMED) {
             MesheliumCpuStages.beginFrame();
             meshelium$levelRenderT0 = System.nanoTime();
+        }
+        // 2026-09-14 NeoForge proof hook: counts in-world frames, dumps the
+        // gate and the Sodium adapter's counters, takes one screenshot and
+        // stops the client. ARMED is a static final off
+        // -Dmeshelium.dev.proofFrames - JIT-dead otherwise, like the two
+        // above. BEFORE the gate check on purpose: under Sodium state() is
+        // SODIUM_PRESENT and the line below returns early. Pure JDK plus
+        // Minecraft/Screenshot, no Blaze3D or LWJGL, so GL-path-safe.
+        if (MesheliumProofRun.ARMED) {
+            MesheliumProofRun.onRenderFrame();
+        }
+        // ---- NEXT (c1), 2026-09-16: the PRE-BOB perspective stash ----
+        // Parameter 4 is the CameraRenderState whose projectionMatrix
+        // GameRenderer.renderLevel copied at ip 75-87 before multiplying
+        // the COPY by the bob pose at ip 122-135, and it is never written
+        // back (one getfield at ip 81, zero putfields). So this is the
+        // canonical perspective the half-res arm derives k and NearR from,
+        // while the rasters keep BINDING the bobbed matrix they must be
+        // compared in. Without it the arm saw m11 * 0.1 = 0.143 of bob
+        // translation against a 1.0e-5 tolerance and refused essentially
+        // every walking frame; the whole 0t bench matrix is stationary
+        // cameras, so that case had never been armed.
+        //
+        // Deliberately LOOSER than the frame-state gate three lines below:
+        // it runs on the Sodium host too, because that host has no
+        // CameraRenderState of its own and its arm needs this stash. Cost
+        // on a frame nothing reads: one 16-float Matrix4f copy and one
+        // serial increment at LevelRenderer.render HEAD - small, but NOT
+        // nothing, and it is charged to every armed session including the
+        // bench's Sodium-alone control leg. The null control is where that
+        // is measured, not argued.
+        //
+        // MesheliumConfig.terrainRenderingEnabled() is deliberately NOT in
+        // this gate: it is the master DRAW switch, and a stash missing on a
+        // frame that arms costs a refused frame and a measurable lever
+        // regression, while a stash written on a frame nothing reads costs
+        // the copy above.
+        if (meshelium$preBobGate == 0
+                && MesheliumGate.state() != MesheliumGate.State.UNKNOWN) {
+            meshelium$preBobGate =
+                    (MesheliumGate.state() == MesheliumGate.State.VULKAN_MESH_SHADERS
+                            || MesheliumGate.sodiumAdapterArmed()) ? (byte) 1 : (byte) 2;
+        }
+        if (meshelium$preBobGate == 1 && !meshelium$preBobHookBroken
+                && cameraRenderState != null
+                && cameraRenderState.projectionMatrix != null) {
+            // projectionMatrix != null is the whole guard the copy needs.
+            // CameraRenderState.initialized is NOT checked: in the 26.2 jar
+            // it has exactly one writer (Camera.extractRenderState ip 0-5)
+            // and zero readers in Camera, GameRenderer, LevelRenderer or
+            // LevelRenderState, so screening on a field vanilla itself
+            // never consults would be a fail-closed guard whose trigger
+            // nobody has traced - and its failure lands in
+            // halfResArmSkipsNoPreBob, which four readers assert is 0.
+            try {
+                MesheliumProjectionCapture.recordPreBob(cameraRenderState.projectionMatrix);
+            } catch (Throwable t) {
+                meshelium$preBobHookBroken = true;
+                MesheliumLog.LOGGER.error(
+                        "Meshelium pre-bob projection stash failed; the half-res occlusion "
+                                + "lever will refuse every frame from here (counted as "
+                                + "halfResArmSkipsNoPreBob if nothing ever stashed, "
+                                + "halfResArmSkipsStale once one did) and terrain draws "
+                                + "full-res", t);
+            }
         }
         if (meshelium$frameStateHookBroken
                 || MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS

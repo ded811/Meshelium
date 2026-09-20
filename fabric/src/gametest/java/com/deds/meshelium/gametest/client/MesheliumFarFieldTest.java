@@ -52,7 +52,7 @@ import java.util.Locale;
 import java.util.stream.Stream;
 
 /**
- * The far field's acceptance suite (docs/FARFIELD-WAVES.md, pre1 W4).
+ * The far field's acceptance suite (docs/unreleased/farfield/FARFIELD-WAVES.md, pre1 W4).
  *
  * <h2>Two runs, eight legs, and the order matters</h2>
  * <ol>
@@ -700,7 +700,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
 
     // ------------------------------------------------------------------
     // Leg 2e: the budget is a FRACTION of the frame (T2, Phase 2 of
-    // docs/FARFIELD-PERF-BRIEF.md)
+    // docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md)
     // ------------------------------------------------------------------
 
     /** Frame times the rule is pinned at, nanoseconds: 300 fps. */
@@ -825,7 +825,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
                         + "at " + frame + " ns it took " + permille + " permille. A "
                         + "share that varies with the frame rate is a frame-rate "
                         + "TARGET wearing a fraction's clothes, which is the T2 "
-                        + "defect itself (docs/FARFIELD-PERF-BRIEF.md section 3)");
+                        + "defect itself (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 3)");
             }
         }
 
@@ -1139,7 +1139,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
      *
      * <h2>The numbers are the jar's, not this test's</h2>
      * {@code positionSeed(100, 71, 200)} and the draws below are
-     * transcribed in docs/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)",
+     * transcribed in docs/unreleased/farfield/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)",
      * from {@code Mth.getSeed} ip 0-34, {@code SingleThreadedRandomSource
      * .setSeed} ip 0-10 / {@code next} ip 0-29 and
      * {@code BitRandomSource.nextInt(int)} ip 14-38. Pinning
@@ -1938,7 +1938,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
     private static final long WORST_OVERRUN_MICROS = 2000L;
 
     /**
-     * Leg 3c - save gametest (b), landed with M3 (docs/FARFIELD-SAVE-DESIGN.md
+     * Leg 3c - save gametest (b), landed with M3 (docs/unreleased/farfield/FARFIELD-SAVE-DESIGN.md
      * section 10): PLACE A BLOCK AND LEAVE, and the edit reaches the
      * store within {@value #EDIT_TO_STORE_SECONDS} seconds of wall
      * clock. This pins Q4's contract - edit-to-store latency is
@@ -2388,7 +2388,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
     }
 
     /**
-     * Leg 3d - save gametest (a), landed with M5 (docs/FARFIELD-SAVE-
+     * Leg 3d - save gametest (a), landed with M5 (docs/unreleased/farfield/FARFIELD-SAVE-
      * DESIGN.md section 10): THE RD STORM LOSES NOTHING. Bulk-load a
      * bigger window ({@value #STORM_RD_HIGH}), record every live tracked
      * column into W while the new ring is still draining (so the shrink
@@ -2682,7 +2682,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
     private static final int ACK_FLOOD_X = 60000;
 
     /**
-     * Leg 3b - save M1 (docs/FARFIELD-SAVE-DESIGN.md): forced queue
+     * Leg 3b - save M1 (docs/unreleased/farfield/FARFIELD-SAVE-DESIGN.md): forced queue
      * eviction, and the VICTIM, not the submitter, is the column that
      * re-queues. Floods the write queue far past {@code WRITE_QUEUE_CAP}
      * in one game-thread burst, so the eviction arm must fire, then
@@ -2881,7 +2881,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
     private static final int REPLACE_MAX_RING = FAR_L1_HIGH - 2;
 
     /**
-     * Leg 4b - SEAM step 2's gametest leg A (docs/FARFIELD-SEAM-DESIGN.md
+     * Leg 4b - SEAM step 2's gametest leg A (docs/unreleased/farfield/FARFIELD-SEAM-DESIGN.md
      * section 6): the edit-a-drawn-column scenario. A fresher shell
      * submitted for a column the far field is ALREADY DRAWING must be an
      * atomic REPLACEMENT - meshed, then swapped against the resident
@@ -2915,7 +2915,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
      *       table, which is the step's acceptance gate.</li>
      * </ul>
      *
-     * <p><b>The pre19 half - APRON STALENESS</b> (docs/FARFIELD-WAVES.md,
+     * <p><b>The pre19 half - APRON STALENESS</b> (docs/unreleased/farfield/FARFIELD-WAVES.md,
      * "APRON STALENESS ANSWERED"). Since pre18 a column's mesh is a
      * function of its EIGHT NEIGHBOURS' stored contents as well as its
      * own, so the same submit that makes this column's mesh stale makes

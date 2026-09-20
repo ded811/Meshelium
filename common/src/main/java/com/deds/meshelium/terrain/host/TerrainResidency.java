@@ -176,7 +176,7 @@ public final class TerrainResidency {
     }
 
     // ------------------------------------------------------------------
-    // THE OWNERSHIP LEDGER (docs/FARFIELD-SEAM-DESIGN.md; shadow at seam
+    // THE OWNERSHIP LEDGER (docs/unreleased/farfield/FARFIELD-SEAM-DESIGN.md; shadow at seam
     // step 1, ENFORCING since steps 3-4).
     //
     // A per-Resident state byte written under LOCK at every ownership
@@ -564,7 +564,7 @@ public final class TerrainResidency {
     private static int awaitingScanRing;
     /**
      * Far-field admission budget per pump (the leaf-tier walker's
-     * 64/pump discipline, docs/FARFIELD-WAVES.md standing rules).
+     * 64/pump discipline, docs/unreleased/farfield/FARFIELD-WAVES.md standing rules).
      */
     private static final int FAR_ADMISSIONS_PER_PUMP = 64;
     /** Far promotion stops above this share of the region-id budget. */
@@ -579,7 +579,7 @@ public final class TerrainResidency {
 
     // ------------------------------------------------------------------
     // H2, THE CORNER GAP: positions Meshelium OWNS and nobody DRAWS
-    // (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre7, item H2)
+    // (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre7, item H2)
     //
     // The owner described the shape exactly: "its like the center is doing
     // regular cylindrical chunk loading, and the box that swaps the lod
@@ -670,7 +670,7 @@ public final class TerrainResidency {
      * collapsing again at altitude because by then the same sections are
      * more than three sections BELOW and the pre18 gate claims them.
      *
-     * <p>pre21 (docs/FARFIELD-WAVES.md, "FLY-UP ANSWERED (seventh
+     * <p>pre21 (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP ANSWERED (seventh
      * attempt: the core)"): the rule no longer stops at the 7x7 core. The
      * core exclusion was an inconsistency (the same section class was
      * covered at {@code |dx| = 4} and not at {@code |dx| = 3}) and, at
@@ -932,11 +932,11 @@ public final class TerrainResidency {
     private static long altitudeArmSweeps;
 
     // ------------------------------------------------------------------
-    // SEAM steps 3-4 (docs/FARFIELD-SEAM-DESIGN.md): THE COVERAGE SPLIT,
+    // SEAM steps 3-4 (docs/unreleased/farfield/FARFIELD-SEAM-DESIGN.md): THE COVERAGE SPLIT,
     // and the death of the handover bridge's clocks and caps.
     //
     // History, compressed (each wave's full argument lives in
-    // docs/FARFIELD-WAVES.md): pre6/H3 armed a PROVEN bridge off the
+    // docs/unreleased/farfield/FARFIELD-WAVES.md): pre6/H3 armed a PROVEN bridge off the
     // contested watch; pre11/M4 added a SPECULATIVE bridge off ring
     // geometry with a 1.2 s deadline, a 1024 population cap and a 768
     // per-frame cap; pre13/O6 counted the five ways the arming chain
@@ -1374,7 +1374,7 @@ public final class TerrainResidency {
      * Immutable counter snapshot for tests and the debug line.
      *
      * <h2>Far sections are half in here, and the split is deliberate
-     * (W4 review requirement, docs/FARFIELD-WAVES.md)</h2>
+     * (W4 review requirement, docs/unreleased/farfield/FARFIELD-WAVES.md)</h2>
      * <p>A far section is retained-shaped but it is NOT a near section,
      * so it is deliberately absent from every COUNT here and unavoidably
      * present in every RESOURCE total. Reading one of these numbers
@@ -2618,7 +2618,7 @@ public final class TerrainResidency {
                     return;
                 }
             }
-            // SEAM step 4, THE COVERAGE PARK (docs/FARFIELD-SEAM-DESIGN.md
+            // SEAM step 4, THE COVERAGE PARK (docs/unreleased/farfield/FARFIELD-SEAM-DESIGN.md
             // §2, freeOrHoldLocked). Reaching here means vanilla's copy is
             // going for good. If the position is FAR-DOMAIN under the
             // published coverage geometry, this free would unbind a
@@ -3210,7 +3210,7 @@ public final class TerrainResidency {
             return;
         }
         if (!farEverArmed) {
-            // Zero-cost-off (docs/FARFIELD-WAVES.md standing rules): never
+            // Zero-cost-off (docs/unreleased/farfield/FARFIELD-WAVES.md standing rules): never
             // emit a FarFieldResidency symbol in a session where the master
             // switch was never on, so the walker and the sprite resolver
             // never class-load. FarFieldConfig is already loaded in every
@@ -3551,7 +3551,7 @@ public final class TerrainResidency {
      * section-Y gate, so that direction is reachable).</p>
      *
      * <h2>O7 — the same hole on the axis this sweep never modelled
-     * (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre13, item O7)</h2>
+     * (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre13, item O7)</h2>
      * <p>"minecraft unloads chunks when you fly up that normally you
      * couldnt see due to the circle of fog, but since the lod increases
      * that, you can." <b>Vanilla does not unload anything when you fly
@@ -3604,7 +3604,7 @@ public final class TerrainResidency {
      * where no report exists, so it keeps vanilla's answer.</p>
      *
      * <h2>P2 — the arm was wrong, and the mask was only ever half the
-     * answer (docs/FARFIELD-WAVES.md, "P2 AND P9 ANSWERED")</h2>
+     * answer (docs/unreleased/farfield/FARFIELD-WAVES.md, "P2 AND P9 ANSWERED")</h2>
      * <p>Two corrections to the block above, both from the owner's pre14
      * report.</p>
      * <p><b>The arm.</b> O7 armed on the CAMERA's own column — nothing of
@@ -3636,7 +3636,7 @@ public final class TerrainResidency {
      * to rebuild the geometry that did not.</p>
      *
      * <h2>S2 — the arm was right and the PREDICATE was the Y disjunct of
-     * an OR (docs/FARFIELD-WAVES.md, "S2 ANSWERED")</h2>
+     * an OR (docs/unreleased/farfield/FARFIELD-WAVES.md, "S2 ANSWERED")</h2>
      * <p>O7, P2 and R6 all keyed their per-section coverage to
      * {@code camSy - sy > }{@value #VANILLA_ADVANCED_CULL_SECTIONS},
      * reading vanilla's advanced-culling flip as a Y test. It is not one.
@@ -3669,7 +3669,7 @@ public final class TerrainResidency {
      * says whether it is ever needed.</p>
      *
      * <h2>pre21 — the core, and vanilla's vertical reach
-     * (docs/FARFIELD-WAVES.md, "FLY-UP ANSWERED (seventh attempt: the
+     * (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP ANSWERED (seventh attempt: the
      * core)")</h2>
      * <p>The owner reproduced the layer at render distance 2, and at rd 2
      * the whole 5x5 disc is inside the 7x7 core the S2 rule excluded, so
@@ -3791,7 +3791,7 @@ public final class TerrainResidency {
         // percentiles. Hysteresis on top, so the two edges are 32 blocks
         // apart and no ordinary flight path chatters across them.
         //
-        // R6: THE ARM, RE-KEYED (docs/FARFIELD-WAVES.md, "R6 AND R7
+        // R6: THE ARM, RE-KEYED (docs/unreleased/farfield/FARFIELD-WAVES.md, "R6 AND R7
         // ANSWERED"). pre15 keyed it on the p90 — the TOP of the terrain
         // band — and the owner's pre17 report is the arithmetic of why
         // that is a window, not a fix: vanilla flips each section to the
@@ -3851,7 +3851,7 @@ public final class TerrainResidency {
             }
         }
         altitudeArmLatched = highCamera;
-        // S6: S2's SECOND ARM IS GONE (docs/FARFIELD-WAVES.md, "FLY-UP
+        // S6: S2's SECOND ARM IS GONE (docs/unreleased/farfield/FARFIELD-WAVES.md, "FLY-UP
         // ANSWERED"). It was `camSy > p90` over the whole disc, latched
         // with two sections of hysteresis, and it is the fifth attempt's
         // residual: p90 is a DISC-WIDE statistic, so over an ocean beside
@@ -5489,7 +5489,7 @@ public final class TerrainResidency {
     }
 
     // ------------------------------------------------------------------
-    // Far field, wave W3 (docs/FARFIELD-WAVES.md; plug points from
+    // Far field, wave W3 (docs/unreleased/farfield/FARFIELD-WAVES.md; plug points from
     // FARFIELD-CODEBASE-SEAM.md). Far entries are retained-shaped
     // residents in their own map — see the farResident javadoc.
     // ------------------------------------------------------------------
@@ -5580,7 +5580,7 @@ public final class TerrainResidency {
 
     /**
      * W3 demote entry: release one chunk column's far sections (the
-     * walker's ring-exit path — docs/FARFIELD-WAVES.md, both-direction
+     * walker's ring-exit path — docs/unreleased/farfield/FARFIELD-WAVES.md, both-direction
      * rule). Render thread, takes LOCK itself; called by
      * {@code FarFieldResidency} OUTSIDE the pump's lock window.
      *

@@ -48,7 +48,7 @@ import net.minecraft.world.level.material.FluidState;
  *     {@link ColumnSnapshot} of a chunk the client still holds -
  *     immutable because it is OUR copy. This is what takes the ~900 us
  *     live walk off the game thread and leaves a ~40 us capture in its
- *     place (docs/FARFIELD-PERF-BRIEF.md section 2).</li>
+ *     place (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 2).</li>
  * </ul>
  * The two differ in exactly three places, all of them named at their
  * site: a live pin's record stays {@code LIVE_DIRTY} rather than going

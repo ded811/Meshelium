@@ -87,17 +87,36 @@ public class MesheliumAdvancedScreen extends Screen {
     private ScrollableLayout scrollArea;
 
     /**
-     * True when the backend gate means none of this can take effect. Read
-     * once at construction, exactly like the main screen: the gate cannot
-     * change without a restart, so re-reading it per frame would only invite
-     * a row that disagrees with its own tooltip.
+     * True when the backend gate means Meshelium's OWN chunk path is not
+     * running. Read once at construction, exactly like the main screen: the
+     * gate cannot change without a restart, so re-reading it per frame
+     * would only invite a row that disagrees with its own tooltip.
+     *
+     * <p>Under Sodium this is true and two rows are live anyway: the
+     * Sodium drawer reads the sub-pixel cull per frame and the GPU timers
+     * read Debug Stat Logging, so those key on
+     * {@link MesheliumGate#sodiumAdapterArmed()} as well (owner report
+     * 2026-09-08 (beta.8)).
      */
     private final boolean gateLocked;
+
+    /**
+     * Sodium is installed, so Meshelium's own chunk builder is standing
+     * aside and the rows that only it reads are not built here at all.
+     *
+     * <p>Read ONCE, beside {@link #gateLocked} and for the same reason:
+     * the gate cannot change without a restart, so re-reading it per frame
+     * could only ever produce a row that disagrees with its own tooltip.
+     * A screen built while the gate was still UNKNOWN is reachable only
+     * from the main screen, which heals itself first.
+     */
+    private final boolean sodium;
 
     public MesheliumAdvancedScreen(Screen parent) {
         super(Component.translatable("meshelium.options.advanced.title"));
         this.parent = parent;
         this.gateLocked = MesheliumGate.state() != MesheliumGate.State.VULKAN_MESH_SHADERS;
+        this.sodium = MesheliumGate.state() == MesheliumGate.State.SODIUM_PRESENT;
     }
 
     @Override
@@ -117,7 +136,12 @@ public class MesheliumAdvancedScreen extends Screen {
         // screen it appears on cannot show. Only properties that lock a row
         // HERE count.
         boolean statsOverridden = System.getProperty("meshelium.debugStats") != null;
-        boolean greedyOverridden = System.getProperty("meshelium.greedyMeshing") != null;
+        // Under Sodium the greedy-meshing row is not built, so its property
+        // must not raise a banner over a row that is not on screen. Same
+        // rule as the main screen's census, and the reason retention is
+        // absent from both.
+        boolean greedyOverridden = !this.sodium
+                && System.getProperty("meshelium.greedyMeshing") != null;
         if (statsOverridden || greedyOverridden) {
             MultiLineTextWidget banner = new MultiLineTextWidget(
                     Component.translatable("meshelium.options.dev_override"), this.font);
@@ -127,8 +151,30 @@ public class MesheliumAdvancedScreen extends Screen {
         }
 
         if (this.gateLocked) {
+            // THREE sentences, because there are three situations and two
+            // of them used to share a wrong one.
+            //
+            // The stock banner says Meshelium is not running, which with
+            // the adapter drawing Sodium's chunks is false. But the Sodium
+            // banner says only the settings that still apply are SHOWN, and
+            // that is false in the other two Sodium shapes: subPixelLive
+            // and statsLive are both (!gateLocked || sodiumAdapterArmed()),
+            // so on Sodium-declined and Sodium-on-OpenGL two of the rows on
+            // screen are grey. A banner asserting everything shown applies,
+            // over two dead rows, is exactly the honesty fault the Sodium
+            // twin was added to fix.
+            //
+            // So: standalone keeps the plain sentence; Sodium with the
+            // adapter drawing gets the Sodium one; Sodium with it not
+            // drawing gets its own, which says Meshelium is not drawing,
+            // that the rows here are held too, and points at the main
+            // screen for why.
+            String lockedKey = !this.sodium ? "meshelium.options.advanced.locked"
+                    : MesheliumGate.sodiumAdapterArmed()
+                            ? "meshelium.options.advanced.locked.sodium"
+                            : "meshelium.options.advanced.locked.sodium_off";
             MultiLineTextWidget locked = new MultiLineTextWidget(
-                    Component.translatable("meshelium.options.advanced.locked")
+                    Component.translatable(lockedKey)
                             .withStyle(ChatFormatting.YELLOW), this.font);
             locked.setMaxWidth(BANNER_WIDTH);
             locked.setCentered(true);
@@ -140,6 +186,13 @@ public class MesheliumAdvancedScreen extends Screen {
         // nothing needs doing beyond writing it: sections already compiled are
         // never recompiled on their own, and a setting that appears to do
         // nothing until the player walks away and back is a bug report.
+        //
+        // NOT BUILT UNDER SODIUM (2026-09-16), like the two leaf tiers, the
+        // plant cull, idle trim and the duplicate-memory row below: every
+        // one of them is read by Meshelium's OWN chunk builder, which does
+        // not run while Sodium builds the chunks. The banner above names
+        // them, which is what the greyed rows were providing.
+        if (!this.sodium) {
         CycleButton<Boolean> greedy = CycleButton.onOffBuilder(config.greedyMeshing)
                 .create(Component.translatable("meshelium.options.greedy_meshing"), (b, value) -> {
                     config.greedyMeshing = value;
@@ -166,16 +219,28 @@ public class MesheliumAdvancedScreen extends Screen {
         plantCull.setTooltip(tip("meshelium.options.tooltip.plant_cull",
                 "meshelium.options.applies.now"));
         rows.addChild(plantCull);
+        }
 
+        // Live under the Sodium adapter too: SodiumTerrainDrawer reads
+        // subPixelCullChunks() into the scene UBO every frame, exactly as
+        // the standalone drawer does. The plant cull is standalone-only,
+        // and since 2026-09-16 is not built here at all under Sodium.
+        boolean subPixelLive = !this.gateLocked || MesheliumGate.sodiumAdapterArmed();
         CullDistanceSlider subPixelCull = new CullDistanceSlider(
                 "meshelium.options.detail_cull.label",
                 () -> MesheliumConfig.get().subPixelCullChunks,
                 chunks -> {
                     config.subPixelCullChunks = chunks;
                     config.save();
-                }, !this.gateLocked);
-        subPixelCull.setTooltip(tip("meshelium.options.tooltip.detail_cull",
-                "meshelium.options.applies.now"));
+                }, subPixelLive);
+        // Its own held sentence rather than the generic one: this row is
+        // NOT held because Sodium builds the terrain (it is live exactly
+        // when Sodium is installed and Meshelium is drawing), it is held
+        // because the adapter is not drawing. applies.sodium would say the
+        // opposite of the truth here.
+        subPixelCull.setTooltip(tip(!subPixelLive, "meshelium.options.tooltip.detail_cull",
+                "meshelium.options.applies.now",
+                "meshelium.options.applies.sodium_gpu_held"));
         rows.addChild(subPixelCull);
 
         // The two leaf-detail tiers: BUILD-time filters, unlike the two
@@ -187,6 +252,7 @@ public class MesheliumAdvancedScreen extends Screen {
         // a slider deliberately never does. Smart first, Solid directly
         // under it: reading order is escalation order (Smart keeps the
         // look, Solid trades it), and the pair shares one walker.
+        if (!this.sodium) {
         CullDistanceSlider smartLeaves = new CullDistanceSlider(
                 "meshelium.options.smart_leaves.label",
                 () -> MesheliumConfig.get().smartLeavesChunks,
@@ -208,6 +274,7 @@ public class MesheliumAdvancedScreen extends Screen {
         solidLeaves.setTooltip(tip("meshelium.options.tooltip.solid_leaves",
                 "meshelium.options.applies.new_builds"));
         rows.addChild(solidLeaves);
+        }
 
         // 1.6: THE ONLY DOOR TO FAR TERRAIN, held shut by one constant.
         // This button is the single reachable entry to
@@ -242,6 +309,7 @@ public class MesheliumAdvancedScreen extends Screen {
         // main screen for the same reason Duplicate Terrain Memory does -
         // the default is right for effectively everyone, and the one reason
         // to touch it is diagnosing a mod conflict around VRAM.
+        if (!this.sodium) {
         CycleButton<Boolean> trim = CycleButton.onOffBuilder(config.arenaTrim)
                 .create(Component.translatable("meshelium.options.arena_trim"), (b, value) -> {
                     config.arenaTrim = value;
@@ -276,6 +344,7 @@ public class MesheliumAdvancedScreen extends Screen {
         suppress.setTooltip(tip("meshelium.options.tooltip.suppress_vanilla",
                 "meshelium.options.applies.now"));
         rows.addChild(suppress);
+        }
 
         CycleButton<Boolean> stats = CycleButton.onOffBuilder(config.debugStats)
                 .create(Component.translatable("meshelium.options.debug_stats"), (b, value) -> {
@@ -283,9 +352,15 @@ public class MesheliumAdvancedScreen extends Screen {
                     config.save();
                 });
         stats.setWidth(WIDGET_WIDTH);
-        stats.active = !this.gateLocked && !statsOverridden;
-        stats.setTooltip(tip("meshelium.options.tooltip.debug_stats",
-                "meshelium.options.applies.now"));
+        // Live under the Sodium adapter too: its GPU pass timers log
+        // through MesheliumGpuTimers, which reads debugStatsEnabled().
+        boolean statsLive = !this.gateLocked || MesheliumGate.sodiumAdapterArmed();
+        stats.active = statsLive && !statsOverridden;
+        // Same reason as the sub-pixel row above: held because the adapter
+        // is not drawing, not because Sodium builds the terrain.
+        stats.setTooltip(tip(!statsLive, "meshelium.options.tooltip.debug_stats",
+                "meshelium.options.applies.now",
+                "meshelium.options.applies.sodium_gpu_held"));
         rows.addChild(stats);
 
         // Active on EVERY backend, unlike the rows above: this one is about
@@ -335,8 +410,36 @@ public class MesheliumAdvancedScreen extends Screen {
      * only truthful annotation.
      */
     private Tooltip tip(String descriptionKey, String appliesKey) {
-        return Tooltip.create(withSemantics(Component.translatable(descriptionKey),
-                this.gateLocked ? "meshelium.options.applies.vulkan" : appliesKey));
+        return tip(this.gateLocked, descriptionKey, appliesKey);
+    }
+
+    /**
+     * A held row's semantics line names WHY it is held. Under Sodium that
+     * is never "Needs the Vulkan renderer": the game may well be on Vulkan,
+     * and the row is held because Sodium builds the terrain (owner report
+     * 2026-09-08 (beta.8)).
+     */
+    private Tooltip tip(boolean locked, String descriptionKey, String appliesKey) {
+        return tip(locked, descriptionKey, appliesKey, "meshelium.options.applies.sodium");
+    }
+
+    /**
+     * As above, with the row's OWN held-under-Sodium sentence.
+     *
+     * <p>Two rows here are live exactly when the Sodium adapter is drawing
+     * (the sub-pixel cull, read into the scene UBO every frame; debug stat
+     * logging, read by the GPU pass timers). The default sentence, "held
+     * while Sodium builds the terrain: this only changes how Meshelium
+     * builds and stores its own", is the opposite of true for them - they
+     * are the rows that follow Sodium's draw rather than Meshelium's own
+     * builder. They pass applies.sodium_gpu_held instead.
+     */
+    private Tooltip tip(boolean locked, String descriptionKey, String appliesKey,
+            String sodiumHeldKey) {
+        String semantics = !locked ? appliesKey
+                : MesheliumGate.state() == MesheliumGate.State.SODIUM_PRESENT ? sodiumHeldKey
+                : "meshelium.options.applies.vulkan";
+        return Tooltip.create(withSemantics(Component.translatable(descriptionKey), semantics));
     }
 
     private static Component withSemantics(MutableComponent description, String semanticsKey) {

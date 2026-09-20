@@ -1,0 +1,42 @@
+// Copyright (C) 2026 Ded811
+// SPDX-License-Identifier: LGPL-3.0-only
+#version 460
+//
+// NEXT (c) half-resolution occlusion depth, pass D: the full-screen
+// triangle the depth downsample rasters. MESH stage, because
+// MesheliumShaderCompiler has no KIND_VERTEX (MSC:43-47) - there is no
+// vertex kind in this backend at all, so a screen-filling primitive is a
+// one-workgroup mesh shader.
+//
+// WHY THIS PASS EXISTS. 0s measured the two box rasters as PIXEL-bound:
+// the same scene costs 0.133 ms at 1080p and 0.211 ms at 1440p, and 0.60 ms
+// when every box passes. Rastering the boxes against a QUARTER-area depth
+// buffer is the cheapest way to buy that back, and this pass is what makes
+// the quarter-area buffer: one min-of-window reduction of vanilla's main
+// depth (depth_downsample.frag).
+//
+// z = 0.5: never on a clip boundary (the depth test is ALWAYS; gl_FragDepth
+// is the value). Revision 2 of the plan put the triangle at z = 0, exactly
+// ON Vulkan's inclusive clip boundary 0 <= z_c <= w_c; had any
+// implementation ever clipped it the half-res depth would have stayed at
+// the pass clear (0.0 = reversed-Z far), every box would have passed, and
+// only the suite's NOT-DEGENERATE threshold would have noticed - the
+// "costs frame time, never a pixel" failure class. Half the range of
+// margin costs nothing.
+//
+// The pipeline culls NONE, so winding is irrelevant; the fragment stage
+// writes gl_FragDepth under depthCompareOp ALWAYS, so this z is never the
+// value that lands.
+
+#extension GL_EXT_mesh_shader : require
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(triangles, max_vertices = 3, max_primitives = 1) out;
+
+void main() {
+    SetMeshOutputsEXT(3u, 1u);
+    gl_MeshVerticesEXT[0].gl_Position = vec4(-1.0, -1.0, 0.5, 1.0);
+    gl_MeshVerticesEXT[1].gl_Position = vec4(3.0, -1.0, 0.5, 1.0);
+    gl_MeshVerticesEXT[2].gl_Position = vec4(-1.0, 3.0, 0.5, 1.0);
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0u, 1u, 2u);
+}

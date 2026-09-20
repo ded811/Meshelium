@@ -87,6 +87,28 @@ public final class MesheliumVulkanState {
         return arenaLimits;
     }
 
+    /**
+     * Both features the batched Sodium draw needs to skip its binary
+     * search: {@code multiDrawIndirect} (so one indirect command can carry
+     * many draws) and {@code shaderDrawParameters} (so the mesh shader can
+     * read {@code gl_DrawID} and index its run directly).
+     *
+     * <p>One flag rather than two because neither is any use alone here.
+     * Both are probed before being requested — asking for an unsupported
+     * feature fails device creation, and the rule is never to break a boot
+     * vanilla could finish — so false simply means the batched path falls
+     * back to searching the table.
+     */
+    private static volatile boolean drawIndirectSupported;
+
+    public static boolean drawIndirectSupported() {
+        return drawIndirectSupported;
+    }
+
+    public static void setDrawIndirectSupported(boolean supported) {
+        drawIndirectSupported = supported;
+    }
+
     private static volatile boolean memoryBudgetSupported;
     /** True when the device advertised VK_EXT_memory_budget. */
     public static boolean memoryBudgetSupported() {
@@ -110,6 +132,79 @@ public final class MesheliumVulkanState {
 
     public static void setConditionalRenderingSupported(boolean supported) {
         conditionalRenderingSupported = supported;
+    }
+
+    private static volatile boolean conservativeRasterizationSupported;
+    private static volatile boolean conservativeRasterizationEnabled;
+    private static volatile ConservativeRasterCaps conservativeRasterCaps;
+
+    /**
+     * NEXT (c) part B: the device OFFERED
+     * VK_EXT_conservative_rasterization. Probed on every boot and logged,
+     * whether or not it was requested, so
+     * docs/unreleased/sodium/MEASUREMENTS.md's UNVERIFIED entry 6 - "does
+     * the RX 9070 XT's driver expose it at all" - is answered by any run.
+     */
+    public static boolean conservativeRasterizationSupported() {
+        return conservativeRasterizationSupported;
+    }
+
+    public static void setConservativeRasterizationSupported(boolean supported) {
+        conservativeRasterizationSupported = supported;
+    }
+
+    /**
+     * The device was CREATED with the extension because
+     * {@code meshelium.occlusion.conservativeRaster} was true at device
+     * creation. A BOOT-TIME lever on purpose: appending an extension is a
+     * change to {@code VkDeviceCreateInfo}, and with the property absent
+     * every shipped boot's structure stays byte-identical. There is no
+     * runtime setter; the box pipelines bake the mode.
+     */
+    public static boolean conservativeRasterizationEnabled() {
+        return conservativeRasterizationEnabled;
+    }
+
+    public static void setConservativeRasterizationEnabled(boolean enabled) {
+        conservativeRasterizationEnabled = enabled;
+    }
+
+    /**
+     * What the device reports about overestimate mode. Null when the
+     * extension is absent (never queried); a zeroed record would be
+     * "reported as zero", and the ArenaLimits rule says a number the driver
+     * did not give us is NOT a number.
+     *
+     * @param primitiveOverestimationSize how far, in pixels, the
+     *        implementation uncertainty region already extends
+     * @param maxExtraPrimitiveOverestimationSize the extra the pipeline may
+     *        ask for on top
+     * @param extraPrimitiveOverestimationSizeGranularity the step that
+     *        extra is quantised to
+     * @param degenerateTrianglesRasterized whether an edge-on face - which
+     *        projects to a degenerate triangle and covers no full-res
+     *        sample either - still produces fragments. LOGGED, never relied
+     *        on: the coverage argument must not depend on it.
+     * @param fullyCoveredFragmentShaderInputVariable whether
+     *        {@code gl_FragFullyCoveredNV}'s equivalent exists (unused here)
+     * @param conservativeRasterizationPostDepthCoverage whether coverage is
+     *        computed after the depth test (unused here)
+     */
+    public record ConservativeRasterCaps(float primitiveOverestimationSize,
+            float maxExtraPrimitiveOverestimationSize,
+            float extraPrimitiveOverestimationSizeGranularity,
+            boolean degenerateTrianglesRasterized,
+            boolean fullyCoveredFragmentShaderInputVariable,
+            boolean conservativeRasterizationPostDepthCoverage) {
+    }
+
+    /** Null when the extension is absent; see {@link ConservativeRasterCaps}. */
+    public static ConservativeRasterCaps conservativeRasterCaps() {
+        return conservativeRasterCaps;
+    }
+
+    public static void setConservativeRasterCaps(ConservativeRasterCaps caps) {
+        conservativeRasterCaps = caps;
     }
 
     /**

@@ -1,0 +1,77 @@
+# Byte-identity baseline for tools/shader_parity.sh: sha256 (first 16 hex)
+# of every shipped shader variant at the macro defaults the Java side
+# injects. Taken 2026-09-07 on the tree at commit 02550e2 with Vulkan SDK
+# 1.4.357.0 (glslc + spirv-val, --target-env vulkan1.2, no -O), before
+# the D-023 stage 2-3 shader edits; GPU-VISIBILITY-CONTRACT.md 12.1.
+# Every row here must be unchanged after those edits: new code appears
+# only under MESHELIUM_SODIUM_TASK (terrain.task, terrain.mesh) and
+# MESHELIUM_SODIUM (the raster shaders), which every row below sets to 0.
+# Rows the script prints that are NOT here are the new variants; they must
+# compile and validate but have no baseline until the coordinator records
+# one after the GPU partition lands.
+6fbbe1d105661b82  task_std
+e4e517578f32fd47  mesh_task_std
+34e8b12da0b2ee3a  frag_std
+4601d2385cfb956f  task_ext
+e4e517578f32fd47  mesh_task_ext
+62602e301be21495  mesh_cpu
+34e8b12da0b2ee3a  frag_cpu
+ff36e9ddd7f61522  mesh_trans
+34e8b12da0b2ee3a  frag_trans
+a6778b2c51af9944  mesh_task_unpacked
+fb6d28ff680aaeb6  frag_unpacked
+df56d85c7923c83e  mesh_sodium_drawid
+255501d3926950dc  frag_sodium
+a3bfad743f8e82e7  frag_sodium_nodiscard
+0a6fc3b4f7ef6295  region_raster_std
+483742f1d8fc6ffa  section_task_std
+b0947d078d36e371  section_mesh_std
+e55b12b92b53be32  box_frag_std
+cd1500dae4ec7902  region_raster_ext
+42cfa1f16e2464bf  section_task_ext
+7f46d31b5edd1919  section_mesh_mark
+e80e0207e86a6fa6  box_frag_mark
+# D-023 stage 2-3 new variants, recorded 2026-09-07 on the integrated tree
+# (terrain: SODIUM=1 TASK_CULL=1 SODIUM_TASK=1 BATCH=0 DRAWID=0; rasters:
+# SODIUM=1 LISTS_SSBO=1 MARK_NEW=0). frag_sodium_task(_nodiscard) equal the
+# stage-1 frag rows and box_frag_sodium equals box_frag_std by construction.
+a9542095594d7c31  task_sodium
+a72f40083b5b56da  mesh_sodium_task
+255501d3926950dc  frag_sodium_task
+a3bfad743f8e82e7  frag_sodium_task_nodiscard
+5a9c11b7ed877f33  region_raster_sodium
+c0216471b8082be4  section_task_sodium
+b58da18685d801a2  section_mesh_sodium
+e55b12b92b53be32  box_frag_sodium
+# 2026-09-13 (0q-0r, D-025): task_sodium and mesh_sodium_task re-recorded
+# after the one-draw-per-group search, the measurement-only DIAG_SKIP
+# flags and the RegionCount push field (the SODIUM_TASK arm only; every
+# standalone row and the stage-1 list rows above are unchanged). New rows:
+# the frustum lever's gpu mode on the list path (MESH_FRUSTUM=1) and the
+# packed section raster (OCC_BOXES_PER_WG=4); section_task_sodium and
+# section_mesh_sodium at the default 1 are byte-identical to before.
+7a22bf23dcecab15  mesh_sodium_drawid_frustum
+726a2b8f665aabd3  section_task_sodium_x4
+06769a7e86519037  section_mesh_sodium_x4
+# 2026-09-15 (NEXT (c), D-027): the half-resolution occlusion depth. The
+# raster rows above are unchanged - every new line in region_raster.mesh and
+# section_raster.mesh is under MESHELIUM_OCC_HALFRES / _FLAT, which the
+# shipped variants define 0 - and these 16 are the lever's own variants
+# (_half = the slope-bias arm, _flat = the nearest-corner arm) plus the two
+# new downsample shaders.
+c3142d21babed9ca  region_raster_std_half
+554c79e37ca21098  region_raster_ext_half
+f42736b29aa55670  section_mesh_std_half
+d989af018f9f5d20  section_mesh_mark_half
+b3f286829cdd6bb5  region_raster_sodium_half
+a99115e6255f1454  section_mesh_sodium_half
+fce6d32871e19937  section_mesh_sodium_x4_half
+70fd5846e9c4bef1  region_raster_sodium_flat
+0aea3d3ea3e66283  section_mesh_sodium_flat
+696f27a1daa4d3b8  section_mesh_sodium_x4_flat
+c27279574665f6ad  region_raster_std_flat
+64e568e8492ec675  region_raster_ext_flat
+46d7e610e90d431d  section_mesh_std_flat
+129fb2cef0c1e03c  section_mesh_mark_flat
+a432120f66999bc1  depth_downsample_mesh
+26a099d8956efc6f  depth_downsample_frag

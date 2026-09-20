@@ -1,3 +1,17 @@
+# ----------------------------------------------------------------------
+# THIS IS THE PRIVATE REPO'S .gitignore. DO NOT COPY IT TO THE PUBLIC REPO.
+#
+# The public copy has an extra PUBLIC-REPO-ONLY block at the end that hides
+# docs/unreleased/ and 19 internal design documents - 53 files in all. This
+# file does NOT have it, so copying this repo wholesale into the public one
+# replaces that block and publishes every one of them, permanently.
+#
+# To publish, build the tree with the script instead of by hand:
+#     python tools/prepare-public.py <output-dir> --compare <public-checkout>
+# It copies only what belongs in public, writes the correct .gitignore, and
+# refuses to hand the tree over if anything held back slipped in.
+# ----------------------------------------------------------------------
+
 # Build output and caches
 .gradle/
 build/

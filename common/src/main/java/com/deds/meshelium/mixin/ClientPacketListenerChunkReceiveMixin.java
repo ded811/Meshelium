@@ -19,7 +19,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 /**
  * The RECEIVE-side extraction seam (FARFIELD-VANILLA-SEAM.md section 1.4
  * and its recommended-seams item 4), added in pre2 for defect B1 —
- * "a lot of gaps and missing chunks" (docs/FARFIELD-WAVES.md, OWNER
+ * "a lot of gaps and missing chunks" (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER
  * PLAYTEST OF pre1).
  *
  * <h2>Why this seam and not more unload-side machinery</h2>

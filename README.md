@@ -61,6 +61,20 @@ Minecraft starts up in the old drawing mode, called OpenGL. Meshelium only works
 
 Skip this and it looks like the mod did nothing at all. If that happens, Meshelium puts a message on your screen with a button that does the whole thing for you.
 
+## Using Sodium?
+
+They work together now. Sodium builds the chunks and Meshelium draws them with
+mesh shaders. Install both and it happens on its own - there is nothing to
+switch on.
+
+Use **Sodium 0.9.2-beta.1**. Meshelium plugs into parts of Sodium that were
+never meant for other mods to touch, so a different version may not fit. The
+Meshelium settings screen shows which version you have and says whether it is
+the one this build was made for.
+
+If you would rather Sodium drew everything by itself, start the game with
+`-Dmeshelium.sodium.adapter=false`.
+
 ## Playing online?
 
 **Add [Bobby](https://modrinth.com/mod/bobby) to your own mods folder, next to Meshelium.**

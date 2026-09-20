@@ -13,6 +13,8 @@ import com.deds.meshelium.terrain.host.SectionBuildTap;
 import com.deds.meshelium.terrain.host.TerrainResidency;
 import com.deds.meshelium.vk.MesheliumGpuTimers;
 import com.deds.meshelium.vk.TerrainDrawer;
+import com.deds.meshelium.vk.TerrainOcclusion;
+import com.deds.meshelium.vk.VisibleSetSample;
 
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
@@ -229,6 +231,17 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
 
             // ---- 1.4.0: the phase-B CPU skip (occlusion still armed) ----
             assertPhaseBCpuSkip(context, singleplayer);
+
+            // ---- NEXT (c1): the WALKING leg, the standalone twin of
+            // 97_19. It must sit here and nowhere else: armHalfRes only
+            // runs on occlusion frames, and the clearProperty below ends
+            // the occlusion window. It is also after assertHalfResBootTime
+            // (reached from assertGpuTimersLive) and after
+            // assertHalfResSupersetStandalone (inside
+            // assertHiddenWallOcclusion), both of which assert
+            // halfResArmSkips() != 0 -> throw ABSOLUTELY, so a leg that may
+            // drive skips up must not precede them.
+            assertHalfResArmsWhileWalking(context, singleplayer);
 
             // Occlusion arming ends here: everything after this point runs
             // at the shipped 1.0.0 default, which is occlusion OFF.
@@ -1079,7 +1092,76 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
             throw new AssertionError("GPU timers read frames but phase A is absent - "
                     + "the point mask/readback pairing is broken");
         }
+        assertHalfResBootTime(context);
         assertNoErrors();
+    }
+
+    /**
+     * NEXT (c): with the lever armed by PROPERTY, the session's FIRST
+     * occlusion frames must already be half-resolution.
+     *
+     * <p>Why this is the assertion that matters on this host: the half-res
+     * pipelines share the FULL-RES descriptor-set and pipeline layouts, and
+     * the standalone's only other {@code ensurePipelines} call site is
+     * INSIDE pass 1. If the half ensure did not begin with the full-res one
+     * it would build at the arm with {@code pipelineLayout == 0L} - a VUID
+     * under validation and a session-long latch without it - and a leg that
+     * only ever flipped the lever at runtime would never see it, because by
+     * then pass 1 has run. This reads it by COUNT, on the first frames.</p>
+     *
+     * <p>With the property absent the mirror-image assertion runs: no half
+     * frame, and no downsample pass, or the property leaked.</p>
+     */
+    private static void assertHalfResBootTime(ClientGameTestContext context) {
+        boolean armed = Boolean.getBoolean(TerrainOcclusion.PROPERTY_HALF_RES);
+        long halfBefore = TerrainOcclusion.halfResFrames();
+        long occBefore = TerrainDrawer.occlusionFrames();
+        if (!armed) {
+            context.waitTicks(20);
+            if (TerrainOcclusion.halfResFrames() != halfBefore) {
+                throw new AssertionError("half-res frames ran with -D"
+                        + TerrainOcclusion.PROPERTY_HALF_RES + " absent (" + halfBefore + " -> "
+                        + TerrainOcclusion.halfResFrames() + "): a property leak");
+            }
+            long down = MesheliumGpuTimers.lastPassNanosSnapshot()[
+                    MesheliumGpuTimers.PASS_DOWNSAMPLE];
+            if (down != -1L) {
+                throw new AssertionError("the downsample pass timed " + down + " ns with the "
+                        + "half-res lever off; pass D must not be recorded at all");
+            }
+            return;
+        }
+        context.waitFor(client -> TerrainOcclusion.halfResFrames() > halfBefore,
+                DRAW_TIMEOUT_TICKS);
+        if (TerrainOcclusion.halfResError() != null) {
+            throw new AssertionError("the half-res path latched on the session's first "
+                    + "occlusion frames: " + TerrainOcclusion.halfResError());
+        }
+        long halfRan = TerrainOcclusion.halfResFrames() - halfBefore;
+        long occRan = TerrainDrawer.occlusionFrames() - occBefore;
+        if (halfRan < occRan - 1L) {
+            throw new AssertionError("only " + halfRan + " of the first " + occRan
+                    + " standalone occlusion frames ran half-res; the first arm must build the "
+                    + "half pipelines AFTER ensurePipelines, not with a zero layout");
+        }
+        if (TerrainOcclusion.halfResArmSkips() != 0L
+                || TerrainOcclusion.halfResAllocationFailures() != 0L) {
+            throw new AssertionError("half-res armSkips=" + TerrainOcclusion.halfResArmSkips()
+                    + " allocationFailures=" + TerrainOcclusion.halfResAllocationFailures()
+                    + " on the standalone boot; a session whose arm skipped is red");
+        }
+        long down = MesheliumGpuTimers.lastPassNanosSnapshot()[
+                MesheliumGpuTimers.PASS_DOWNSAMPLE];
+        if (down <= 0L) {
+            throw new AssertionError("the GPU timers see no downsample pass (" + down
+                    + " ns) while the half-res lever is on");
+        }
+        System.out.println("[Meshelium] half-res boot-time: " + halfRan + "/" + occRan
+                + " first occlusion frames at " + TerrainOcclusion.halfResWidth() + "x"
+                + TerrainOcclusion.halfResHeight() + ", downsample=" + down / 1000.0
+                + " us, inflateK=" + TerrainOcclusion.halfResInflateK() + " nearR="
+                + TerrainOcclusion.halfResNearR() + ", projection mismatches="
+                + TerrainOcclusion.halfResArmProjectionMismatches());
     }
 
     // ------------------------------------------------------------------
@@ -1116,6 +1198,9 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
      * Turn the camera 180° (the residency test's tp-command walk pattern,
      * as a relative-yaw rotation) and require the dispatched-region SET to
      * change — GPU culling must respond to the camera, not just exist.
+     *
+     * <p>NEXT (c) note: a yaw change alone keeps the projection canonical,
+     * so the half-res arm is unaffected here.</p>
      */
     private static void assertCullingRespondsToCamera(ClientGameTestContext context,
             TestSingleplayerContext singleplayer) {
@@ -1181,8 +1266,28 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
     private static void assertHiddenWallOcclusion(ClientGameTestContext context,
             TestSingleplayerContext singleplayer) {
         var server = singleplayer.getServer();
-        // Pin the view, then raise the wall dead ahead (south, +Z).
+        // NEXT (c): TELEPORT to a pose the half-res near force cannot reach
+        // across, instead of asserting the incidental one. The old line was
+        // "tp @s ~ ~ ~ 0 0" - the POSITION is unchanged, i.e. wherever the
+        // harness spawned, so a pose assertion here would have passed or
+        // failed by luck. Snapping x and z to the mid-section, mid-region
+        // value puts the eye 8 blocks from every multiple of 16 and 64 from
+        // every region boundary; the widened force needs ~1.9 at the
+        // harness resolution. y stays the ground's, and the margin check
+        // below prints all three and says so if the ground disagrees.
+// NO POSE SNAP HERE, deliberately. The NEXT (c) work added one (an
+        // absolute x/z teleport with a RELATIVE y) so the standalone superset
+        // leg would sit mid-section; it moved the player up to 64 blocks
+        // sideways while keeping the old column's height, and this leg then
+        // measured occlusion at a pose it was never calibrated for - the wall
+        // culled nothing, 40 sections drawn either way (2026-09-16). It is
+        // the same defect the Sodium file's pinPose had. The wall is built
+        // PLAYER-RELATIVE, so the leg needs no particular position at all,
+        // only a pinned view; the standalone half of the superset proof runs
+        // at whatever pose this leg establishes and asserts nothing that
+        // depends on section alignment.
         server.runCommand("execute as @p at @s run tp @s ~ ~ ~ 0 0");
+        quiesce(context);
         server.runCommand("execute as @p at @s run fill ~-32 ~-8 ~8 ~32 ~32 ~10 minecraft:stone");
         quiesce(context); // wall rebuilds uploaded, encode counter flat
 
@@ -1193,6 +1298,9 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
         int occDrawn = TerrainDrawer.gpuSectionsDrawn();
         context.takeScreenshot(TestScreenshotOptions.of("50_meshelium_occlusion_on"));
         assertNoErrors();
+
+        // ---- NEXT (c): the standalone half of the superset proof ----
+        int occDrawnHalf = assertHalfResSupersetStandalone(context, occDrawn);
 
         // Flip to the wave-5 BFS feed; prove the revert is total.
         long bfsFramesBefore = TerrainDrawer.bfsOnlyFrames();
@@ -1221,6 +1329,32 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
                         + "occlusion=" + occDrawn + " vs bfsOnly=" + bfsDrawn
                         + " (expected strictly fewer)");
             }
+            // NEXT (c): the strict wall assertion at HALF resolution, and it
+            // is ARM-dependent - which 0t measured after this leg was
+            // written. The world-space inflation arm re-admits ~24% of the
+            // drawn set at rd64; at THIS harness scale the wall culls
+            // exactly one section (bfs 45, full-res 44), so any re-admission
+            // at all erases the margin and the leg reds on a lever that is
+            // behaving exactly as measured (2026-09-16: half 45 vs bfs 45).
+            // The shipping configuration is conservative rasterisation, which
+            // re-admits a third as much - so assert strictly THERE, and where
+            // the inflation arm is the one in use, print the numbers and say
+            // why no claim is being made rather than fail for a known cost.
+            boolean strictHalfWall = TerrainOcclusion.conservativeRasterActive();
+            if (occDrawnHalf > 0 && !strictHalfWall) {
+                System.out.println("[Meshelium] 50b half-res wall: half=" + occDrawnHalf
+                        + " vs bfsOnly=" + bfsDrawn + " (full-res " + occDrawn + "). NOT asserted: "
+                        + "conservative rasterisation is off, so the world-space inflation arm is "
+                        + "carrying coverage and its re-admission is the measured cost of 0t, not "
+                        + "a defect. Run with -Dmeshelium.occlusion.conservativeRaster=true for "
+                        + "the shipping configuration's claim.");
+            }
+            if (strictHalfWall && occDrawnHalf > 0 && occDrawnHalf >= bfsDrawn) {
+                throw new AssertionError("half-res occlusion did not cull behind the wall: "
+                        + "sections drawn half=" + occDrawnHalf + " vs bfsOnly=" + bfsDrawn
+                        + " (full-res drew " + occDrawn + "); the re-admission has eaten the "
+                        + "whole cut");
+            }
         } finally {
             context.runOnClient(client ->
                     System.setProperty(TerrainDrawer.PROPERTY_BFS_ONLY, "false"));
@@ -1229,6 +1363,186 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
         context.waitFor(client -> TerrainDrawer.occlusionFrames() > occFramesAtFlip,
                 DRAW_TIMEOUT_TICKS);
         assertNoErrors();
+    }
+
+    /**
+     * NEXT (c), F.4: the standalone half of the superset proof, at the
+     * wall pose, with the lever flipped ON mid-leg.
+     *
+     * <h2>What it proves that the Sodium leg does not</h2>
+     * This host BINDS A DIFFERENT MATRIX from the one plan revision 3
+     * armed with, builds a different set of pipelines and indexes stamps
+     * by {@code regionId * 256 + compacted slot}. The FLAT arm is built
+     * here in this change precisely so the standalone does not ship only
+     * the unsound comparator, and this is the leg that exercises it.
+     *
+     * <h2>The anchors</h2>
+     * Phase B is silent at a converged pose, so the standalone anchor is
+     * {@code |S| > 0} against {@code gpuSectionsAAt(f)} alone rather than
+     * A + B; the CPU skip must be provably disarmed
+     * ({@code -Dmeshelium.occlusion.phaseBCpuSkip=false}) or a "phase B
+     * stayed silent" reading would be a statement about the skip.
+     *
+     * @return the half-res sections-drawn figure, or 0 when this run has
+     *         no lever to exercise
+     */
+    private static int assertHalfResSupersetStandalone(ClientGameTestContext context,
+            int occDrawn) {
+        boolean readback = Boolean.getBoolean(TerrainOcclusion.PROPERTY_STAMPS_READBACK);
+        VisibleSetSample full = readback ? standaloneSet(context, "50 full") : null;
+        long encodedBefore = TerrainResidency.counters().encodedSections();
+
+        boolean wasEnabled = TerrainOcclusion.halfResEnabled();
+        int halfDrawn;
+        try {
+            long before = TerrainOcclusion.halfResFrames();
+            context.runOnClient(client -> {
+                TerrainOcclusion.setHalfResArm(TerrainOcclusion.HALF_RES_ARM_FLAT);
+                TerrainOcclusion.setHalfResEnabled(true);
+            });
+            context.waitFor(client -> TerrainOcclusion.halfResFrames() > before + 10,
+                    DRAW_TIMEOUT_TICKS);
+            long settled = TerrainDrawer.statsFrames();
+            context.waitFor(client -> TerrainDrawer.lastReadStatsFrame() >= settled
+                    && TerrainDrawer.gpuSectionsDrawn() > 0, DRAW_TIMEOUT_TICKS);
+            halfDrawn = TerrainDrawer.gpuSectionsDrawn();
+            VisibleSetSample flat = readback ? standaloneSet(context, "50 flat") : null;
+            context.takeScreenshot(
+                    TestScreenshotOptions.of("52_meshelium_occlusion_on_halfres"));
+
+            if (TerrainOcclusion.halfResError() != null) {
+                throw new AssertionError("50 half-res: the path latched: "
+                        + TerrainOcclusion.halfResError());
+            }
+            if (TerrainOcclusion.halfResAllocationFailures() != 0L) {
+                throw new AssertionError("50 half-res: "
+                        + TerrainOcclusion.halfResAllocationFailures()
+                        + " attachment allocation(s) threw");
+            }
+            if (TerrainDrawer.phaseBCpuSkipArmed()) {
+                System.out.println("[Meshelium] 50 half-res: the phase-B CPU skip is ARMED, so "
+                        + "a silence reading here would be about the skip, not the lever; run "
+                        + "with -Dmeshelium.occlusion.phaseBCpuSkip=false for the non-vacuous "
+                        + "check");
+            }
+            // STABLE: phase A constant over the last ten read stats frames.
+            long window = TerrainDrawer.lastReadStatsFrame();
+            int firstA = -1;
+            StringBuilder ring = new StringBuilder();
+            for (long f = window - 10; f <= window; f++) {
+                int a = TerrainDrawer.gpuSectionsAAt(f);
+                ring.append(" f").append(f).append('=').append(a);
+                if (a < 0) {
+                    continue;
+                }
+                if (firstA < 0) {
+                    firstA = a;
+                } else if (a != firstA) {
+                    throw new AssertionError("50 half-res: phase A is not STABLE over the last "
+                            + "ten read stats frames at a static pose (" + ring + ")");
+                }
+            }
+            if (readback) {
+                if (full == null || flat == null) {
+                    throw new AssertionError("50 half-res: the visible-set readback is armed "
+                            + "but debugVisibleSet() returned null; the superset gate has no "
+                            + "data at all");
+                }
+                java.util.BitSet lost = full.minus(flat);
+                System.out.println("[Meshelium] 50 half-res sets: |S_full|=" + full.size()
+                        + " |S_flat|=" + flat.size() + " re-admission="
+                        + flat.minus(full).cardinality() + " lost=" + lost.cardinality()
+                        + " (frames " + full.frame() + " / " + flat.frame() + "), forcedNear "
+                        + flat.forcedText());
+                if (!flat.forcedAgrees()) {
+                    throw new AssertionError("50 half-res: the WIDENED near force fired where "
+                            + "the full-res test would not (" + flat.forcedText()
+                            + "); inflateK=" + TerrainOcclusion.halfResInflateK() + " nearR="
+                            + TerrainOcclusion.halfResNearR() + ". Either the pose is "
+                            + "non-compliant or the widening reaches further than the "
+                            + "arithmetic says");
+                }
+                if (!lost.isEmpty()) {
+                    throw new AssertionError("50 half-res: the FLAT set is NOT a superset of "
+                            + "the full-res set - " + lost.cardinality() + " section(s) stamped "
+                            + "at full resolution and not at half. That is a hole, and at a "
+                            + "static pose it stays");
+                }
+            }
+            if (halfDrawn < occDrawn) {
+                throw new AssertionError("50 half-res: drew FEWER sections (" + halfDrawn
+                        + ") than full-res (" + occDrawn + "); half-res is a superset by "
+                        + "construction, so a shortfall is a section the rasters DROPPED");
+            }
+            System.out.println("[Meshelium] 50 half-res: drawn " + halfDrawn + " vs full-res "
+                    + occDrawn + ", size " + TerrainOcclusion.halfResWidth() + "x"
+                    + TerrainOcclusion.halfResHeight() + ", armSkips="
+                    + TerrainOcclusion.halfResArmSkipReasons() + " projectionMismatches="
+                    + TerrainOcclusion.halfResArmProjectionMismatches()
+                    + " transformedFrames=" + TerrainOcclusion.halfResArmedTransformedFrames()
+                    + " (armSkips is expected 0 at this pinned pose. projectionMismatches is "
+                    + "NOT: Matrix4f.equals is floatToIntBits and mulPerspectiveAffine writes "
+                    + "D.m33 = P.m23 * M.m32 = -0.0f against P.m33 = +0.0f, while bobView runs "
+                    + "even at bob == 0 and Matrix4f.translation never sets PROPERTY_IDENTITY, "
+                    + "so it can increment on EVERY armed frame here. Read the number rather "
+                    + "than expecting one; the window-scoped witness is transformedFrames)");
+            long encodedAfter = TerrainResidency.counters().encodedSections();
+            if (encodedBefore != encodedAfter) {
+                System.out.println("[Meshelium] 50 half-res: sections were encoded between the "
+                        + "two samples (" + encodedBefore + " -> " + encodedAfter + "); the "
+                        + "stamp index mapping may have moved and the set comparison above is "
+                        + "weaker than it looks");
+            }
+        } finally {
+            boolean restore = wasEnabled;
+            context.runOnClient(client -> TerrainOcclusion.setHalfResEnabled(restore));
+        }
+        return halfDrawn;
+    }
+
+    /**
+     * Two folds at least five stats frames apart that must AGREE, each
+     * anchored to its own frame's phase-A count. Without the anchor a fold
+     * keyed to the wrong stamp, buffer, slot or byte offset yields the
+     * EMPTY set - and the empty set is a subset of everything.
+     */
+    private static VisibleSetSample standaloneSet(ClientGameTestContext context, String label) {
+        VisibleSetSample first = context.computeOnClient(
+                client -> TerrainDrawer.debugVisibleSet());
+        if (first == null) {
+            throw new AssertionError(label + ": debugVisibleSet() is null with -D"
+                    + TerrainOcclusion.PROPERTY_STAMPS_READBACK + "=true set");
+        }
+        long firstFrame = first.frame();
+        context.waitFor(client -> TerrainDrawer.lastReadStatsFrame() >= firstFrame + 5L,
+                DRAW_TIMEOUT_TICKS);
+        VisibleSetSample second = context.computeOnClient(
+                client -> TerrainDrawer.debugVisibleSet());
+        if (second == null || second.frame() < firstFrame + 5L) {
+            throw new AssertionError(label + ": the second fold is "
+                    + (second == null ? "null" : "frame " + second.frame())
+                    + ", not five frames past " + firstFrame);
+        }
+        if (!first.bits().equals(second.bits())) {
+            throw new AssertionError(label + ": the visible set is NOT STABLE at a static pose ("
+                    + first.size() + " stamped at frame " + firstFrame + " against "
+                    + second.size() + " at frame " + second.frame() + ")");
+        }
+        int size = second.size();
+        int a = TerrainDrawer.gpuSectionsAAt(second.frame());
+        if (size <= 0) {
+            throw new AssertionError(label + ": the folded visible set is EMPTY at frame "
+                    + second.frame() + "; an empty set is a subset of everything, so the "
+                    + "superset gate would pass vacuously");
+        }
+        if (a >= 0 && Math.abs(size - a) > Math.max(8, Math.round(0.1 * size))) {
+            throw new AssertionError(label + ": the folded set of " + size + " is nowhere near "
+                    + "the " + a + " sections phase A drew at frame " + second.frame()
+                    + "; the fold and the counters are not describing the same frame");
+        }
+        System.out.println("[Meshelium] " + label + ": |S|=" + size + " anchored to phase A "
+                + a + " at frame " + second.frame());
+        return second;
     }
 
     /**
@@ -1284,6 +1598,386 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
      *       (delegates to {@link #assertCameraCutPhaseB}).</li>
      * </ol>
      */
+    /** Attempted arms a walking/control window must contain; see 97_19. */
+    private static final int WALK_MIN_ARMS = 120;
+
+    /** Ticks a window may take to reach {@link #WALK_MIN_ARMS}. */
+    private static final int WALK_WINDOW_TIMEOUT_TICKS = 400;
+
+    /** The minimum interpolated bob held for the WHOLE walk window. */
+    private static final float WALK_MIN_BOB = 0.05f;
+
+    /** Horizontal blocks the player must cover in the walk window. */
+    private static final double WALK_MIN_MOVE = 3.0;
+
+    /** Armed control-window frames allowed a non-identity transform. */
+    private static final int WALK_CONTROL_TRANSFORMED_MAX = 2;
+
+    /** Vanilla's proven bob translation bound, plus float room. */
+    private static final double WALK_TRANSLATION_BOUND = 0.1 + 1.0e-3;
+
+    /**
+     * NEXT (c1), 2026-09-16: the STANDALONE twin of 97_19 - the walking
+     * leg on the mesh-shader host.
+     *
+     * <h2>Why a twin at all</h2>
+     * The two hosts arm from DIFFERENT matrices through different code. The
+     * standalone takes the bound matrix from
+     * {@code MesheliumProjectionCapture.lastIfBound(RenderSystem
+     * .getProjectionMatrixBuffer())} and the pre-bob stash beside it; the
+     * Sodium host takes {@code drawSolidOwned}'s {@code projection}
+     * parameter and has no {@code CameraRenderState} at all. A green 97_19
+     * says nothing about {@code TerrainDrawer}'s arm path, and the two
+     * tests cannot even share a client JVM -
+     * {@code fabric/build.gradle} swaps the gametest entrypoint list, so
+     * {@code -Pmeshelium.sodium} registers only the Sodium stand-down class
+     * and the normal list never registers it.
+     *
+     * <h2>What differs from 97_19, and it is all in our favour</h2>
+     * The world here is SUPERFLAT ({@code worldBuilder().create()} leaves
+     * {@code setConsistentSettings} unmodified: {@code WorldPresets.FLAT},
+     * seed "1", no structures), so there is no tree, cliff, water or lava
+     * to walk into and THE RUNWAY IS UNNECESSARY - the one place the
+     * superflat harness blind spot works for us, said out loud rather than
+     * silently omitted. {@code freezeWorld} has also killed every non-player
+     * entity, so nothing can hit the player and raise a hurt tilt.
+     *
+     * <h2>Incoming state at this call site (not something this leg sets)</h2>
+     * {@code assertHiddenWallOcclusion} (called at the top of the run)
+     * fills a stone wall 8-10 blocks ahead at yaw 0 and never removes it,
+     * and {@code assertCameraCutPhaseB} then applies
+     * {@code tp @s ~ ~ ~ ~180 ~} with no restore - that line is its ONLY
+     * command - so the player arrives here ALREADY facing away from the
+     * wall, into open superflat. This leg therefore does not turn around:
+     * a "turn around first" step would be a no-op whose own precondition is
+     * already satisfied, which hides the dependency.
+     *
+     * <h2>Why the restore is an ABSOLUTE POSITION and NO rotation</h2>
+     * This file has no {@code runLeg}-style re-homing to fall back on
+     * (contrast {@code MesheliumSodiumStandDownTest.runLeg}, which issues
+     * {@code runCommand(legs.home)} before EVERY leg), so everything
+     * downstream is anchored to wherever the player happens to be, and
+     * every downstream command is RELATIVE in position:
+     * {@code assertTranslucentParity}'s {@code tp @s ~ ~ ~ 180 20} and its
+     * glass/water/obsidian/portal fills,
+     * {@code assertFovRevealHealsTranslucent}'s {@code tp @s ~ ~ ~ 180 20},
+     * and {@code assertResortsApplyWithoutReencode}'s {@code tp @s ~1 ~ ~}
+     * / {@code ~-1} / {@code ~17}. A walk of N ticks at ~0.13 blocks/tick
+     * would re-base all of them. So the position is restored absolutely and
+     * VERIFIED, and the rotation is left alone: passing {@code 0 0} would
+     * silently re-aim the camera by 180 degrees, which is the precise
+     * failure this paragraph exists to prevent.
+     */
+    private static void assertHalfResArmsWhileWalking(ClientGameTestContext context,
+            TestSingleplayerContext singleplayer) {
+        var server = singleplayer.getServer();
+        boolean bobOption = context.computeOnClient(
+                client -> client.options.bobView().get());
+        if (!bobOption) {
+            throw new AssertionError("standalone walking leg HARNESS: "
+                    + "client.options.bobView() is FALSE, so renderLevel never folds a walking "
+                    + "bob into the projection and this leg would pass vacuously");
+        }
+        String screen = context.computeOnClient(client -> client.gui.screen() == null
+                ? null : client.gui.screen().getClass().getName());
+        if (screen != null) {
+            throw new AssertionError("standalone walking leg HARNESS: a screen is open ("
+                    + screen + "); KeyboardHandler.keyPress swallows the press and the walk "
+                    + "would silently do nothing");
+        }
+        boolean wasEnabled = TerrainOcclusion.halfResEnabled();
+        int armBefore = TerrainOcclusion.halfResArm();
+        double[] start = walkPlayerSample(context);
+        boolean bodyOk = false;
+        try {
+            // The lever, flipped exactly as assertHalfResSupersetStandalone
+            // does. Without it armHalfRes returns 0 at its first statement,
+            // that early return counts NOTHING, and attempted would be 0 -
+            // a verdict satisfied by a leg that never armed a frame.
+            context.runOnClient(client -> {
+                TerrainOcclusion.setHalfResArm(TerrainOcclusion.HALF_RES_ARM_FLAT);
+                TerrainOcclusion.setHalfResEnabled(true);
+            });
+            walkPoll(context, 100, () -> walkBob(context) <= 0.0);
+            context.waitTicks(10);
+
+            // ---- CONTROL WINDOW: same pose, same lever, no key ----
+            long[] s0 = walkCounterSample(context);
+            int sTicks = walkWaitForArms(context, s0);
+            long[] s1 = walkCounterSample(context);
+            long framesS = s1[0] - s0[0];
+            long skipsS = s1[1] - s0[1];
+            long attemptedS = framesS + skipsS;
+            long transformedS = s1[2] - s0[2];
+            long mismatchS = s1[3] - s0[3];
+
+            // ---- WALK WINDOW ----
+            // Face a KNOWN direction first. Two reviewers read the yaw
+            // history before this call site (the ~180 at :1209, the absolute
+            // 0 0 at :1286, the ~180 at :1542) and reached OPPOSITE
+            // conclusions about whether the player ends up facing the stone
+            // wall assertHiddenWallOcclusion leaves standing - which is the
+            // defect, not the disagreement: a leg that depends on inherited
+            // facing is one reordered leg away from walking into a wall and
+            // failing for a reason that has nothing to do with the bob.
+            // An ABSOLUTE yaw makes it independent of every leg before it.
+            // 90 looks along -X, across the wall's face rather than into it
+            // (the wall is built on the player's +Z at :1286-:1296), and the
+            // WALK_MIN_MOVE assertion below is the backstop if some future
+            // leg builds something there too.
+            server.runCommand("execute as @p at @s run tp @s ~ ~ ~ 90 0");
+            context.waitTicks(2);
+            context.getInput().holdKey(o -> o.keyUp);
+            long[] w0;
+            long[] w1;
+            double[] walkOpen;
+            double[] walkClose;
+            double bobMin = Double.MAX_VALUE;
+            double bobMax = 0.0;
+            double hurtMax = 0.0;
+            boolean allOnGround = true;
+            int wTicks;
+            try {
+                boolean ramped = walkPoll(context, 100, () -> walkBob(context) >= 0.09);
+                walkOpen = walkPlayerSample(context);
+                if (!ramped) {
+                    throw new AssertionError("standalone walking leg HARNESS: the bob never "
+                            + "reached 0.09 in 100 ticks of held keyUp (bob=" + walkOpen[0]
+                            + " onGround=" + (walkOpen[1] != 0.0) + " hurtTime=" + walkOpen[2]
+                            + "); the player is not walking");
+                }
+                w0 = walkCounterSample(context);
+                wTicks = 0;
+                while (wTicks < WALK_WINDOW_TIMEOUT_TICKS) {
+                    double[] st = walkPlayerSample(context);
+                    bobMin = Math.min(bobMin, st[0]);
+                    bobMax = Math.max(bobMax, st[0]);
+                    hurtMax = Math.max(hurtMax, st[2]);
+                    allOnGround &= st[1] != 0.0;
+                    long[] now = walkCounterSample(context);
+                    if ((now[0] - w0[0]) + (now[1] - w0[1]) >= WALK_MIN_ARMS) {
+                        break;
+                    }
+                    context.waitTicks(2);
+                    wTicks += 2;
+                }
+                w1 = walkCounterSample(context);
+                walkClose = walkPlayerSample(context);
+            } finally {
+                // NEVER holdKeyFor: its impl is holdKey/waitTicks/releaseKey
+                // with no try/finally, and a held key leaks into every later
+                // assertion in this file.
+                context.getInput().releaseKey(o -> o.keyUp);
+                context.waitTicks(2);
+            }
+
+            long framesW = w1[0] - w0[0];
+            long skipsW = w1[1] - w0[1];
+            long attemptedW = framesW + skipsW;
+            long transformedW = w1[2] - w0[2];
+            long mismatchW = w1[3] - w0[3];
+            double moved = walkHorizontal(walkOpen, walkClose);
+
+            System.out.println("[Meshelium] standalone walking bob: control frames=" + framesS
+                    + " skips=" + skipsS + " attempted=" + attemptedS + " transformed="
+                    + transformedS + " mismatches=+" + mismatchS + " in " + sTicks + " ticks"
+                    + " | walk frames=" + framesW + " skips=" + skipsW + " attempted="
+                    + attemptedW + " transformed=" + transformedW + " mismatches=+" + mismatchW
+                    + " in " + wTicks + " ticks"
+                    + " | bob min/max=" + bobMin + "/" + bobMax + " moved=" + moved
+                    + " blocks hurtMax=" + hurtMax + " onGround=" + allOnGround
+                    + " | maxArmedTranslation=" + TerrainOcclusion.halfResMaxArmedTranslation()
+                    + " maxArmedOrtho=" + TerrainOcclusion.halfResMaxArmedOrtho()
+                    + " inflateK=" + TerrainOcclusion.halfResInflateK()
+                    + " nearR=" + TerrainOcclusion.halfResNearR()
+                    + " | skips by reason: " + TerrainOcclusion.halfResArmSkipReasons()
+                    + " | NOT a coverage result: the superset gate needs a static pose");
+
+            String screenAfter = context.computeOnClient(client -> client.gui.screen() == null
+                    ? null : client.gui.screen().getClass().getName());
+            if (screenAfter != null) {
+                throw new AssertionError("standalone walking leg HARNESS: a screen opened "
+                        + "during the walk (" + screenAfter + ")");
+            }
+            if (!(bobMin >= WALK_MIN_BOB)) {
+                throw new AssertionError("standalone walking leg HARNESS: the bob fell to "
+                        + bobMin + " inside the window (floor " + WALK_MIN_BOB + ")");
+            }
+            if (!(moved >= WALK_MIN_MOVE)) {
+                throw new AssertionError("standalone walking leg HARNESS: the player moved "
+                        + moved + " blocks horizontally (floor " + WALK_MIN_MOVE + ")");
+            }
+            if (hurtMax != 0.0) {
+                throw new AssertionError("standalone walking leg HARNESS: hurtTime reached "
+                        + hurtMax + "; the damage tilt is a different transform from the bob");
+            }
+            if (!allOnGround) {
+                throw new AssertionError("standalone walking leg HARNESS: the player left the "
+                        + "ground, which forces the bob target to 0.0F");
+            }
+            if (attemptedS < WALK_MIN_ARMS || attemptedW < WALK_MIN_ARMS) {
+                throw new AssertionError("standalone walking leg HARNESS: attempted arms "
+                        + "control=" + attemptedS + " walk=" + attemptedW + ", floor "
+                        + WALK_MIN_ARMS + ". If BOTH are 0 the lever never armed: armHalfRes "
+                        + "returns 0 before arm() when halfResEnabled is false, and that early "
+                        + "return counts nothing");
+            }
+            if (skipsS > Math.max(2L, attemptedS / 50L)) {
+                throw new AssertionError("standalone walking leg HARNESS: the STATIONARY "
+                        + "control already refused " + skipsS + " of " + attemptedS + " ("
+                        + TerrainOcclusion.halfResArmSkipReasons() + "); the instrument is "
+                        + "dirty before the walk begins");
+            }
+            // The host-neutral, window-scoped witness. NOT
+            // halfResArmProjectionMismatches: Matrix4f.equals is
+            // floatToIntBits and mulPerspectiveAffine writes
+            // D.m33 = P.m23 * M.m32 = -0.0f against P.m33 = +0.0f, so that
+            // counter can increment on every armed frame even at a pinned
+            // pose. It is printed above and read, never asserted, until a
+            // run says what it actually does.
+            if (transformedW <= 0L) {
+                throw new AssertionError("standalone walking leg: the walk window armed "
+                        + framesW + " frames and NONE carried a non-identity recovered "
+                        + "transform; either the bob is not in the drawn matrix on this host "
+                        + "or only stationary frames armed");
+            }
+            if (transformedS > WALK_CONTROL_TRANSFORMED_MAX) {
+                throw new AssertionError("standalone walking leg HARNESS: the stationary "
+                        + "control armed " + transformedS + " non-identity frames (allowed "
+                        + WALK_CONTROL_TRANSFORMED_MAX + "); at a pinned pose ||t|| is EXACTLY "
+                        + "0.0f and L exactly I, so the control is not still");
+            }
+            if (!(TerrainOcclusion.halfResMaxArmedTranslation() <= WALK_TRANSLATION_BOUND)) {
+                throw new AssertionError("standalone walking leg: armed under a recovered apex "
+                        + "displacement of " + TerrainOcclusion.halfResMaxArmedTranslation()
+                        + " blocks, above vanilla's proven bob bound of "
+                        + WALK_TRANSLATION_BOUND);
+            }
+            long allowed = Math.max(2L, attemptedW / 50L);
+            if (skipsW > allowed) {
+                throw new AssertionError("standalone walking leg: a WALKING player had " + skipsW
+                        + " of " + attemptedW + " attempted arms refused (allowed " + allowed
+                        + ") while the stationary control had " + skipsS + " of " + attemptedS
+                        + ". Reasons: " + TerrainOcclusion.halfResArmSkipReasons()
+                        + ". The half-res lever is off for the state a player is in");
+            }
+            bodyOk = true;
+        } finally {
+            // ABSOLUTE position, NO rotation arguments - see the javadoc.
+            // Position AND facing: the leg set an absolute yaw above, so
+            // leaving it would hand the next leg a camera pointing somewhere
+            // it never chose. start[6]/start[7] are the yaw and pitch this
+            // leg walked in on.
+            server.runCommand(String.format(java.util.Locale.ROOT,
+                    "execute as @p run tp @s %.3f %.3f %.3f %.2f %.2f",
+                    start[3], start[4], start[5], start[6], start[7]));
+            context.waitTicks(5);
+            boolean restore = wasEnabled;
+            int restoreArm = armBefore;
+            context.runOnClient(client -> {
+                TerrainOcclusion.setHalfResEnabled(restore);
+                TerrainOcclusion.setHalfResArm(restoreArm);
+            });
+            double drift = walkHorizontal(start, walkPlayerSample(context));
+            System.out.println("[Meshelium] standalone walking bob: restored position (drift "
+                    + drift + " blocks) and halfRes=" + TerrainOcclusion.halfResEnabled()
+                    + " arm=" + TerrainOcclusion.halfResArm());
+            if (drift > 1.0) {
+                // Everything after this point in the file is anchored to
+                // wherever the player is; a failed restore aims the rest of
+                // the run somewhere else and every later assertion becomes
+                // a statement about the wrong place.
+                String message = "standalone walking leg: the player is " + drift + " blocks "
+                        + "from where the leg started after an ABSOLUTE restore; every "
+                        + "assertion after this one is player-relative and would be aimed "
+                        + "somewhere else";
+                if (bodyOk) {
+                    throw new AssertionError(message);
+                }
+                System.out.println("[Meshelium] " + message + " (the leg had already failed; "
+                        + "not masking that failure with this one)");
+            }
+        }
+    }
+
+    /**
+     * {@code {frames, armSkips, transformedFrames, projectionMismatches,
+     * allocationFailures}}, sampled inside ONE {@code computeOnClient} so
+     * they belong to one frame.
+     */
+    private static long[] walkCounterSample(ClientGameTestContext context) {
+        return context.computeOnClient(client -> new long[] {
+                TerrainOcclusion.halfResFrames(),
+                TerrainOcclusion.halfResArmSkips(),
+                TerrainOcclusion.halfResArmedTransformedFrames(),
+                TerrainOcclusion.halfResArmProjectionMismatches(),
+                TerrainOcclusion.halfResAllocationFailures()});
+    }
+
+    /**
+     * {@code {bob, onGround, hurtTime, x, y, z}}. The bob lives on
+     * {@code ClientAvatarState}, not on the player, and
+     * {@code getInterpolatedBob(1.0f)} is {@code Mth.lerp(1, bobO, bob)},
+     * i.e. {@code bob} exactly.
+     */
+    private static double[] walkPlayerSample(ClientGameTestContext context) {
+        return context.computeOnClient(client -> new double[] {
+                client.player.avatarState().getInterpolatedBob(1.0f),
+                client.player.onGround() ? 1.0 : 0.0,
+                client.player.hurtTime,
+                client.player.getX(),
+                client.player.getY(),
+                client.player.getZ(),
+                // [6]/[7]: the facing this leg walked in on. The walk sets an
+                // ABSOLUTE yaw (it must not inherit one), so the restore has
+                // to put back what it found.
+                client.player.getYRot(),
+                client.player.getXRot()});
+    }
+
+    private static double walkBob(ClientGameTestContext context) {
+        return context.computeOnClient(
+                client -> (double) client.player.avatarState().getInterpolatedBob(1.0f));
+    }
+
+    private static double walkHorizontal(double[] a, double[] b) {
+        double dx = b[3] - a[3];
+        double dz = b[5] - a[5];
+        return Math.sqrt(dx * dx + dz * dz);
+    }
+
+    /** Poll a condition every two ticks; true if it held. */
+    private static boolean walkPoll(ClientGameTestContext context, int maxTicks,
+            java.util.function.BooleanSupplier done) {
+        for (int waited = 0; waited < maxTicks; waited += 2) {
+            if (done.getAsBoolean()) {
+                return true;
+            }
+            context.waitTicks(2);
+        }
+        return done.getAsBoolean();
+    }
+
+    /**
+     * Wait until {@link #WALK_MIN_ARMS} arms have been ATTEMPTED since the
+     * sample, or the timeout. Polls the COUNTER, never a tick count, so the
+     * window is correct at any frame rate.
+     *
+     * @return the ticks waited
+     */
+    private static int walkWaitForArms(ClientGameTestContext context, long[] from) {
+        int waited = 0;
+        while (waited < WALK_WINDOW_TIMEOUT_TICKS) {
+            long[] now = walkCounterSample(context);
+            if ((now[0] - from[0]) + (now[1] - from[1]) >= WALK_MIN_ARMS) {
+                break;
+            }
+            context.waitTicks(2);
+            waited += 2;
+        }
+        return waited;
+    }
+
     private static void assertPhaseBCpuSkip(ClientGameTestContext context,
             TestSingleplayerContext singleplayer) {
         context.runOnClient(client ->
@@ -1696,6 +2390,14 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
         if (occError != null) {
             throw new AssertionError("occlusion culling reported an error (drawing fell back "
                     + "to the BFS feed): " + occError);
+        }
+        // NEXT (c): the half-res latch must be RED, never a silent fallback
+        // to full resolution. A lever that quietly stood down would leave
+        // every counter and every bench row saying "on" while nothing ran.
+        String halfError = TerrainOcclusion.halfResError();
+        if (halfError != null) {
+            throw new AssertionError("the half-resolution occlusion depth latched (the rasters "
+                    + "fell back to full resolution): " + halfError);
         }
     }
 }

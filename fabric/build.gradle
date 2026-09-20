@@ -29,6 +29,13 @@ sourceSets {
 	main {
 		java.srcDir rootProject.file('common/src/main/java')
 		resources.srcDir rootProject.file('common/src/main/resources')
+		// The Sodium adapter. Its own tree rather than part of common/,
+		// because common/ must compile with nothing but vanilla on the
+		// classpath and this names Sodium types in every file. Both
+		// loaders add it and both supply their own Sodium coordinate, so
+		// the adapter exists on Fabric and NeoForge alike.
+		java.srcDir rootProject.file('sodium/src/main/java')
+		resources.srcDir rootProject.file('sodium/src/main/resources')
 	}
 }
 
@@ -36,6 +43,18 @@ base {
 	// "meshelium", not "meshelium-fabric": this is the jar players have
 	// installed since 1.0.0 and the name is on Modrinth.
 	archivesName = 'meshelium'
+}
+
+// Loom supplies the Fabric and Maven Central repositories implicitly; this
+// adds the one it does not. Scoped with includeGroup so every other
+// dependency in this build keeps resolving exactly where it did before -
+// an unscoped extra repository changes resolution order for everything.
+repositories {
+	maven {
+		name = 'Modrinth'
+		url = 'https://api.modrinth.com/maven'
+		content { includeGroup 'maven.modrinth' }
+	}
 }
 
 dependencies {
@@ -50,6 +69,43 @@ dependencies {
 	// Settings reach players through vanilla's own Video Settings screen
 	// (VideoSettingsScreenMixin) and the /meshelium command, so the adapter
 	// was a third route to a screen that already had two.
+
+	// Sodium, to COMPILE the interop adapter against. compileOnly: the
+	// adapter classes ship in our jar, Sodium itself never does, and at
+	// runtime the gate decides whether any of it is reachable.
+	//
+	// From the Modrinth maven rather than ../test-mods on purpose. A shipped
+	// code path cannot depend on a jar that happens to be sitting beside the
+	// repo on one machine - that is exactly what stopped a clean clone
+	// building before 1.0.0, and the note above this block is the scar.
+	// The NeoForge project does the same with the loader-suffixed twin
+	// (sodium_neoforge_version), unwrapped from its jar-in-jar shell.
+	compileOnly "maven.modrinth:sodium:${project.sodium_version}"
+
+	// -Pmeshelium.sodium puts Sodium on the RUN classpath for the interop
+	// work: the gametest harness is the only way to get a world rendering
+	// on this loader, and its run directory is wiped before every run, so
+	// dropping a jar in there by hand does not survive.
+	//
+	// Property-gated and runtime-only on purpose. That is the difference
+	// between this and the ModMenu adapter above: nothing COMPILES against
+	// it, and without the property the dependency does not exist at all.
+	//
+	// The run jar is the same Modrinth artefact compileOnly resolves above
+	// (since 2026-09-14; it used to be a file path under ../test-mods with
+	// a configuration-time throw when the file was missing). Same bytes:
+	// the cached Modrinth jar and the ../test-mods copy were 1,885,574
+	// bytes, MD5 1c808d739819e94e2e02a83c0d97128e, both. The throw had to
+	// go because -Pmeshelium.sodium is a root-level property and Gradle
+	// configures EVERY project for a `:neoforge:runClient` invocation, so
+	// the NeoForge proof run tripped it on any clone without the sibling
+	// folder. If a file path is ever wanted again, keep `files(path)`
+	// (legal for a missing file at configuration) and move the existence
+	// check into gradle.taskGraph.whenReady, gated on a :fabric run task
+	// actually being scheduled.
+	if (project.hasProperty('meshelium.sodium')) {
+		runtimeOnly "maven.modrinth:sodium:${project.sodium_version}"
+	}
 }
 
 fabricApi {
@@ -88,7 +144,7 @@ loom {
 		// exercised on this loader too. It is not covered by the gametest
 		// suite and cannot be: every test class reaches a world through
 		// the title screen, which is exactly the route that hid the gate
-		// bug (docs/FARFIELD-WAVES.md, "A HARNESS BLIND SPOT").
+		// bug (docs/unreleased/farfield/FARFIELD-WAVES.md, "A HARNESS BLIND SPOT").
 		//   -Pmeshelium.backend=vulkan
 		//   -Pmeshelium.world=<name in fabric/run/saves>
 		//   -Pmeshelium.vmargs="-Dk=v"
@@ -330,7 +386,7 @@ loom {
 			// and pins its camera, so it never loads a chunk and never
 			// saves one - which is why the owner's "saving the chunks to
 			// lod drops 200 to 60" has no number anywhere in this project.
-			// Phase 1 of docs/FARFIELD-PERF-BRIEF.md; every later phase of
+			// Phase 1 of docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md; every later phase of
 			// that plan is gated on it.
 			//
 			// TWO properties, and the second is not optional:
@@ -429,10 +485,27 @@ def mesheliumNormalTests = ['MesheliumBootSmokeTest', 'MesheliumTerrainDataTest'
 // with the bench appended, for a run that wants both.
 def mesheliumFarBenchAlone = project.hasProperty('meshelium.farbench') &&
 		!project.hasProperty('meshelium.farbench.suite')
+// -Pmeshelium.sodium swaps the list to the stand-down test alone, for the
+// same reason the bench modes do: the ordinary suite asserts that
+// Meshelium RENDERS, and under Sodium it deliberately does not, so those
+// tests would fail correctly and prove nothing. The stand-down test
+// asserts the behaviour that is actually wanted there.
+//
+// The bench modes take precedence over it deliberately. -Pmeshelium.sodium
+// does two separable things - put Sodium on the classpath, and choose what
+// to run - and only the first is wanted when it is combined with a bench.
+// `-Pmeshelium.sodium -Pmeshelium.bench=<scene>` is how Sodium gets
+// MEASURED: the bench's vanillaOnly leg times whatever the host renderer
+// is, and with Sodium installed and Meshelium stood down by the gate, the
+// host renderer IS Sodium.
+def mesheliumSodiumRun = project.hasProperty('meshelium.sodium')
 def mesheliumGametestEntrypoints
 if (mesheliumBenchScene) {
 	mesheliumGametestEntrypoints =
 			'"com.deds.meshelium.gametest.client.MesheliumBenchmarkTest"'
+} else if (mesheliumSodiumRun) {
+	mesheliumGametestEntrypoints =
+			'"com.deds.meshelium.gametest.client.MesheliumSodiumStandDownTest"'
 } else if (mesheliumFarBenchAlone) {
 	mesheliumGametestEntrypoints =
 			'"com.deds.meshelium.gametest.client.MesheliumFarFieldBenchTest"'
@@ -442,6 +515,7 @@ if (mesheliumBenchScene) {
 tasks.named('processGametestResources', ProcessResources) {
 	inputs.property 'meshelium_bench', mesheliumBenchScene
 	inputs.property 'meshelium_farbench', mesheliumFarBenchAlone
+	inputs.property 'meshelium_sodium', mesheliumSodiumRun
 	// The EXPANDED VALUE must be an input, not just the bench scene.
 	// Without this, adding a class to mesheliumNormalTests does not
 	// invalidate the task: Gradle sees the same declared inputs and the
@@ -492,4 +566,20 @@ tasks.withType(JavaCompile).configureEach {
 java {
 	sourceCompatibility = JavaVersion.VERSION_25
 	targetCompatibility = JavaVersion.VERSION_25
+}
+
+// Two root censuses, wired in here so a plain `./gradlew build` runs both.
+//
+// checkSodiumCoordinate is called at CONFIGURATION time, not from a task:
+// its whole job is to stop a build whose Sodium coordinate and whose
+// shipped MesheliumSodiumVersion.BUILT_AGAINST name different Sodiums, and
+// a check that only runs when somebody remembers to run `check` is a check
+// that certifies memory. It is handed THIS project's property name and
+// loader suffix, because a root property inherits into every subproject
+// and the drafted single call would have green-lit a NeoForge-only bump
+// while reading the Fabric coordinate.
+rootProject.ext.checkSodiumCoordinate('sodium_version', 'fabric')
+
+tasks.named('check') {
+	dependsOn rootProject.tasks.named('checkLangKeys')
 }

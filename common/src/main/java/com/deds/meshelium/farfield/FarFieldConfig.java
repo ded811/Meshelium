@@ -31,7 +31,7 @@ import java.nio.file.Path;
  * property flips and config edits apply next frame, no restart).
  *
  * <h2>Why a separate file instead of new fields on MesheliumConfig</h2>
- * W1 of the far-field plan (docs/FARFIELD-WAVES.md, pre1) is pure new files
+ * W1 of the far-field plan (docs/unreleased/farfield/FARFIELD-WAVES.md, pre1) is pure new files
  * and may not touch {@code MesheliumConfig.java}. The house config is one
  * GSON POJO per file, so new fields there would mean editing that class.
  * TODO-FOR-LATER (central registration): a future wave may fold these
@@ -390,7 +390,7 @@ public final class FarFieldConfig {
     /**
      * Background Saving: <b>10% of the measured frame</b>, capped at
      * 2 ms and floored at 0.25 ms - the shipped point, and
-     * docs/FARFIELD-PERF-BRIEF.md section 3's rule exactly.
+     * docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 3's rule exactly.
      *
      * <p>At 200 fps that is 0.5 ms of a 5 ms frame. The rule it replaced
      * took 3 to 6.7 ms of that same frame and settled the client at the
@@ -760,7 +760,7 @@ public final class FarFieldConfig {
          * saved {@code meshelium-farfield.json}; a rename here would make
          * GSON drop the player's choice silently, and a rename of
          * {@code l1WaterDepth} would break a {@code -D} flag that is
-         * documented in docs/FARFIELD-WAVES.md. The stale name is the
+         * documented in docs/unreleased/farfield/FARFIELD-WAVES.md. The stale name is the
          * cheaper of the two wrongs and it is confined to this line and
          * to {@code propertySuffix}.</p>
          */
@@ -1644,7 +1644,7 @@ public final class FarFieldConfig {
                     propertyOr(layer.key + "SmallDetail", settings.smallDetail);
             case WATER_LOOK ->
                     // The property key stays l1WaterDepth: it is documented in
-                    // docs/FARFIELD-WAVES.md and a -D flag a player already
+                    // docs/unreleased/farfield/FARFIELD-WAVES.md and a -D flag a player already
                     // has must keep working across the rename.
                     propertyOr(layer.key + "WaterDepth", settings.waterDepth);
             case BLOCK_VARIANTS ->
@@ -1982,7 +1982,7 @@ public final class FarFieldConfig {
     private static final int BAND_RULE_REVISION = 5;
 
     /**
-     * Q2's one-time heal lever (pre16 Phase 1, docs/FARFIELD-WAVES.md "Q2
+     * Q2's one-time heal lever (pre16 Phase 1, docs/unreleased/farfield/FARFIELD-WAVES.md "Q2
      * ANSWERED"): {@code -Dmeshelium.farfield.healBlackRecords=true} bumps
      * the save signature by one, which makes {@code FarFieldResidency}
      * call {@code ExtractDispatch.forgetExtractedColumns()} exactly as a

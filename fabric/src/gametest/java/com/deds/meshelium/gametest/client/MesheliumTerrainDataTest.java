@@ -60,6 +60,7 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
         greedyMergeCornerShading();
         leafTierFilters();
         resetCoversEveryField();
+        configV3ReArmsTheVulkanPromptOnce();
         arenaBasics();
         arenaPendingRelease();
         arenaExhaustionAndStats();
@@ -138,6 +139,53 @@ public final class MesheliumTerrainDataTest implements FabricClientGameTest {
         } else {
             throw new AssertionError("config field " + f.getName() + " has type " + t
                     + " this walk cannot perturb - teach perturb() about it");
+        }
+    }
+
+    // ==================================================================
+    // Settings schema v3: the Vulkan prompt is re-armed once, not per boot
+    // ==================================================================
+
+    /**
+     * Every build before 504d1fd spent {@code showVulkanPrompt} on
+     * [Enable Vulkan], so a v2 file saying "never ask" may be recording a
+     * choice the player never made. Schema v3 re-arms all three notice
+     * flags exactly once; a v3 file that says false is a real [Don't Show
+     * This Again] and must stay spent (owner report 2026-09-08 (beta.8)).
+     *
+     * <p>The migration runs inside {@code MesheliumConfig.load()} at boot,
+     * before any test can write a file, so this drives {@code migrate()}
+     * on instances built from JSON the way Gson builds them from disk.
+     */
+    private static void configV3ReArmsTheVulkanPromptOnce() {
+        com.google.gson.Gson gson = new com.google.gson.Gson();
+        try {
+            java.lang.reflect.Method migrate =
+                    com.deds.meshelium.MesheliumConfig.class.getDeclaredMethod("migrate");
+            migrate.setAccessible(true);
+
+            com.deds.meshelium.MesheliumConfig v2 = gson.fromJson(
+                    "{\"configVersion\":2,\"showVulkanPrompt\":false,"
+                            + "\"noMeshShaderNoticeShown\":true,\"vulkanFailedNoticeShown\":true}",
+                    com.deds.meshelium.MesheliumConfig.class);
+            boolean changed = (Boolean) migrate.invoke(v2);
+            check(changed, "a v2 settings file did not migrate");
+            check(v2.showVulkanPrompt, "v3 did not re-arm showVulkanPrompt on a v2 file");
+            check(!v2.noMeshShaderNoticeShown && !v2.vulkanFailedNoticeShown,
+                    "v3 re-armed the prompt but not the two once-shown notices; the Backend "
+                            + "Popup row writes all three and would misreport itself");
+            check(v2.configVersion >= 3, "migrated file still reads schema v" + v2.configVersion);
+            check(!(Boolean) migrate.invoke(v2), "a migrated file migrated again");
+
+            com.deds.meshelium.MesheliumConfig v3 = gson.fromJson(
+                    "{\"configVersion\":3,\"showVulkanPrompt\":false}",
+                    com.deds.meshelium.MesheliumConfig.class);
+            migrate.invoke(v3);
+            check(!v3.showVulkanPrompt,
+                    "a v3 file's [Don't Show This Again] was re-armed; the re-arm is once, not "
+                            + "every boot");
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("config migration reflection failed", e);
         }
     }
 

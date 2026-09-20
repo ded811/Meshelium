@@ -23,7 +23,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /**
  * Far-field save design E4 (M3): the block-change event - the hook that
  * made the 30-second staleness epoch unnecessary
- * (docs/FARFIELD-SAVE-DESIGN.md section 2, event E4).
+ * (docs/unreleased/farfield/FARFIELD-SAVE-DESIGN.md section 2, event E4).
  *
  * <h2>The injection point, from the bytecode</h2>
  * javap of the 26.2 merged jar in this authoring session:

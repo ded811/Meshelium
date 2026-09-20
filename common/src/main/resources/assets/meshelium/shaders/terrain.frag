@@ -63,16 +63,38 @@ layout(set = 0, binding = 4, std140) uniform Globals {
 
 layout(set = 0, binding = 5) uniform sampler2D Sampler0; // block atlas
 
+#if MESHELIUM_PACKED_VARYINGS && MESHELIUM_SODIUM
+#define MESHELIUM_SPRITE_RECT 0
+#else
+#define MESHELIUM_SPRITE_RECT 1
+#endif
+
 layout(location = 0) in vec4 vertexColor;
+#if MESHELIUM_PACKED_VARYINGS
+// Mirrors terrain.mesh: one location carries the atlas UV (xy) and the
+// spherical (z) and cylindrical (w) fog distances; main() unpacks them
+// into the names the rest of this file has always used.
+layout(location = 1) in vec4 texFog;
+layout(location = 2) flat in uint materialBits;
+#else
 layout(location = 1) in vec2 texCoord0;
 layout(location = 2) in float sphericalVertexDistance;
 layout(location = 3) in float cylindricalVertexDistance;
 layout(location = 4) flat in uint materialBits;
+#endif
 // Sprite rectangle: xy = atlas min, zw = atlas max. One vec4 rather than
 // two vec2s plus a repeat varying, because mesh-stage output memory is
 // charged per LOCATION and the spec floor is 32768 B per workgroup; the
 // repeat pair is re-derived from materialBits below instead of shipped.
+// Absent on the packed Sodium layout, where no quad is ever merged; a
+// zero constant keeps the (compiled-out) tiling helper well-formed.
+#if !MESHELIUM_SPRITE_RECT
+const vec4 spriteRect = vec4(0.0);
+#elif MESHELIUM_PACKED_VARYINGS
+layout(location = 3) flat in vec4 spriteRect;
+#else
 layout(location = 5) flat in vec4 spriteRect;
+#endif
 
 layout(location = 0) out vec4 fragColor;
 
@@ -232,6 +254,11 @@ const float ALPHA_CUTOFFS[3] = float[](0.0, 0.1, 0.5);
 // samples; ShellMesher.quad() carries the corrected measurement table.
 
 void main() {
+#if MESHELIUM_PACKED_VARYINGS
+    vec2 texCoord0 = texFog.xy;
+    float sphericalVertexDistance = texFog.z;
+    float cylindricalVertexDistance = texFog.w;
+#endif
     vec2 TextureSize = SceneMisc.xy;
     vec2 pixelSize = 1.0f / TextureSize;
     // Unmerged quads take the vanilla-verbatim path untouched: the packed
@@ -240,7 +267,11 @@ void main() {
     // primitive), and pixel parity with vanilla is unaffected for every quad
     // the mesher did not touch.
     vec4 color;
+#if MESHELIUM_SPRITE_RECT
     if ((materialBits & 0xF8u) != 0u) {
+#else
+    if (false) { // no merged quads on this geometry; the branch is compiled out
+#endif
         // The tile counts ride in materialBits as log2(u) * 5 + log2(v)
         // (bits 3-7). Re-deriving them here costs a few integer ops on
         // merged-quad fragments only, and it bought back a whole output
@@ -263,8 +294,13 @@ void main() {
     }
     // vanilla: color = mix(FogColor * vec4(1,1,1,color.a), color, ChunkVisibility);
     // ChunkVisibility == 1.0 here (fade-in deviation, see header) → identity.
+#if !defined(MESHELIUM_NO_DISCARD) || !MESHELIUM_NO_DISCARD
+    // Absent from the no-discard variant (Sodium SOLID pass): a discard
+    // that is statically present, even one that can never fire, is enough
+    // to push the depth write after the shader on every fragment.
     if (color.a < ALPHA_CUTOFFS[materialBits & 3u]) {
         discard;
     }
+#endif
     fragColor = apply_fog(color, sphericalVertexDistance, cylindricalVertexDistance, FogEnvironmentalStart, FogEnvironmentalEnd, FogRenderDistanceStart, FogRenderDistanceEnd, FogColor);
 }

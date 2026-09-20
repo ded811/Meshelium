@@ -25,7 +25,7 @@ import java.util.List;
  * so the walk that reads it can run on {@link PinWorker} - the same
  * capture-then-walk split Phase 5 built for LEAVING columns, applied to
  * the population that stayed behind because it reads mutable state
- * (docs/FARFIELD-PERF-BRIEF.md section 2).
+ * (docs/unreleased/farfield/FARFIELD-PERF-BRIEF.md section 2).
  *
  * <h2>Why the stand-in is a real {@code LevelChunk}</h2>
  * The walk reads its home column through {@code getSections()},

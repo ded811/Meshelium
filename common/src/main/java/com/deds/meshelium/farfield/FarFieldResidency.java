@@ -32,7 +32,7 @@ import java.util.function.Consumer;
  * should be drawable right now, feeds the promote side through
  * {@link FarField#requestShell} and the demote side through
  * {@code TerrainResidency.releaseFarColumn}, and carries the far field's
- * OWN counters (standing rule, docs/FARFIELD-WAVES.md: far-field
+ * OWN counters (standing rule, docs/unreleased/farfield/FARFIELD-WAVES.md: far-field
  * failures may never touch the four wave-8 coverage-guard drop
  * counters; nothing in this class can reach them — the only
  * TerrainResidency entry points it calls are the far-specific ones).
@@ -43,7 +43,7 @@ import java.util.function.Consumer;
  * center is doing regular cylindrical chunk loading, and the box that
  * swaps the lod chunks in behind me is doing square shaped chunk loading.
  * thats what the gap looks like, the corner of a square"
- * (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre7, item H2). The audit,
+ * (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre7, item H2). The audit,
  * with every test named and its metric fixed:
  * <table border="1">
  *   <caption>Distance tests, after the H2 fix</caption>
@@ -195,7 +195,7 @@ import java.util.function.Consumer;
  * can contest a far position. The square part is true; the conclusion
  * that vanilla FILLS it is not, and the owner saw the difference:
  * "around the edges of my render distance theres some issues with chunks
- * not loading" (docs/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre1, B3).
+ * not loading" (docs/unreleased/farfield/FARFIELD-WAVES.md, OWNER PLAYTEST OF pre1, B3).
  *
  * <p>What vanilla actually compiles is a pad-1 DISC inscribed in that
  * square. {@code SectionOcclusionGraph.getRelativeFrom} gates BFS
@@ -1127,7 +1127,7 @@ public final class FarFieldResidency {
      */
     private static final int LATE_SHELL_CAP = 4096;
     /**
-     * SEAM step 2 (docs/FARFIELD-SEAM-DESIGN.md): columns the far field
+     * SEAM step 2 (docs/unreleased/farfield/FARFIELD-SEAM-DESIGN.md): columns the far field
      * is ALREADY DRAWING whose stored shell just got fresher
      * ({@link #onShellWritten} on a resident, wanted column - the
      * player edited it, or the sweep upgraded a degraded record). Each
@@ -1148,7 +1148,7 @@ public final class FarFieldResidency {
      */
     private static final LongOpenHashSet refreshColumns = new LongOpenHashSet();
     /**
-     * APRON STALENESS (pre19, docs/FARFIELD-WAVES.md "APRON STALENESS
+     * APRON STALENESS (pre19, docs/unreleased/farfield/FARFIELD-WAVES.md "APRON STALENESS
      * ANSWERED"): resident columns whose own record is unchanged but
      * whose MESH is stale, because one of the eight neighbours they
      * apron-read was rewritten.
@@ -1213,7 +1213,7 @@ public final class FarFieldResidency {
      * <p><b>As a FLOOR</b>: 2 per pump against the config's 60 fps
      * frame-rate floor is 120 columns a second, which is more than the
      * travel write rate this fanout is amplifying (96 columns/s of new
-     * ground at creative flight, docs/FARFIELD-WAVES.md "P3 ANSWERED"
+     * ground at creative flight, docs/unreleased/farfield/FARFIELD-WAVES.md "P3 ANSWERED"
      * 1e). So on a quiet pipeline the drain keeps up with the writes
      * themselves and only the dilation of the frontier arc can lag - and
      * on a travel leg that arc is being re-read by the ring walk anyway,

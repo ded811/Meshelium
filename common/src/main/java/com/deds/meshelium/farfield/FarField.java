@@ -99,7 +99,7 @@ import java.util.stream.Stream;
  *
  * <h2>Counters</h2>
  * Public LongAdders, the far field's OWN failure/throughput accounting
- * (standing rule, docs/FARFIELD-WAVES.md): W4 exports them into the
+ * (standing rule, docs/unreleased/farfield/FARFIELD-WAVES.md): W4 exports them into the
  * bench counter map and the zero-cost leg asserts them zero with the
  * master off. Cheap to increment from any thread, summed only when read.
  *
@@ -205,7 +205,7 @@ public final class FarField {
      */
     public static final LongAdder farStoreDroppedNoStore = new LongAdder();
     /**
-     * Save-design M1 (docs/FARFIELD-SAVE-DESIGN.md): writes the store
+     * Save-design M1 (docs/unreleased/farfield/FARFIELD-SAVE-DESIGN.md): writes the store
      * ACKNOWLEDGED as durably appended (or as an equal-truth refusal -
      * see {@link WriteTask#run} for why a tier refusal acks OK). The pair
      * {@code farSaveAckOk + farSaveAckFailed} must eventually equal the
@@ -467,7 +467,7 @@ public final class FarField {
         }
         // W3: release every far-resident section through the residency's
         // far release path BEFORE the store flushes shut, and reset the
-        // walker's per-world state (docs/FARFIELD-WAVES.md W3: release
+        // walker's per-world state (docs/unreleased/farfield/FARFIELD-WAVES.md W3: release
         // everything on onWorldLeave). Guarded by the io null-check above
         // so a never-armed session still never class-loads the walker —
         // the zero-cost-off posture.

@@ -475,7 +475,7 @@ final class RegionStore {
      * reporting whether the PUBLISHED value actually moved — the
      * two-directional twin {@link #markRetained} could never be, because
      * its boolean already means "the owner still holds the slot" and three
-     * callers branch on that meaning (docs/FARFIELD-WAVES.md H2).
+     * callers branch on that meaning (docs/unreleased/farfield/FARFIELD-WAVES.md H2).
      *
      * <p>Owner-checked exactly like {@link #markRetained}, so a slot
      * stolen out from under the caller is a no-op rather than a bit

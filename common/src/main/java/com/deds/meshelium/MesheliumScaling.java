@@ -687,7 +687,7 @@ public final class MesheliumScaling {
             // describe the near field's own draw path — the far ring
             // overflows the per-frame mask/occlusion lists at these
             // settings either way and those paths fail open (culling
-            // degrades, parity never; docs/FARFIELD-WAVES.md, "M4 AND M5
+            // degrades, parity never; docs/unreleased/farfield/FARFIELD-WAVES.md, "M4 AND M5
             // ANSWERED"). Sizing them to the far ring instead would move
             // the frame lists to the SSBO variant on a world the player
             // pinned as standard, which is a much bigger change than the

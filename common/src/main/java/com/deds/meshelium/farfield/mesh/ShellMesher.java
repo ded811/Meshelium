@@ -140,7 +140,7 @@ import java.util.List;
  * {@code SpriteUvResolver.enumerateVariants} holds one quad table per
  * draw. It rides the Block Variants row (default ON) because it is the
  * one accuracy feature that costs quads on FLAT ground - see
- * docs/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)", for the arithmetic
+ * docs/unreleased/farfield/FARFIELD-WAVES.md, "R4 AND R5 ANSWERED (S1)", for the arithmetic
  * and the merge price, and "P1, P6, P7, P8 ANSWERED" for the census.</p>
  *
  * <h2>Meshing with the 3x3 (pre18, S1 - the owner's R5)</h2>
@@ -358,7 +358,7 @@ import java.util.List;
  * it a no-op; that is true per RECORD and false for a world, because a
  * column taken at the chunk-receive seam is saved with no plane and only
  * gets one when the catch-up sweep re-extracts it. Desk-checked over the
- * four biomes in docs/FARFIELD-WAVES.md's N4 table, the two settings agree
+ * four biomes in docs/unreleased/farfield/FARFIELD-WAVES.md's N4 table, the two settings agree
  * to the byte on a planed record and differ by up to 64 of 255 on one
  * channel on an un-planed one - a bright ocean beside a dark one, which is
  * the only thing this row can draw that vanilla never shows.</p>
@@ -922,7 +922,7 @@ public final class ShellMesher {
      * floor - and those are two more of the five channels
      * {@code Plane} compares. Two independent disqualifiers now stack on
      * the same surfaces, and nothing in this file or in
-     * docs/FARFIELD-WAVES.md has ever priced them together.
+     * docs/unreleased/farfield/FARFIELD-WAVES.md has ever priced them together.
      *
      * <p><b>So the honest state of the cost is: unmeasured.</b> The only
      * number that exists is a NEAR-field one - over 10,000 real sections at
@@ -1104,7 +1104,7 @@ public final class ShellMesher {
      *     floor round a torch the top-face group falls from 251 quads to
      *     68. The one case that costs is a light FRONT crossing the plane,
      *     where the blend widens the varying band by one cell - worst
-     *     measured +16 quads on 256 cells. See docs/FARFIELD-WAVES.md,
+     *     measured +16 quads on 256 cells. See docs/unreleased/farfield/FARFIELD-WAVES.md,
      *     "S3 AND S5 ANSWERED".</li>
      * </ul>
      *
@@ -1128,7 +1128,7 @@ public final class ShellMesher {
      * components, signs, wall fence gates - therefore take shading here
      * that the near field does not draw. The error is DARK, it needs a
      * full cube adjacent, and the fix is one {@code boolean[]} on
-     * {@code SpriteUvResolver.ResolvedPalette}; see docs/FARFIELD-WAVES.md,
+     * {@code SpriteUvResolver.ResolvedPalette}; see docs/unreleased/farfield/FARFIELD-WAVES.md,
      * "S3 AND S5 ANSWERED".</p>
      *
      * <p><b>Cross-chunk, on pre18's apron and nothing else.</b> Both halves
@@ -1398,7 +1398,7 @@ public final class ShellMesher {
      * {@code FarFieldResidency.fileApronNeighbors} files every RESIDENT
      * neighbour of a rewritten column for a replace-in-place re-mesh,
      * drained under a per-pump cap. What is left is a PROMPTNESS bound
-     * rather than a correctness one - see docs/FARFIELD-WAVES.md,
+     * rather than a correctness one - see docs/unreleased/farfield/FARFIELD-WAVES.md,
      * "APRON STALENESS ANSWERED".</p>
      */
     private static final class Apron {
@@ -1573,7 +1573,7 @@ public final class ShellMesher {
      * varies, light already split the merge (it is two of the five
      * channels) and the blended field is AFFINE where the raw one was a
      * staircase, so the merge takes MORE of it - measured in
-     * docs/FARFIELD-WAVES.md, "S3 AND S5 ANSWERED".</p>
+     * docs/unreleased/farfield/FARFIELD-WAVES.md, "S3 AND S5 ANSWERED".</p>
      */
     private static it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap airLight(
             ShellCodec.Shell shell, Apron apron) {
@@ -2027,7 +2027,7 @@ public final class ShellMesher {
      * stored because the sky is above it, but a cell beside a slab set
      * into a floor and roofed over on that side has no exposed face of its
      * own and is absent, so it answers not-occluded. All three are
-     * written up in docs/FARFIELD-WAVES.md ("P4 AND P5 ANSWERED",
+     * written up in docs/unreleased/farfield/FARFIELD-WAVES.md ("P4 AND P5 ANSWERED",
      * "R4 AND R5 ANSWERED (S1)", "S3 AND S5 ANSWERED").</p>
      *
      * <h2>The ORIGIN is a parameter, and that is S3 (pre19)</h2>
@@ -2561,7 +2561,7 @@ public final class ShellMesher {
      * column. A kelp forest's sea floor - and the stalks themselves -
      * drew at sky 14 where vanilla's engine holds sky 0, i.e. a pale flat
      * ocean beside a correctly dark one, per chunk and per record. See
-     * docs/FARFIELD-WAVES.md, "O1 ANSWERED".
+     * docs/unreleased/farfield/FARFIELD-WAVES.md, "O1 ANSWERED".
      *
      * <h2>Why full-cube is the right question and not merely a narrower
      * one</h2>

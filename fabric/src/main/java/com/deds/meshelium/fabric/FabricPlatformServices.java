@@ -8,6 +8,7 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 
 import java.nio.file.Path;
+import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -50,5 +51,25 @@ final class FabricPlatformServices implements MesheliumPlatform.Services {
         // exactly what both callers want, so this is a method reference
         // rather than a wrapper that throws the argument away.
         ClientTickEvents.END_CLIENT_TICK.register(callback::accept);
+    }
+
+    @Override
+    public boolean isModLoaded(String modId) {
+        return FabricLoader.getInstance().isModLoaded(modId);
+    }
+
+    @Override
+    public boolean sodiumAdapterAvailable() {
+        // sodium/ is a source set of this jar (fabric/build.gradle).
+        return true;
+    }
+
+    @Override
+    public Optional<String> modVersion(String modId) {
+        // getModContainer -> Optional<ModContainer>; ModMetadata.getVersion
+        // -> Version; getFriendlyString -> the string a player recognises
+        // (fabric-loader 0.19.3, javap).
+        return FabricLoader.getInstance().getModContainer(modId)
+                .map(c -> c.getMetadata().getVersion().getFriendlyString());
     }
 }
