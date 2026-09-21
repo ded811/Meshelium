@@ -7,10 +7,10 @@ package com.deds.meshelium.vk;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.mixin.GpuDeviceAccessor;
 
-import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.renderpearl.api.device.GpuDevice;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;

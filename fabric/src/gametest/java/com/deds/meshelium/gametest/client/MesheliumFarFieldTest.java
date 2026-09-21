@@ -1531,7 +1531,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
                     + "switch before this leg; it can only prove anything from a cold start");
         }
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             // Hundreds of residency pumps with a real world up: this is
             // the window in which a mis-gated hook would name the walker.
             context.waitTicks(120);
@@ -1672,7 +1672,7 @@ public final class MesheliumFarFieldTest implements FabricClientGameTest {
                 // exactly how this leg failed on its first real run
                 // (2026-08-19). Wait at boot rd, THEN raise, then settle
                 // on counters that have no fixed deadline.
-                singleplayer.getClientLevel().waitForChunksRender();
+                HarnessCompat.waitForChunksRender(singleplayer);
                 setRenderDistanceLikeTheUi(context, FAR_RD);
                 settleLoadedChunks(context);
                 context.waitFor(client -> TerrainDrawer.framesDrawn() > 0

@@ -1,0 +1,35 @@
+# Minecraft 26.3 moved the GPU abstraction out of com.mojang.blaze3d into
+# com.mojang.renderpearl (docs/unreleased/MC26.3-RECON.md). The shared
+# sources are written in 26.3's vocabulary; this table takes them back to
+# 26.2's. One '<canonical> <26.2>' pair per line; the build applies both
+# the dotted and the slashed form, whole names only. Nested classes
+# (VulkanGpuBuffer$Direct) follow their outer class and need no line.
+com.mojang.renderpearl.api.device.GpuDeviceLossException com.mojang.blaze3d.GpuDeviceLossException
+com.mojang.renderpearl.api.pipeline.IndexType com.mojang.blaze3d.IndexType
+com.mojang.renderpearl.api.buffers.GpuBuffer com.mojang.blaze3d.buffers.GpuBuffer
+com.mojang.renderpearl.api.buffers.GpuBufferSlice com.mojang.blaze3d.buffers.GpuBufferSlice
+com.mojang.renderpearl.api.commands.CommandEncoder com.mojang.blaze3d.systems.CommandEncoder
+com.mojang.renderpearl.api.device.DeviceInfo com.mojang.blaze3d.systems.DeviceInfo
+com.mojang.renderpearl.api.device.GpuBackend com.mojang.blaze3d.systems.GpuBackend
+com.mojang.renderpearl.api.device.GpuDevice com.mojang.blaze3d.systems.GpuDevice
+com.mojang.renderpearl.backend.api.GpuDeviceBackend com.mojang.blaze3d.systems.GpuDeviceBackend
+com.mojang.renderpearl.api.commands.GpuQueryPool com.mojang.blaze3d.systems.GpuQueryPool
+com.mojang.renderpearl.api.commands.RenderPass com.mojang.blaze3d.systems.RenderPass
+com.mojang.renderpearl.backend.api.RenderPassBackend com.mojang.blaze3d.systems.RenderPassBackend
+com.mojang.renderpearl.api.textures.FilterMode com.mojang.blaze3d.textures.FilterMode
+com.mojang.renderpearl.api.textures.GpuSampler com.mojang.blaze3d.textures.GpuSampler
+com.mojang.renderpearl.api.textures.GpuTexture com.mojang.blaze3d.textures.GpuTexture
+com.mojang.renderpearl.api.textures.GpuTextureView com.mojang.blaze3d.textures.GpuTextureView
+com.mojang.renderpearl.backend.vulkan.VulkanBackend com.mojang.blaze3d.vulkan.VulkanBackend
+com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder com.mojang.blaze3d.vulkan.VulkanCommandEncoder
+com.mojang.renderpearl.backend.vulkan.VulkanConst com.mojang.blaze3d.vulkan.VulkanConst
+com.mojang.renderpearl.backend.vulkan.VulkanDevice com.mojang.blaze3d.vulkan.VulkanDevice
+com.mojang.renderpearl.backend.vulkan.VulkanGpuBuffer com.mojang.blaze3d.vulkan.VulkanGpuBuffer
+com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler com.mojang.blaze3d.vulkan.VulkanGpuSampler
+com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture com.mojang.blaze3d.vulkan.VulkanGpuTexture
+com.mojang.renderpearl.backend.vulkan.VulkanGpuTextureView com.mojang.blaze3d.vulkan.VulkanGpuTextureView
+com.mojang.renderpearl.backend.vulkan.VulkanPhysicalDevice com.mojang.blaze3d.vulkan.VulkanPhysicalDevice
+com.mojang.renderpearl.backend.vulkan.VulkanQueryPool com.mojang.blaze3d.vulkan.VulkanQueryPool
+com.mojang.renderpearl.backend.vulkan.VulkanRenderPass com.mojang.blaze3d.vulkan.VulkanRenderPass
+com.mojang.renderpearl.backend.vulkan.init.VulkanFeature com.mojang.blaze3d.vulkan.init.VulkanFeature
+com.mojang.renderpearl.backend.vulkan.init.VulkanPNextStruct com.mojang.blaze3d.vulkan.init.VulkanPNextStruct

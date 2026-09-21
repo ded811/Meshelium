@@ -19,7 +19,7 @@ import com.deds.meshelium.terrain.QuadFacing;
 import com.deds.meshelium.terrain.TerrainQuad;
 import com.deds.meshelium.terrain.TerrainVertex;
 
-import com.mojang.blaze3d.IndexType;
+import com.mojang.renderpearl.api.pipeline.IndexType;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.MeshData;
 

@@ -5,6 +5,7 @@
 package com.deds.meshelium.farfield.mesh;
 
 import com.deds.meshelium.farfield.store.ShellCodec;
+import com.deds.meshelium.compat.McCompat;
 import com.deds.meshelium.terrain.QuadFacing;
 
 import net.minecraft.client.Minecraft;
@@ -2216,7 +2217,7 @@ public final class SpriteUvResolver {
             translucent[i] = layer == ChunkSectionLayer.TRANSLUCENT;
             cutoff[i] = (byte) (layer == ChunkSectionLayer.CUTOUT ? 2 : 0);
             tinted[i] = info.tintIndex() >= 0;
-            shaded[i] = info.shade();
+            shaded[i] = McCompat.quadShaded(info, q.direction());
             unit[i] = unitFace(pos, pb, f);
             shift[i] = unit[i] ? planeShift(pos, pb, f) : 0.0f;
             // BEFORE the overlay nudge below, which is this class's own

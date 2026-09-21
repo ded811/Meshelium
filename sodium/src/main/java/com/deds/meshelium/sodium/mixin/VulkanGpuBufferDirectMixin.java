@@ -4,8 +4,8 @@
  */
 package com.deds.meshelium.sodium.mixin;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.vulkan.VulkanConst;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.backend.vulkan.VulkanConst;
 
 import org.lwjgl.vulkan.VK10;
 import org.spongepowered.asm.mixin.Mixin;
@@ -54,14 +54,14 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  * whole set on Sodium being loaded, which is the right scope for a change
  * whose only beneficiary is the Sodium path.
  */
-@Mixin(targets = "com.mojang.blaze3d.vulkan.VulkanGpuBuffer$Direct")
+@Mixin(targets = "com.mojang.renderpearl.backend.vulkan.VulkanGpuBuffer$Direct")
 abstract class VulkanGpuBufferDirectMixin {
 
     @Redirect(
             method = "<init>",
             at = @At(
                     value = "INVOKE",
-                    target = "Lcom/mojang/blaze3d/vulkan/VulkanConst;bufferUsageToVk(I)I"))
+                    target = "Lcom/mojang/renderpearl/backend/vulkan/VulkanConst;bufferUsageToVk(I)I"))
     private static int meshelium$storageCapableVertexBuffers(int usage) {
         int vk = VulkanConst.bufferUsageToVk(usage);
         if ((usage & GpuBuffer.USAGE_VERTEX) != 0) {

@@ -9,6 +9,7 @@ import com.deds.meshelium.MesheliumSmokeRun;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumGate;
+import com.deds.meshelium.MesheliumLaunchCheck;
 import com.deds.meshelium.gui.MesheliumOptionsScreen;
 
 import net.fabricmc.api.ClientModInitializer;
@@ -57,6 +58,9 @@ public final class MesheliumClient implements ClientModInitializer {
                 + "on the first tick where the GPU device exists)", version());
         MesheliumConfig.get();
         MesheliumGate.init();
+        // Did the launcher pass the Java setting Minecraft 26.3 needs? Log +
+        // one toast if not; nothing below Java 25. Shared with the other loader.
+        MesheliumLaunchCheck.run();
         // Wave-10: the extended-RD monitor registers AFTER the gate's tick
         // hook so on the decision tick it already sees the decided state
         // (fabric events run in registration order).

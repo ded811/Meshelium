@@ -13,12 +13,12 @@ import com.deds.meshelium.vk.SodiumGpuVisibilityLayout;
 import com.deds.meshelium.vk.SodiumMirrorGpu;
 import com.deds.meshelium.vk.SodiumTerrainDrawer;
 
-import com.mojang.blaze3d.GpuDeviceLossException;
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.device.GpuDeviceLossException;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import com.mojang.blaze3d.textures.GpuSampler;
-import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.renderpearl.api.textures.GpuSampler;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
 
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderer;
@@ -90,14 +90,21 @@ import net.minecraft.client.Minecraft;
  * none may ever be copied into it. Implementing an interface in order to
  * interoperate is not derivation.</p>
  */
-public final class MesheliumChunkRenderer implements ChunkRenderer {
+public abstract class MesheliumChunkRendererBase {
+    // The class that IMPLEMENTS Sodium's ChunkRenderer is MesheliumChunkRenderer,
+    // one per Minecraft version under versions/mc<v>/sodium/: Sodium 0.9.2's
+    // render(...) grew a RenderPass and an OitStage between 26.2 and 26.3 and
+    // gained prepare(...), and an @Override cannot name two signatures. That
+    // subclass is a constructor, render(...) calling draw(...) then the
+    // delegate, and prepare(...) forwarded; every decision is in this file.
+
 
     /**
      * Sodium's own renderer. It draws every pass Meshelium declines, which
      * today includes all translucent geometry, and it is the landing place
      * for any failure.
      */
-    private final ChunkRenderer delegate;
+    protected final ChunkRenderer delegate;
 
     /** The manager this renderer sits in; null only through the legacy constructor. */
     private final RenderSectionManager manager;
@@ -136,11 +143,11 @@ public final class MesheliumChunkRenderer implements ChunkRenderer {
     private Boolean armed;
 
     /** The legacy seat: no manager, so rung 0 never arms and rungs 1-2 draw as in stage 1. */
-    public MesheliumChunkRenderer(ChunkRenderer delegate) {
+    protected MesheliumChunkRendererBase(ChunkRenderer delegate) {
         this(delegate, null);
     }
 
-    public MesheliumChunkRenderer(ChunkRenderer delegate, RenderSectionManager manager) {
+    protected MesheliumChunkRendererBase(ChunkRenderer delegate, RenderSectionManager manager) {
         if (delegate == null) {
             throw new IllegalArgumentException(
                     "Meshelium's chunk renderer needs Sodium's to delegate to; without it there "
@@ -166,26 +173,11 @@ public final class MesheliumChunkRenderer implements ChunkRenderer {
      *        which Sodium has already folded this pass's matrices and fog
      * @param sectionTimeInfo Sodium's per-section fade timestamps
      */
-    @Override
-    public void render(ChunkRenderMatrices matrices, ChunkRenderListIterable renderLists,
-            TerrainRenderPass pass, CameraTransform camera, FogParameters fog,
-            boolean useTranslucencySorting, GpuSampler atlasSampler, GpuBufferSlice globalsUbo,
-            GpuBuffer sectionTimeInfo) {
-        if (meshelium$draw(matrices, renderLists, pass, camera, fog, atlasSampler)) {
-            return;
-        }
-        if (pass != null && !pass.isTranslucent()) {
-            SodiumTerrainDrawer.reportRung("2"); // an opaque pass handed back whole
-        }
-        this.delegate.render(matrices, renderLists, pass, camera, fog, useTranslucencySorting,
-                atlasSampler, globalsUbo, sectionTimeInfo);
-    }
-
     /**
      * @return true when Meshelium has recorded this pass and Sodium must
      *         not draw it again
      */
-    private boolean meshelium$draw(ChunkRenderMatrices matrices,
+    protected final boolean draw(ChunkRenderMatrices matrices,
             ChunkRenderListIterable renderLists, TerrainRenderPass pass, CameraTransform camera,
             FogParameters fog, GpuSampler atlasSampler) {
         // Checked before any enumeration, because building a draw list is
@@ -561,7 +553,20 @@ public final class MesheliumChunkRenderer implements ChunkRenderer {
         }
     }
 
-    private boolean armed() {
+    /**
+     * The cheap half of {@link #draw}'s early-outs, for the 26.3 subclass to
+     * test before it suspends vanilla's main pass: a translucent pass, an
+     * unarmed adapter or a drawer that is off or latched would be declined
+     * by draw() before any GPU work, so they must not pay for a suspension
+     * either. Anything draw() declines AFTER these still resumes the pass
+     * and hands it to Sodium, at the cost of one end/begin pair.
+     */
+    protected final boolean wantsDraw(TerrainRenderPass pass) {
+        return pass != null && !pass.isTranslucent() && armed()
+                && SodiumTerrainDrawer.enabled() && !SodiumTerrainDrawer.broken();
+    }
+
+    protected final boolean armed() {
         Boolean a = this.armed;
         if (a == null) {
             // Keyed on the gate's answer rather than on the raw
@@ -597,7 +602,6 @@ public final class MesheliumChunkRenderer implements ChunkRenderer {
         return a;
     }
 
-    @Override
     public void rotate() {
         this.delegate.rotate();
     }
@@ -609,7 +613,6 @@ public final class MesheliumChunkRenderer implements ChunkRenderer {
      * every row queued dead before the instance retires behind vanilla's
      * deferred-destroy rotation.
      */
-    @Override
     public void delete() {
         this.frame.clear();
         this.frameOwned = false;

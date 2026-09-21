@@ -7,7 +7,7 @@ package com.deds.meshelium.mixin;
 import com.deds.meshelium.MesheliumCpuStages;
 import com.deds.meshelium.vk.SodiumTerrainDrawer;
 
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;

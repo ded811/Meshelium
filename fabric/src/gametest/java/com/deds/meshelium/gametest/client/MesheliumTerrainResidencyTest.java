@@ -39,7 +39,7 @@ public final class MesheliumTerrainResidencyTest implements FabricClientGameTest
         // The boot-smoke test already opened and closed a world on this
         // client, so a dispose snapshot may exist BEFORE our world closes —
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             if (vulkanRun) {
                 assertResidencyLive(context);
                 assertBacklogDrains(context);
@@ -130,8 +130,8 @@ public final class MesheliumTerrainResidencyTest implements FabricClientGameTest
      */
     private static void walkCamera(TestSingleplayerContext singleplayer) {
         singleplayer.getServer().runCommand("execute as @p at @s run tp @s ~128 ~ ~");
-        singleplayer.getClientLevel().waitForChunksDownload();
-        singleplayer.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksDownload(singleplayer);
+        HarnessCompat.waitForChunksRender(singleplayer);
     }
 
     private static void assertGrowth(ClientGameTestContext context, long uploadedBefore) {
@@ -196,7 +196,7 @@ public final class MesheliumTerrainResidencyTest implements FabricClientGameTest
     private static void assertFreesFlowInSecondWorld(ClientGameTestContext context) {
         long freedBefore = TerrainResidency.counters().freedSections();
         try (TestSingleplayerContext second = context.worldBuilder().create()) {
-            second.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(second);
             context.waitFor(client ->
                     TerrainResidency.counters().freedSections() > freedBefore,
                     RESIDENCY_TIMEOUT_TICKS);

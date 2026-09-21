@@ -41,10 +41,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.levelgen.presets.WorldPresets;
 
-import org.lwjgl.glfw.GLFW;
-import org.lwjgl.system.MemoryStack;
 
-import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -992,7 +989,7 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
             // Vanilla's fields are what the render target is sized from, so
             // getWidth/getHeight ARE the pixels being shaded and are the
             // number that belongs beside a per-pixel cost. The real OS
-            // framebuffer is queried straight from GLFW so a clamped or
+            // framebuffer is queried straight from the windowing layer so a clamped or
             // refused window is visible rather than silently equal.
             int[] fb = new int[6];
             context.runOnClient(client -> {
@@ -1000,13 +997,9 @@ public final class MesheliumBenchmarkTest implements FabricClientGameTest {
                 fb[1] = client.getWindow().getHeight();
                 fb[2] = client.getWindow().getScreenWidth();
                 fb[3] = client.getWindow().getScreenHeight();
-                try (MemoryStack stack = MemoryStack.stackPush()) {
-                    IntBuffer w = stack.mallocInt(1);
-                    IntBuffer h = stack.mallocInt(1);
-                    GLFW.glfwGetFramebufferSize(client.getWindow().handle(), w, h);
-                    fb[4] = w.get(0);
-                    fb[5] = h.get(0);
-                }
+                int[] real = HarnessCompat.queryFramebufferSize(client.getWindow());
+                fb[4] = real[0];
+                fb[5] = real[1];
             });
 
             // ---- report ----

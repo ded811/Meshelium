@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/loader-Fabric%20%7C%20NeoForge-5B4FCF?style=flat-square" alt="Fabric and NeoForge">
   <a href="https://modrinth.com/mod/fabric-api"><img src="https://img.shields.io/badge/on%20Fabric%2C%20also%20install-Fabric%20API-1976D2?style=flat-square" alt="Fabric API on Modrinth"></a>
   <a href="https://modrinth.com/mod/bobby"><img src="https://img.shields.io/badge/for%20multiplayer%2C%20also%20install-Bobby-7E57C2?style=flat-square" alt="Bobby on Modrinth"></a>
-  <img src="https://img.shields.io/badge/Minecraft-26.2-brightgreen?style=flat-square" alt="Minecraft 26.2">
+  <img src="https://img.shields.io/badge/Minecraft-26.2%20%7C%2026.3-brightgreen?style=flat-square" alt="Minecraft 26.2 and 26.3">
 </p>
 
 Frames per second at 1920x1080, same computer, same world, looking the same way, at default settings. One run with Meshelium, one without.
@@ -41,7 +41,7 @@ These are our numbers on our computer: one graphics card, one world, one spot. Y
 
 ## What you need
 
-- **Minecraft 26.2**, on either the **Fabric** or the **NeoForge** loader. Download the build that matches yours; they are the same mod
+- **Minecraft 26.2 or 26.3**, on either the **Fabric** or the **NeoForge** loader. Download the build that matches your game version and your loader; they are all the same mod
 - On Fabric, [**Fabric API**](https://modrinth.com/mod/fabric-api) as well, the helper mod almost every mod wants. Put it in your mods folder too. NeoForge needs no extra mod
 - Windows or Linux. Sorry, no Mac: Macs don't do mesh shaders on Vulkan yet
 - A graphics card that supports mesh shaders, which means **AMD** RX 6000 or newer, **NVIDIA** GTX 16xx or newer, or **Intel** Arc. Newer laptop and handheld chips count too, including the Steam Deck
@@ -67,10 +67,12 @@ They work together now. Sodium builds the chunks and Meshelium draws them with
 mesh shaders. Install both and it happens on its own - there is nothing to
 switch on.
 
-Use **Sodium 0.9.2-beta.1**. Meshelium plugs into parts of Sodium that were
-never meant for other mods to touch, so a different version may not fit. The
-Meshelium settings screen shows which version you have and says whether it is
-the one this build was made for.
+Use **Sodium 0.9.2** for your game version - the release, not the newer
+0.9.3 alpha. (On 26.2, Sodium 0.9.2-beta.1 is the same build with a
+different version number, and works too.) Meshelium plugs into parts of
+Sodium that were never meant for other mods to touch, so a different version
+may not fit. The Meshelium settings screen shows which version you have and
+says whether it is the one this build was made for.
 
 If you would rather Sodium drew everything by itself, start the game with
 `-Dmeshelium.sodium.adapter=false`.

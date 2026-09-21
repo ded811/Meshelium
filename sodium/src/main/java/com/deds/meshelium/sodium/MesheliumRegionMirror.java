@@ -12,7 +12,7 @@ import com.deds.meshelium.vk.SodiumTerrainDrawer;
 import com.deds.meshelium.vk.TerrainDrawer;
 import com.deds.meshelium.sodium.mixin.ChunkRenderListAccessor;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
 
 import net.caffeinemc.mods.sodium.client.SodiumClientMod;
 import net.caffeinemc.mods.sodium.client.render.chunk.RenderSectionManager;

@@ -114,7 +114,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         optionsScreenSmoke(context);
 
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             waitForDrawing(context, "initial world");
             assertConfigGraduationLive(context);
             assertResourceReloadSurvives(context);
@@ -164,7 +164,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
      */
     private static void assertRebuildHandover(ClientGameTestContext context) {
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             waitForDrawing(context, "handover leg");
             if (!VanillaUploadSeam.armed()) {
                 throw new AssertionError("the seam is not armed, so this leg would pass "
@@ -186,7 +186,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             for (int round = 0; round < 3; round++) {
                 server.runCommand("fill ~-16 ~12 ~-16 ~16 ~15 ~16 "
                         + (round % 2 == 0 ? "stone" : "air"));
-                singleplayer.getClientLevel().waitForChunksRender();
+                HarnessCompat.waitForChunksRender(singleplayer);
                 waitForDrawing(context, "handover rebuild round " + round);
             }
 
@@ -244,7 +244,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         context.runOnClient(client ->
                 System.setProperty("meshelium.tune.arenaTrimQuietSec", "2"));
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             waitForDrawing(context, "trim leg standup");
             long capacityBefore = TerrainResidency.counters().arenaCapacityBytes();
             try {
@@ -275,7 +275,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             for (int round = 0; round < 2; round++) {
                 server.runCommand("fill ~-16 ~12 ~-16 ~16 ~15 ~16 "
                         + (round % 2 == 0 ? "stone" : "glass"));
-                singleplayer.getClientLevel().waitForChunksRender();
+                HarnessCompat.waitForChunksRender(singleplayer);
                 waitForDrawing(context, "post-trim rebuild round " + round);
             }
             if (totalDrops() != droppedBefore) {
@@ -303,7 +303,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             pinBudgetLegContent();
         });
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             // The same world content that overflows a FIXED 1 MiB arena in
             // the guard leg must grow right through it here.
             try {
@@ -619,7 +619,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
                             + "observed during world creation - the note-11 teardown did not run", t);
                 }
                 previousDispose = TerrainResidency.lastDisposeSnapshot();
-                singleplayer.getClientLevel().waitForChunksRender();
+                HarnessCompat.waitForChunksRender(singleplayer);
                 waitForDrawing(context, "world hop " + hopNumber);
             }
         }
@@ -638,7 +638,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
             pinBudgetLegContent();
         });
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             // The 1 MiB arena (16384 quads) fills in the first pumps —
             // and since wave 14 the property also pins the CEILING to
             // 1 MiB, so growth is exhausted before it can start. "Fills"
@@ -720,7 +720,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         // A normal world re-arms the switch: fresh baseline, clean
         // counters, drawing resumes.
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             waitForDrawing(context, "post-guard normal world");
             if (TerrainDrawer.coveragePassive()) {
                 throw new AssertionError("coverage guard still passive in a clean world - "
@@ -776,7 +776,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
         final int raised = 40;
         final int rdBefore = context.computeOnClient(client -> client.options.renderDistance().get());
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             context.runOnClient(client -> {
                 // The property outranks the config, and the harness always
                 // sets it, so the master switch is unreachable until it goes.
@@ -854,7 +854,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
                 MesheliumConfig.get().suppressVanillaUploads = true;
                 VanillaUploadSeam.onSettingChanged();
             });
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             waitForDrawing(context, "swap leg, suppression armed");
 
             // --- Meshelium -> vanilla -------------------------------------
@@ -905,7 +905,7 @@ public final class MesheliumLifecycleTortureTest implements FabricClientGameTest
 
             // --- vanilla -> Meshelium -------------------------------------
             context.runOnClient(client -> MesheliumConfig.get().enableTerrainRendering = true);
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             waitForDrawing(context, "swap leg, Meshelium switched back on");
         } finally {
             context.runOnClient(client -> {

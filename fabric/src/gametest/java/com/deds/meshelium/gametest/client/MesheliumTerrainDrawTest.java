@@ -151,7 +151,7 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
 
         try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
             freezeWorld(singleplayer);
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
 
             // The drawer must be live: frames recorded, sections drawn, no error.
             context.waitFor(client ->
@@ -2160,10 +2160,16 @@ public final class MesheliumTerrainDrawTest implements FabricClientGameTest {
             // offset 586), so that getter reads null between frames on every
             // graphics setting there is. The drawer counts it at the point
             // it picks its target instead.
-            long separateBefore = TerrainDrawer.translucentSeparateTargetFrames();
+            // Version-neutral witness (2026-09-20): 26.2 counts frames whose
+            // translucent target was the separate one; 26.3 has no such
+            // target - improved transparency is order-independent there and
+            // the group is drawn at the end of the solid pass by a 26.3-only
+            // seam that reports itself. improvedTransparencyFrames() is the
+            // sum, and only one term can move in a session.
+            long improvedBefore = TerrainDrawer.improvedTransparencyFrames();
             quiesce(context);
             context.waitFor(
-                    client -> TerrainDrawer.translucentSeparateTargetFrames() > separateBefore,
+                    client -> TerrainDrawer.improvedTransparencyFrames() > improvedBefore,
                     DRAW_TIMEOUT_TICKS);
 
             long framesBefore = TerrainDrawer.translucentFrames();

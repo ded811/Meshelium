@@ -6,7 +6,7 @@ package com.deds.meshelium.mixin;
 
 import com.deds.meshelium.vk.MesheliumProjectionCapture;
 
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 
 import net.minecraft.client.renderer.ProjectionMatrixBuffer;
 
@@ -40,7 +40,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(ProjectionMatrixBuffer.class)
 abstract class ProjectionMatrixBufferMixin {
 
-    @Inject(method = "getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/blaze3d/buffers/GpuBufferSlice;",
+    @Inject(method = "getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;",
             at = @At("RETURN"))
     private void meshelium$captureProjection(Matrix4f matrix,
             CallbackInfoReturnable<GpuBufferSlice> cir) {

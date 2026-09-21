@@ -35,15 +35,20 @@ Sodium keeps doing what it is best at - building the chunks - and Meshelium
 draws them with mesh shaders. Install both and it happens on its own; there is
 nothing to switch on.
 
+Measured on a Radeon RX 9070 XT at 1920x1080, standing in the same spot in the
+same world: with Meshelium drawing, the frame is about **twice as fast as
+Sodium on its own** - 1.9x at render distance 64, and 1.8x at 96.
+
 You also get **GPU Visibility**, which only exists on this path: Meshelium
 works out what you can actually see on the graphics card itself, instead of
 drawing everything it is handed.
 
-Use **Sodium 0.9.2-beta.1**. Modrinth lists it under Versions as a beta, so you
-have to pick it deliberately rather than taking the top entry. Meshelium plugs
-into parts of Sodium that were never meant for other mods to touch, so another
-version may not fit; the Meshelium settings screen shows which one you have and
-says whether it matches.
+Use **Sodium 0.9.2** for your game version - the release, not the newer
+0.9.3 alpha. (On 26.2, Sodium 0.9.2-beta.1 is the same build with a
+different version number, and works too.) Meshelium plugs into parts of
+Sodium that were never meant for other mods to touch, so another version may
+not fit; the Meshelium settings screen shows which one you have and says
+whether it matches.
 
 With Sodium installed the Meshelium settings screen is **shorter**. The settings
 that only change how Meshelium builds chunks have nothing to do while Sodium is
@@ -52,7 +57,8 @@ below. They come back if you remove Sodium.
 
 ## What you need
 
-- **Minecraft 26.2**, on **Fabric** or **NeoForge** - pick the matching download
+- **Minecraft 26.2 or 26.3**, on **Fabric** or **NeoForge** - pick the download
+  that matches your game version and your loader
 - On Fabric, [**Fabric API**](https://modrinth.com/mod/fabric-api) as well.
   NeoForge needs no extra mod
 - Windows or Linux. No Mac: Macs don't do mesh shaders on Vulkan yet
@@ -155,22 +161,28 @@ every time the game starts.
 
 ## NeoForge and the early loading screen
 
-**Handled for you; here is what is happening.** NeoForge's loading
-screen and Minecraft's Vulkan renderer cannot both exist. The loading
-screen creates the game window in OpenGL mode, and Vulkan — the renderer Meshelium runs on — cannot draw to a window made
-that way, so the game dies during start-up with a GLFW error that blames
-your graphics drivers. It is not your drivers, and updating them will not
-help. It is a known NeoForge issue (neoforged/NeoForge#3230) and its fix
-has not been merged.
+**On Minecraft 26.2 - handled for you; here is what is happening.**
+NeoForge's loading screen and Minecraft's Vulkan renderer cannot both
+exist. The loading screen creates the game window in OpenGL mode, and
+Vulkan - the renderer Meshelium runs on - cannot draw to a window made that
+way, so the game dies during start-up with a GLFW error that blames your
+graphics drivers. It is not your drivers, and updating them will not help.
+It is a known NeoForge issue (neoforged/NeoForge#3230) and its fix has not
+been merged.
 
-**You do not have to do anything about it.** Meshelium closes that
-loading screen in the instant before the game creates its window, so the
-game starts normally. You get no loading screen and a game window that
-appears a moment later than usual; nothing else changes. Meshelium also
-turns `earlyWindowControl` off in `config/fml.toml`, so that even on a
-future NeoForge build where the live fix no longer applies, the game
-still starts.
+You do not have to do anything about it. Meshelium closes that loading
+screen in the instant before the game creates its window, so the game
+starts normally. You get no loading screen and a game window that appears
+a moment later than usual; nothing else changes. Meshelium also turns
+`earlyWindowControl` off in `config/fml.toml`, so that even on a future
+NeoForge build where the live fix no longer applies, the game still starts.
 
-On OpenGL none of this happens and the loading screen is left alone.
+**On Minecraft 26.3 - nothing to handle.** NeoForge for 26.3 currently
+ships with its early loading screen switched off altogether (its loader
+ignores the setting), and the game makes its own window, so the problem
+above cannot happen. Meshelium leaves everything alone there and says so in
+the log.
+
+On OpenGL none of this applies and the loading screen is left alone.
 
 The Fabric build is unaffected.

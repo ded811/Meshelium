@@ -46,21 +46,23 @@ config = "meshelium.neoforge.mixins.json"
 config = "meshelium.sodium.mixins.json"
 requiredMods = ["sodium"]
 
-# Upper-bounded on purpose. Every one of the 38 shared mixins is pinned to a
-# method descriptor in Minecraft 26.2's bytecode, and NeoForge recompiles
-# the whole game, so a NeoForge built for 26.3 would be a different set of
-# descriptors. Refusing to load is the correct failure; applying half the
-# mixins and rendering nothing is not.
+# Upper-bounded on purpose. Every one of the shared mixins is pinned to a
+# method descriptor in one Minecraft version's bytecode, and NeoForge
+# recompiles the whole game, so a NeoForge built for the next version is a
+# different set of descriptors. Refusing to load is the correct failure;
+# applying half the mixins and rendering nothing is not. The bounds are
+# expanded by the build from versions/mc<target>.properties, so the jar
+# built for 26.3 says [26.3,26.4) here and the 26.2 one says [26.2,26.3).
 [[dependencies.meshelium]]
 modId = "neoforge"
 type = "required"
-versionRange = "[26.2,26.3)"
+versionRange = "[${minecraft_version},${minecraft_version_next})"
 ordering = "NONE"
 side = "CLIENT"
 
 [[dependencies.meshelium]]
 modId = "minecraft"
 type = "required"
-versionRange = "[26.2,26.3)"
+versionRange = "[${minecraft_version},${minecraft_version_next})"
 ordering = "NONE"
 side = "CLIENT"

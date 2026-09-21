@@ -182,7 +182,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         context.runOnClient(client -> SodiumTerrainDrawer.setGpuDrawEnabled(false));
 
         try (TestSingleplayerContext world = context.worldBuilder().create()) {
-            world.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(world);
             context.takeScreenshot(TestScreenshotOptions.of("90_meshelium_sodium_stand_down"));
 
             assertMesheliumDrawsSodiumsTerrain(context);
@@ -243,7 +243,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
                                     .getOrThrow(WorldPresets.NORMAL)));
                 })
                 .create()) {
-            world.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(world);
             // Worldgen keeps arriving after the first drawable frame, and a
             // shot taken while a tree is still building photographs a hole
             // that is not a bug.
@@ -497,7 +497,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
                     + "empty regions should die in RenderRegionManager.update");
         }
         server.runCommand(home);
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         context.waitTicks(40);
         context.takeScreenshot(TestScreenshotOptions.of("96_03_after_reload"));
 
@@ -528,7 +528,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
             client.options.renderDistance().set(rdBefore);
             client.options.save();
         });
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         context.waitTicks(40);
         context.takeScreenshot(TestScreenshotOptions.of("96_04_rd_back"));
 
@@ -892,7 +892,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         legs.home = teleportCommand(legs.x, legs.y, legs.z, legs.yaw, GPU_PITCH);
         server.runCommand(legs.home);
         context.waitTicks(5);
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         context.waitTicks(20);
         System.out.println("[Meshelium] pinPose: world frozen (noon, no weather, no mobs, no "
                 + "random ticks, clouds OFF) and the pose snapped to mid-section/mid-region "
@@ -1158,7 +1158,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
                     + "means the dirty tracking missed a mutation");
         }
         server.runCommand(legs.home);
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         context.waitTicks(40);
         waitForUploadsToSettle(context);
         // A returned region gets its id at the first owned frame after its
@@ -1241,7 +1241,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
                     + SodiumGpuVisibilityLayout.CAPACITY_INITIAL);
         }
         setRenderDistance(context, rdBefore);
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         context.waitTicks(40);
         long ownedBack = SodiumTerrainDrawer.framesOwned();
         waitForRung(context, rung, ownedBack, leg + " (rd back to " + rdBefore + ")");
@@ -1536,7 +1536,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         } finally {
             context.runOnClient(client -> SodiumTerrainDrawer.setMirrorCapacityForTest(0));
             setRenderDistance(context, rdBefore);
-            world.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(world);
             context.waitTicks(40);
         }
     }
@@ -2599,7 +2599,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         context.takeScreenshot(TestScreenshotOptions.of("97_12_cut_f3"));
         assertNotBroken("97_12");
         server.runCommand(legs.home);
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         context.waitTicks(40);
         waitForUploadsToSettle(context);
     }
@@ -2615,7 +2615,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         long retiredBefore = SodiumTerrainDrawer.instancesRetired();
         context.runOnClient(client -> client.levelExtractor.allChanged());
         context.waitTicks(100);
-        world.getClientLevel().waitForChunksRender();
+        HarnessCompat.waitForChunksRender(world);
         long owned = SodiumTerrainDrawer.framesOwned();
         waitForRung(context, "0a", owned, "97_14");
         if (!pollTicks(context, 200, () -> SodiumTerrainDrawer.framesOwned() > owned + 10)) {
@@ -3626,7 +3626,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
             client.options.renderDistance().set(64);
         });
         context.runOnClient(client -> client.gui.setScreen(
-                new OptionsScreen(client.gui.screen(), client.options, true)));
+                HarnessCompat.optionsScreen(client.gui.screen(), client.options, true)));
         context.waitTicks(2);
         // The pause-menu shape (inWorld = true) of the "Meshelium..." row.
         // assertOptionsMenuButtonUnderSodium pins the title-screen shape;
@@ -3775,7 +3775,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
             // The TitleScreen shape (inWorld = false, as TitleScreen builds
             // it); assertSodiumSliderAcceptsTheWidenedRange pins the
             // pause-menu shape.
-            menu[0] = new OptionsScreen(client.gui.screen(), client.options, false);
+            menu[0] = HarnessCompat.optionsScreen(client.gui.screen(), client.options, false);
             client.gui.setScreen(menu[0]);
         });
         context.waitForScreen(OptionsScreen.class);

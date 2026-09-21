@@ -197,7 +197,7 @@ upward the frames are long enough that repeat runs land within a few percent.
 > comfortably FASTER than not having it at every distance measured, not
 > just above 48. See [the numbers after the
 > fix](#the-numbers-after-the-atomic-fix) below and
-> [`OCCLUSION-FILLRATE-DESIGN.md`](OCCLUSION-FILLRATE-DESIGN.md) stage 1a.
+> `OCCLUSION-FILLRATE-DESIGN.md` (an internal design note) stage 1a.
 > The section is kept as written because the reasoning it contains is
 > sound and only the premise was wrong, and because the default is still
 > off until the re-enable gate is cleared.

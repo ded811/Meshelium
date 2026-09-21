@@ -6,7 +6,7 @@ package com.deds.meshelium.vk;
 
 import com.deds.meshelium.MesheliumLog;
 
-import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import org.lwjgl.vulkan.VkDevice;
 

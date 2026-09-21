@@ -44,6 +44,11 @@ WHAT IS DELIBERATELY PUBLISHED
                               into the shipped jar, so under LGPL-3.0 it is
                               corresponding source and must ship. It contains
                               no Sodium code.
+  versions/                   the per-Minecraft-version layout (versions/
+                              README.md): toolchain properties, the rename
+                              table and the overlay files. Every published
+                              jar is built from these, so they are
+                              corresponding source too.
   the far-field CODE          same reason: compiled in, therefore published,
                               even though the feature is unreachable
 """
@@ -81,6 +86,7 @@ docs/*
 !docs/MODRINTH.md
 !docs/PERFORMANCE.md
 !docs/TECHNICAL.md
+!docs/TROUBLESHOOTING.md
 !docs/fps-chart.png
 !docs/fps-chart-rd64.png
 !docs/releases/
@@ -93,6 +99,7 @@ DOCS_ALLOW_FILES = {
     "docs/MODRINTH.md",
     "docs/PERFORMANCE.md",
     "docs/TECHNICAL.md",
+    "docs/TROUBLESHOOTING.md",
     "docs/fps-chart.png",
     "docs/fps-chart-rd64.png",
 }
@@ -148,6 +155,17 @@ def build(out_dir):
     # The .gitignore is the one file that must NOT be the private copy.
     private_ignore = open(os.path.join(PRIVATE_ROOT, ".gitignore"),
                           encoding="utf-8").read().rstrip("\n")
+    # The private file opens with a banner that says "do not copy this to
+    # the public repo"; the public copy must not start with that sentence.
+    # The banner is the first comment block, closed by a rule of dashes.
+    lines = private_ignore.split("\n")
+    if lines and lines[0].startswith("# ---"):
+        end = next((i for i, l in enumerate(lines[1:], 1) if l.startswith("# ---")), None)
+        if end is not None:
+            lines = lines[end + 1:]
+            while lines and not lines[0].strip():
+                lines.pop(0)
+    private_ignore = "\n".join(lines)
     with open(os.path.join(out_dir, ".gitignore"), "w",
               encoding="utf-8", newline="\n") as fh:
         fh.write(private_ignore + "\n" + PUBLIC_DOCS_BLOCK)
@@ -171,6 +189,16 @@ def verify(out_dir, keep):
     for line in ("docs/*", "!docs/MODRINTH.md", "!docs/releases/"):
         if line not in ig:
             problems.append(".gitignore is missing the rule: " + line)
+    # Every allowlisted doc must also be un-ignored, or it is copied into a
+    # tree whose .gitignore hides it from the public commit.
+    for f in sorted(DOCS_ALLOW_FILES):
+        if ("!" + f) not in PUBLIC_DOCS_BLOCK:
+            problems.append("allowlisted but not un-ignored: " + f)
+    for d in DOCS_ALLOW_DIRS:
+        if ("!" + d) not in PUBLIC_DOCS_BLOCK:
+            problems.append("allowlisted dir not un-ignored: " + d)
+    if "DO NOT COPY IT TO THE PUBLIC REPO" in ig:
+        problems.append(".gitignore still carries the private banner")
 
     # LGPL: the adapter source compiles into the jar, so it has to ship.
     if not any(f.startswith("sodium/") for f in keep):

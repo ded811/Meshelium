@@ -1,3 +1,6 @@
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+
 // Meshelium — cross-vendor mesh-shader terrain renderer on Minecraft 26.2's
 // vanilla Vulkan backend.
 //
@@ -40,63 +43,278 @@
 // byte-for-byte the toolchain that has gated this project all along.
 
 // ======================================================================
+// THE MINECRAFT TARGET (2026-09-20)
+//
+// One source tree, several Minecraft versions. versions/README.md is the
+// manual; this block is the machinery. It runs before either loader
+// project is evaluated (Gradle configures the root first), so everything
+// it puts in `ext` is a plain `project.foo` by the time fabric/build.gradle
+// and neoforge/build.gradle read it - the same names the two scripts read
+// out of gradle.properties before 2026-09-20.
+// ======================================================================
+
+def mesheliumTarget = rootProject.property('mc').toString().trim()
+def mesheliumCanonical = rootProject.property('mc_canonical').toString().trim()
+def mesheliumTargetFile = rootProject.file("versions/mc${mesheliumTarget}.properties")
+if (!mesheliumTargetFile.isFile()) {
+	def known = rootProject.file('versions').listFiles()
+			.findAll { it.name ==~ /mc.+\.properties/ }
+			.collect { it.name.replaceAll(/^mc|\.properties$/, '') }
+			.sort()
+	throw new GradleException("Unknown Minecraft target mc=${mesheliumTarget}: there is no "
+			+ "versions/mc${mesheliumTarget}.properties. Known targets: ${known}. "
+			+ "See versions/README.md.")
+}
+def mesheliumTargetProps = new Properties()
+mesheliumTargetFile.withInputStream { mesheliumTargetProps.load(it) }
+['minecraft_version', 'loader_version', 'fabric_api_version', 'neoforge_version',
+ 'sodium_base_version'].each { key ->
+	if (!mesheliumTargetProps.getProperty(key)?.trim()) {
+		throw new GradleException("versions/mc${mesheliumTarget}.properties is missing ${key}")
+	}
+}
+def mesheliumMinecraft = mesheliumTargetProps.getProperty('minecraft_version').trim()
+if (mesheliumMinecraft != mesheliumTarget) {
+	throw new GradleException("versions/mc${mesheliumTarget}.properties says minecraft_version="
+			+ "${mesheliumMinecraft}; the file name and the property must agree")
+}
+// The exclusive upper bound for a "[26.3,26.4)" range: bump the last
+// component. Minecraft's versions have been <year>.<n> since 26.1.
+def mesheliumMinecraftNext = {
+	def parts = mesheliumMinecraft.split(/\./)
+	if (parts.length < 2 || !(parts[-1] ==~ /\d+/)) {
+		throw new GradleException("Cannot derive the next version after ${mesheliumMinecraft}")
+	}
+	parts[-1] = (parts[-1].toInteger() + 1).toString()
+	parts.join('.')
+}()
+def mesheliumSodiumBase = mesheliumTargetProps.getProperty('sodium_base_version').trim()
+
+allprojects {
+	ext.mc = mesheliumTarget
+	ext.mc_is_canonical = (mesheliumTarget == mesheliumCanonical)
+	ext.minecraft_version = mesheliumMinecraft
+	ext.minecraft_version_next = mesheliumMinecraftNext
+	ext.loader_version = mesheliumTargetProps.getProperty('loader_version').trim()
+	ext.fabric_api_version = mesheliumTargetProps.getProperty('fabric_api_version').trim()
+	ext.neoforge_version = mesheliumTargetProps.getProperty('neoforge_version').trim()
+	// Sodium: ONE base version, three derived strings. The Modrinth
+	// coordinate is <mcversion>-<version>-<loader> and the version the
+	// loader reports is <version>+<mcversion> (unzip -p fabric.mod.json of
+	// the shipped jar). Deriving all three from one property is what makes
+	// "bump both or neither" true by construction; until 2026-09-20 a
+	// configuration-time check compared two hand-kept copies instead.
+	ext.sodium_version = "mc${mesheliumMinecraft}-${mesheliumSodiumBase}-fabric".toString()
+	ext.sodium_neoforge_version = "mc${mesheliumMinecraft}-${mesheliumSodiumBase}-neoforge".toString()
+	ext.sodium_built_against = "${mesheliumSodiumBase}+mc${mesheliumMinecraft}".toString()
+	ext.sodium_also_matching = (mesheliumTargetProps.getProperty('sodium_also_matching') ?: '').trim()
+	// -XX:StackShadowPages this version's launch profile passes; 0 = none, check off.
+	ext.launch_shadow_pages = (mesheliumTargetProps.getProperty('launch_shadow_pages') ?: '0').trim()
+	// 1.6.1+mc26.3: the mod version and the game it is for, in one string,
+	// the shape Sodium uses. This is the jar's version on both loaders.
+	ext.mod_version_full = "${rootProject.mod_version}+mc${mesheliumMinecraft}".toString()
+	// What processResources expands into meshelium-build.properties and the
+	// two manifests. One map so the loaders cannot expand different values.
+	ext.mesheliumBuildExpansion = [
+			'minecraft_target'      : mesheliumMinecraft,
+			'minecraft_version'     : mesheliumMinecraft,
+			'minecraft_version_next': mesheliumMinecraftNext,
+			'sodium_built_against'  : ext.sodium_built_against,
+			'sodium_also_matching'  : ext.sodium_also_matching,
+			'launch_shadow_pages'   : ext.launch_shadow_pages,
+	]
+}
+
+// ---- the rename table for a derived target ---------------------------
+// versions/mc<target>/renames.txt: "<canonical FQN> <target FQN>" per line.
+// Both the dotted form (imports, code) and the slashed form (mixin
+// descriptor strings such as "Lcom/mojang/blaze3d/vulkan/VulkanConst;")
+// are applied. Longest names first, and a name only matches when the next
+// character is not an identifier character, so a rename of GpuBuffer can
+// never eat GpuBufferSlice. Absent file = no renames.
+def mesheliumRenameFile = rootProject.file("versions/mc${mesheliumTarget}/renames.txt")
+def mesheliumRenamePairs = []
+if (mesheliumRenameFile.isFile()) {
+	mesheliumRenameFile.eachLine { line ->
+		def t = line.trim()
+		if (!t || t.startsWith('#')) {
+			return
+		}
+		def parts = t.split(/\s+/)
+		if (parts.length != 2 || parts[0] == parts[1]) {
+			throw new GradleException("${mesheliumRenameFile}: expected '<canonical> <target>', got: ${line}")
+		}
+		mesheliumRenamePairs << [parts[0], parts[1]]
+		mesheliumRenamePairs << [parts[0].replace('.', '/'), parts[1].replace('.', '/')]
+	}
+	mesheliumRenamePairs.sort { -it[0].length() }
+}
+def mesheliumRenamePatterns = mesheliumRenamePairs.collect { pair ->
+	[Pattern.compile(Pattern.quote(pair[0]) + '(?![A-Za-z0-9_])'), Matcher.quoteReplacement(pair[1])]
+}
+ext.mesheliumRenameLine = { String line ->
+	def out = line
+	for (p in mesheliumRenamePatterns) {
+		out = p[0].matcher(out).replaceAll(p[1])
+	}
+	return out
+}
+
+/**
+ * A source root, as this target sees it: a LIST of directories to hand to
+ * `java.srcDirs` / `resources.srcDirs`.
+ *
+ * For the canonical target that is the real directory plus its own
+ * overlay, untouched, so the IDE and the compiler look at the same files.
+ * For a derived target it is one Sync task's output under
+ * <project>/build/versioned/mc<target>/: the shared root copied through
+ * the rename table (Java files only), with every file that the overlay
+ * versions/mc<target>/<root> also holds taken from the overlay instead,
+ * and any overlay-only file added. That element is a Provider carrying
+ * the task dependency, so the source set wires the generation in.
+ *
+ * Called once per (project, root) - the two loaders each compile common/
+ * and sodium/ and each get their own copy, which costs a second and keeps
+ * the task graph free of cross-project outputs.
+ */
+ext.versionedRoot = { Project p, String rel ->
+	def base = rootProject.file(rel)
+	def overlay = rootProject.file("versions/mc${mesheliumTarget}/${rel}")
+	if (rootProject.ext.mc_is_canonical) {
+		// The canonical version compiles the shared tree and its own overlay
+		// directory as they are - no copy, so the IDE and javac read the
+		// same files. Its overlay holds the files that exist ONLY on the
+		// canonical version (checkVersionedSources refuses one that
+		// shadows a shared file, which would be a duplicate class).
+		return overlay.isDirectory() ? [base, overlay] : [base]
+	}
+	def shadowed = []
+	if (overlay.isDirectory()) {
+		overlay.eachFileRecurse { f ->
+			if (f.isFile()) {
+				shadowed << overlay.toPath().relativize(f.toPath()).toString().replace('\\', '/')
+			}
+		}
+	}
+	def taskName = 'versionedSources_' + rel.replaceAll(/[^A-Za-z0-9]+/, '_')
+	def task = p.tasks.register(taskName, Sync) {
+		group = 'build setup'
+		description = "Derives ${rel} for Minecraft ${mesheliumTarget}: rename table + overlay"
+		into p.layout.buildDirectory.dir("versioned/mc${mesheliumTarget}/${rel}")
+		inputs.files(mesheliumRenameFile).withPropertyName('renames')
+		inputs.property('shadowed', shadowed.toString())
+		from(base) {
+			exclude shadowed
+			filesMatching('**/*.java') {
+				filter { String line -> rootProject.ext.mesheliumRenameLine(line) }
+			}
+		}
+		if (overlay.isDirectory()) {
+			from(overlay)
+		}
+	}
+	return [task.map { it.destinationDir }]
+}
+
+// ======================================================================
 // BUILD-TIME CENSUSES (2026-09-16)
 //
-// Two facts that used to be true only by memory, and that a green build
-// then certified as still true. Both live at the root, because both read
+// Facts that used to be true only by memory, and that a green build then
+// certified as still true. They live at the root because they read
 // common/ and sodium/, which are plain shared source rather than Gradle
 // projects of their own.
 // ======================================================================
 
 /**
- * One literal, two coordinates, one truth.
- *
- * The Modrinth coordinate a loader build resolves Sodium from and the
- * constant the jar ships (MesheliumSodiumVersion.BUILT_AGAINST) must name
- * the same Sodium; a bump to one without the other is exactly the silent
- * wrongness the version work exists to stop.
- *
- * Called with the PROPERTY NAME and the LOADER SUFFIX, so each build
- * checks the coordinate it actually consumes rather than whichever one a
- * root property happened to inherit:
- *   fabric/build.gradle    -> sodium_version           (gradle.properties:30)
- *   neoforge/build.gradle  -> sodium_neoforge_version  (gradle.properties:34)
- *
- * The comparison is an EXACT rebuild of the expected coordinate, never
- * `coordinate.contains(builtAgainst)`. A substring test passes the drift
- * it exists to catch: "mc26.2-0.9.2-beta.10-fabric" contains
- * "0.9.2-beta.1", so a beta.1 -> beta.10 bump on one loader would build
- * green with the jar still claiming beta.1. gradle.properties:31-33 says
- * in its own comment that the two coordinates exist separately because
- * Modrinth has published the two loaders a day apart, which is precisely
- * that case.
+ * The versioned layout's own rules, checked. Every rename line parses
+ * (already enforced above); the canonical version's overlay holds only
+ * files the shared tree does not have (a shadowing file there would be a
+ * duplicate class, since the canonical build compiles both directories
+ * as they are); and no overlay file for a derived target still names a
+ * canonical class the rename table would have rewritten - an overlay is
+ * written in its own version's vocabulary and is never filtered, so such
+ * a name would compile against the wrong class or not at all. Prints
+ * what it counted, including what it skipped.
  */
-ext.checkSodiumCoordinate = { String propertyName, String loaderSuffix ->
-	def source = rootProject.file(
-			'common/src/main/java/com/deds/meshelium/MesheliumSodiumVersion.java')
-	def matcher = source.text =~ /BUILT_AGAINST\s*=\s*"([^"]+)"/
-	if (!matcher.find()) {
-		throw new GradleException(
-				"MesheliumSodiumVersion.BUILT_AGAINST not found in ${source}")
-	}
-	def builtAgainst = matcher.group(1)
-	def parts = builtAgainst.split(/\+/)
-	if (parts.length != 2) {
-		throw new GradleException("MesheliumSodiumVersion.BUILT_AGAINST=${builtAgainst} is not "
-				+ "<version>+<metadata>; the loader reports Sodium in that shape and the "
-				+ "constant has to match it")
-	}
-	def expectedMetadata = "mc${rootProject.minecraft_version}".toString()
-	if (parts[1] != expectedMetadata) {
-		throw new GradleException("MesheliumSodiumVersion.BUILT_AGAINST=${builtAgainst} is built "
-				+ "against ${parts[1]} but this project targets ${expectedMetadata}")
-	}
-	def expected = "${expectedMetadata}-${parts[0]}-${loaderSuffix}".toString()
-	def coordinate = rootProject.property(propertyName).toString()
-	if (coordinate != expected) {
-		throw new GradleException("${propertyName}=${coordinate} but "
-				+ "MesheliumSodiumVersion.BUILT_AGAINST=${builtAgainst} expects ${expected}; "
-				+ "bump both or neither")
+tasks.register('checkVersionedSources') {
+	group = 'verification'
+	description = 'The versions/ layout obeys versions/README.md.'
+	def versionsDir = rootProject.file('versions')
+	inputs.dir(versionsDir).withPropertyName('versions')
+	inputs.property('canonical', mesheliumCanonical)
+	def stamp = layout.buildDirectory.file('checkVersionedSources.txt')
+	outputs.file(stamp).withPropertyName('stamp')
+	doLast {
+		def report = []
+		int targets = 0
+		versionsDir.listFiles().findAll { it.isDirectory() && it.name ==~ /mc.+/ }.sort().each { dir ->
+			targets++
+			def target = dir.name.substring(2)
+			def canonical = (target == mesheliumCanonical)
+			if (!new File(versionsDir, "mc${target}.properties").isFile()) {
+				throw new GradleException("versions/${dir.name}/ has no versions/mc${target}.properties beside it")
+			}
+			def renames = []
+			def renameFile = new File(dir, 'renames.txt')
+			if (renameFile.isFile()) {
+				renameFile.eachLine { line ->
+					def t = line.trim()
+					if (t && !t.startsWith('#')) {
+						def parts = t.split(/\s+/)
+						if (parts.length != 2) {
+							throw new GradleException("${renameFile}: expected '<canonical> <target>', got: ${line}")
+						}
+						renames << parts[0]
+					}
+				}
+			}
+			int overlayFiles = 0
+			int shadowing = 0
+			int added = 0
+			int skipped = 0
+			dir.eachFileRecurse { f ->
+				if (!f.isFile() || f == renameFile) {
+					return
+				}
+				def rel = dir.toPath().relativize(f.toPath()).toString().replace('\\', '/')
+				overlayFiles++
+				if (rootProject.file(rel).isFile()) {
+					if (canonical) {
+						throw new GradleException("versions/${dir.name}/${rel} shadows a shared file, but "
+								+ "${target} is the canonical version and compiles both directories as "
+								+ "they are: that is a duplicate class. Move the version-specific file "
+								+ "into the shared tree, or the shared one into every OTHER version's "
+								+ "overlay.")
+					}
+					shadowing++
+				} else {
+					added++
+				}
+				if (!f.name.endsWith('.java')) {
+					skipped++
+					return
+				}
+				def text = f.text
+				renames.each { canonicalName ->
+					def hit = Pattern.compile(Pattern.quote(canonicalName) + '(?![A-Za-z0-9_])').matcher(text)
+					if (hit.find()) {
+						throw new GradleException("versions/${dir.name}/${rel} names ${canonicalName}, a "
+								+ "canonical class the rename table maps to something else on ${target}. "
+								+ "Overlay files are written in their own version's vocabulary and are "
+								+ "never filtered; use the ${target} name.")
+					}
+				}
+			}
+			report << "mc${target}${canonical ? ' (canonical)' : ''}: ${renames.size()} renames, " +
+					"${overlayFiles} overlay files (${shadowing} replacing a shared file, ${added} " +
+					"own), ${skipped} non-Java files skipped by the vocabulary scan"
+		}
+		def line = "checkVersionedSources: canonical mc${mesheliumCanonical}, ${targets} version " +
+				"director(y/ies). " + (report ? report.join('; ') : 'none.')
+		logger.lifecycle(line)
+		def out = stamp.get().asFile
+		out.parentFile.mkdirs()
+		out.text = line + '\n'
 	}
 }
 
@@ -129,8 +347,19 @@ tasks.register('checkLangKeys') {
 	group = 'verification'
 	description = 'Every lang literal has a key, every key has a literal, and no long dashes.'
 
+	// The shared trees plus every version's overlay of them: an overlay file
+	// can name a lang key too, and a key only an overlay names must not
+	// read as an orphan.
 	def sourceRoots = [rootProject.file('common/src/main/java'),
 	                   rootProject.file('sodium/src/main/java')]
+	rootProject.file('versions').listFiles().findAll { it.isDirectory() && it.name ==~ /mc.+/ }.sort().each { dir ->
+		['common/src/main/java', 'sodium/src/main/java'].each { rel ->
+			def overlayRoot = new File(dir, rel)
+			if (overlayRoot.isDirectory()) {
+				sourceRoots << overlayRoot
+			}
+		}
+	}
 	def langFile = rootProject.file(
 			'common/src/main/resources/assets/meshelium/lang/en_us.json')
 	def stamp = layout.buildDirectory.file('checkLangKeys.txt')

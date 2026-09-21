@@ -1,8 +1,13 @@
 # Meshelium 1.0.0, the technical half
 
-Meshelium is a cross vendor, GPU driven terrain renderer for Minecraft 26.2,
-built on the game's own Vulkan backend and one extension,
-`VK_EXT_mesh_shader`. This page is the design record: what happens per frame,
+Meshelium is a cross vendor, GPU driven terrain renderer for Minecraft 26.2
+and 26.3, built on the game's own Vulkan backend and one extension,
+`VK_EXT_mesh_shader`. (Both game versions are built from one source tree; the
+seams that differ between them, and how the build picks them, are described
+in `versions/README.md`. The design below was written against 26.2 and holds
+on 26.3, whose one structural difference for this renderer - the terrain
+groups are drawn inside vanilla's single main render pass rather than in
+passes of their own - is met by suspending that pass around Meshelium's.) This page is the design record: what happens per frame,
 what it refuses to do and why, how it behaves when something goes wrong, and
 what had to be redesigned rather than translated when Nvidium's NVIDIA only
 architecture was taken cross vendor.
@@ -700,13 +705,17 @@ at the top saying so, and they are kept because the reasoning is the evidence.
 | File | What is in it |
 |---|---|
 | [`PERFORMANCE.md`](PERFORMANCE.md) | Every measured number, with method, hardware and the traps |
-| [`SPEC.md`](SPEC.md) | The build plan, wave by wave, with the evidence for each row |
-| [`EXTENDED-RENDER-DISTANCE.md`](EXTENDED-RENDER-DISTANCE.md) | Everything behind the widened slider, including the server half |
-| [`VANILLA-VULKAN-SEAM.md`](VANILLA-VULKAN-SEAM.md) | Disassembly recon of 26.2's Vulkan backend, question by question |
-| [`NVIDIUM-ARCHITECTURE.md`](NVIDIUM-ARCHITECTURE.md) | Source study of the original, including the inventory of every NVIDIA only piece and its cross vendor replacement |
-| [`TERRAIN-DATA.md`](TERRAIN-DATA.md) | The byte layouts of the vertex, section and region records, each re-derived and pinned by a test |
-| [`VANILLA-FRAME-PATH.md`](VANILLA-FRAME-PATH.md), [`VANILLA-SECTION-BUILD.md`](VANILLA-SECTION-BUILD.md) | Where vanilla's frame and section build actually go |
-| [`MP-RETENTION-RECON.md`](MP-RETENTION-RECON.md), [`FRONTIER-HOLES-RECON.md`](FRONTIER-HOLES-RECON.md) | The two reverted attempts at the fog wall, kept as the evidence for why the answer is Bobby. Both carry REVERTED banners |
+| [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Things that look like Meshelium problems and are not, with the fix for each |
+| `SPEC.md` (internal) | The build plan, wave by wave, with the evidence for each row |
+| `EXTENDED-RENDER-DISTANCE.md` (internal) | Everything behind the widened slider, including the server half |
+| `VANILLA-VULKAN-SEAM.md` (internal) | Disassembly recon of 26.2's Vulkan backend, question by question |
+| `NVIDIUM-ARCHITECTURE.md` (internal) | Source study of the original, including the inventory of every NVIDIA only piece and its cross vendor replacement |
+| `TERRAIN-DATA.md` (internal) | The byte layouts of the vertex, section and region records, each re-derived and pinned by a test |
+| `VANILLA-FRAME-PATH.md`, `VANILLA-SECTION-BUILD.md` (internal) | Where vanilla's frame and section build actually go |
+| `MP-RETENTION-RECON.md`, `FRONTIER-HOLES-RECON.md` (internal) | The two reverted attempts at the fog wall, kept as the evidence for why the answer is Bobby. Both carry REVERTED banners |
+
+The rows marked internal are working notes that stay in the private tree;
+they are listed so the evidence trail is visible, not because the files ship.
 
 ## Credits
 

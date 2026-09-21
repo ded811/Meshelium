@@ -4,7 +4,7 @@
  */
 package com.deds.meshelium.vk;
 
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;

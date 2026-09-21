@@ -118,6 +118,8 @@
   "meshelium.options.status.reason.terrain_off": "terrain rendering is turned off",
   "meshelium.options.status.reason.error": "a renderer error occurred; vanilla is drawing",
   "meshelium.toast.popup.title": "Meshelium is off",
+  "meshelium.toast.launch.title": "Your launcher skipped a Java setting",
+  "meshelium.toast.launch.shadow": "Minecraft wants -XX:StackShadowPages=%s and got %s. Without it the game can close without a word. Add it to this instance's Java arguments.",
   "meshelium.toast.popup.opengl": "Minecraft is drawing with OpenGL. The chat line has the details.",
   "meshelium.toast.popup.vulkan_failed": "Vulkan is selected but it didn't start. The chat line has the details.",
   "meshelium.toast.popup.no_mesh": "No mesh shader support on this graphics card. The chat line has the details.",

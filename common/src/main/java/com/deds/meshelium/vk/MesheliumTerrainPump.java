@@ -7,7 +7,7 @@ package com.deds.meshelium.vk;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.terrain.host.TerrainResidency;
 
-import com.mojang.blaze3d.GpuDeviceLossException;
+import com.mojang.renderpearl.api.device.GpuDeviceLossException;
 
 /**
  * Render-thread orchestrator for wave 3b's GPU residency. Called from two

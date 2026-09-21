@@ -7,7 +7,7 @@ package com.deds.meshelium.sodium;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.vk.SodiumTerrainDrawer;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
 
 import net.caffeinemc.mods.sodium.client.SodiumClientMod;
 import net.caffeinemc.mods.sodium.client.model.quad.properties.ModelQuadFacing;

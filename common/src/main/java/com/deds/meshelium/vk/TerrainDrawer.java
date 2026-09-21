@@ -5,10 +5,11 @@
 package com.deds.meshelium.vk;
 
 import com.deds.meshelium.MesheliumLog;
+import com.deds.meshelium.compat.McCompat;
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumCpuStages;
 import com.deds.meshelium.MesheliumVulkanState;
-import com.mojang.blaze3d.GpuDeviceLossException;
+import com.mojang.renderpearl.api.device.GpuDeviceLossException;
 import com.deds.meshelium.mixin.FrustumAccessor;
 import com.deds.meshelium.mixin.RenderPassAccessor;
 import com.deds.meshelium.mixin.SectionOcclusionGraphAccessor;
@@ -17,20 +18,20 @@ import com.deds.meshelium.terrain.QuadFacing;
 import com.deds.meshelium.terrain.host.SectionBuildTap;
 import com.deds.meshelium.terrain.host.TerrainResidency;
 
-import com.mojang.blaze3d.buffers.GpuBuffer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
+import com.mojang.renderpearl.api.buffers.GpuBuffer;
+import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import com.mojang.blaze3d.systems.CommandEncoder;
-import com.mojang.blaze3d.systems.RenderPass;
+import com.mojang.renderpearl.api.commands.CommandEncoder;
+import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.textures.FilterMode;
-import com.mojang.blaze3d.textures.GpuSampler;
-import com.mojang.blaze3d.textures.GpuTextureView;
-import com.mojang.blaze3d.vulkan.VulkanConst;
-import com.mojang.blaze3d.vulkan.VulkanGpuBuffer;
-import com.mojang.blaze3d.vulkan.VulkanGpuSampler;
-import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
-import com.mojang.blaze3d.vulkan.VulkanRenderPass;
+import com.mojang.renderpearl.api.textures.FilterMode;
+import com.mojang.renderpearl.api.textures.GpuSampler;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
+import com.mojang.renderpearl.backend.vulkan.VulkanConst;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuBuffer;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuSampler;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuTextureView;
+import com.mojang.renderpearl.backend.vulkan.VulkanRenderPass;
 
 import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.ObjectArrayList;
@@ -874,6 +875,8 @@ public final class TerrainDrawer {
     private static volatile long cancelledTranslucentGroups;
     /** Wave-16: owned translucent frames that drew into the SEPARATE target. */
     private static volatile long translucentSeparateTargetFrames;
+    /** See improvedTransparencyFrames(): the 26.3 half of that count. */
+    private static volatile long translucentImprovedTransparencyFrames;
     private static volatile long translucentGatedSections;
     // Wave-9: frames whose translucent pass used the multi-WG experiment.
     private static volatile long translucentMultiWGFrames;
@@ -1000,6 +1003,13 @@ public final class TerrainDrawer {
     // frames would blend against a depth Meshelium didn't write).
     private static long frameSerial;
     private static long opaqueOwnedSerial = -1;
+    /**
+     * The frame whose translucent group Meshelium drew, or -1. Read by the
+     * 26.3 order-independent path, which must skip vanilla's own translucent
+     * terrain passes once ours is in the main target; a stale serial can
+     * never match because frameSerial moves every frame.
+     */
+    private static long translucentOwnedSerial = -1;
     // Wave-7 occlusion carry (opaque pass → translucent pass, same frame):
     // gate only when the occlusion rasters actually ran this frame.
     private static long occGateSerial = -1;
@@ -1317,6 +1327,26 @@ public final class TerrainDrawer {
         return translucentSeparateTargetFrames;
     }
 
+    /**
+     * Frames on which Meshelium drew the translucent group with "Improved
+     * Transparency" ON, whatever that mode means on the game version: on
+     * 26.2 the group goes to a separate translucent target and the drawer
+     * counts the frames whose target was not the main one; on 26.3 the mode
+     * is order-independent transparency, the group is drawn at the end of
+     * the solid pass by a 26.3-only seam that calls
+     * {@link #noteTranslucentUnderImprovedTransparency()}. The harness's
+     * proof that the improved-transparency path was exercised reads this,
+     * and exactly one of the two terms can ever be non-zero in a session.
+     */
+    public static long improvedTransparencyFrames() {
+        return translucentSeparateTargetFrames + translucentImprovedTransparencyFrames;
+    }
+
+    /** The 26.3 seam's report that it drew the translucent group under improved transparency. */
+    public static void noteTranslucentUnderImprovedTransparency() {
+        translucentImprovedTransparencyFrames++;
+    }
+
     /** Translucent sections recorded last owned translucent frame. */
     public static int lastTranslucentSections() {
         return lastTranslucentSections;
@@ -1330,6 +1360,16 @@ public final class TerrainDrawer {
     /** Times the TRANSLUCENT renderGroup was cancelled for our pass. */
     public static long cancelledTranslucentGroups() {
         return cancelledTranslucentGroups;
+    }
+
+    /** Did Meshelium draw the opaque terrain group this frame? */
+    public static boolean opaqueOwnedThisFrame() {
+        return opaqueOwnedSerial == frameSerial;
+    }
+
+    /** Did Meshelium draw the translucent terrain group this frame? */
+    public static boolean translucentOwnedThisFrame() {
+        return translucentOwnedSerial == frameSerial;
     }
 
     /** Cumulative sections recorded WITH the occlusion stamp gate armed. */
@@ -1640,7 +1680,7 @@ public final class TerrainDrawer {
         if (cam == null || !cam.initialized || cam.cullFrustum == null) {
             return false;
         }
-        RenderTarget target = ChunkSectionLayerGroup.OPAQUE.outputTarget();
+        RenderTarget target = McCompat.opaqueTarget();
         if (target == null || target.getColorTextureView() == null
                 || target.getDepthTextureView() == null) {
             return false;
@@ -2025,7 +2065,8 @@ public final class TerrainDrawer {
      * mixin cancel vanilla's renderGroup. Any internal failure returns
      * false and vanilla draws normally.
      */
-    public static boolean drawOpaque(ChunkSectionsToRender sections, GpuSampler atlasSampler) {
+    public static boolean drawOpaque(ChunkSectionsToRender sections, GpuSampler atlasSampler,
+            GpuTextureView atlasView) {
         if (broken) {
             return notePrepOutcome(false);
         }
@@ -2038,7 +2079,7 @@ public final class TerrainDrawer {
         }
         try {
             long t0 = System.nanoTime();
-            boolean owned = drawOpaqueInner(sections, atlasSampler);
+            boolean owned = drawOpaqueInner(sections, atlasSampler, atlasView);
             // Wave-7 coupling marker: translucent may own THIS frame only
             // when opaque did (they share depth-authorship semantics).
             opaqueOwnedSerial = owned ? frameSerial : -1;
@@ -2076,7 +2117,8 @@ public final class TerrainDrawer {
         }
     }
 
-    private static boolean drawOpaqueInner(ChunkSectionsToRender sections, GpuSampler atlasSampler) {
+    private static boolean drawOpaqueInner(ChunkSectionsToRender sections, GpuSampler atlasSampler,
+            GpuTextureView atlasView) {
         CameraRenderState cam = camera;
         if (cam == null || !cam.initialized || cam.cullFrustum == null) {
             return false; // no frame state yet — vanilla draws this frame
@@ -2087,10 +2129,9 @@ public final class TerrainDrawer {
         // translucent pass, the bfs masks, vanilla's own draws) lags the
         // stale list otherwise (mechanism on the method).
         healFrustumOnProjectionChange(cam);
-        RenderTarget target = ChunkSectionLayerGroup.OPAQUE.outputTarget();
+        RenderTarget target = McCompat.opaqueTarget();
         GpuTextureView colorView = target.getColorTextureView();
         GpuTextureView depthView = target.getDepthTextureView();
-        GpuTextureView atlasView = sections.textureView();
         GpuTextureView lightmapView = Minecraft.getInstance().gameRenderer.lightmap();
         if (colorView == null || depthView == null || atlasView == null || lightmapView == null) {
             return false;
@@ -3348,14 +3389,16 @@ public final class TerrainDrawer {
      * guard argument lives in terrain.mesh). Sections in regions past the
      * occlusion list cap draw ungated, mirroring the opaque fail-open.
      */
-    public static boolean drawTranslucent(ChunkSectionsToRender sections, GpuSampler atlasSampler) {
+    public static boolean drawTranslucent(ChunkSectionsToRender sections, GpuSampler atlasSampler,
+            GpuTextureView atlasView) {
         if (broken) {
             return false;
         }
         try {
             long t0 = System.nanoTime();
-            boolean owned = drawTranslucentInner(sections, atlasSampler);
+            boolean owned = drawTranslucentInner(sections, atlasSampler, atlasView);
             if (owned) {
+                translucentOwnedSerial = frameSerial;
                 cancelledTranslucentGroups++;
                 // Wave-12 stage (d2): the translucent recording span.
                 if (MesheliumCpuStages.ARMED) {
@@ -3398,7 +3441,8 @@ public final class TerrainDrawer {
         }
     }
 
-    private static boolean drawTranslucentInner(ChunkSectionsToRender sections, GpuSampler atlasSampler) {
+    private static boolean drawTranslucentInner(ChunkSectionsToRender sections, GpuSampler atlasSampler,
+            GpuTextureView atlasView) {
         CameraRenderState cam = camera;
         if (cam == null || !cam.initialized || cam.cullFrustum == null) {
             return false;
@@ -3407,7 +3451,7 @@ public final class TerrainDrawer {
             return false; // vanilla drew opaque this frame — it draws translucent too
         }
         long probeEntry = TranslucentPhaseProbe.ARMED ? System.nanoTime() : 0L;
-        RenderTarget target = ChunkSectionLayerGroup.TRANSLUCENT.outputTarget();
+        RenderTarget target = McCompat.translucentTarget();
         // Wave-16 harness probe: is this the SEPARATE translucent target
         // (improved transparency, what used to be called fabulous) or the
         // main one? The drawer needs no branch here - outputTarget() hands
@@ -3423,7 +3467,6 @@ public final class TerrainDrawer {
         }
         GpuTextureView colorView = target.getColorTextureView();
         GpuTextureView depthView = target.getDepthTextureView();
-        GpuTextureView atlasView = sections.textureView();
         GpuTextureView lightmapView = Minecraft.getInstance().gameRenderer.lightmap();
         if (colorView == null || depthView == null || atlasView == null || lightmapView == null) {
             return false;

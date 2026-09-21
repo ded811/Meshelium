@@ -7,9 +7,10 @@ package com.deds.meshelium.vk;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.MesheliumVramState;
 import com.deds.meshelium.MesheliumVulkanState;
-import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
-import com.mojang.blaze3d.vulkan.init.VulkanFeature;
-import com.mojang.blaze3d.vulkan.init.VulkanPNextStruct;
+import com.deds.meshelium.compat.McCompat;
+import com.mojang.renderpearl.backend.vulkan.VulkanPhysicalDevice;
+import com.mojang.renderpearl.backend.vulkan.init.VulkanFeature;
+import com.mojang.renderpearl.backend.vulkan.init.VulkanPNextStruct;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.EXTConservativeRasterization;
@@ -66,7 +67,7 @@ public final class MeshShaderDeviceSupport {
      * Mirrors {@code VulkanBackend.MULTI_DRAW_FEATURES_STRUCT}:
      * sType + struct size of {@code VkPhysicalDeviceMeshShaderFeaturesEXT}.
      */
-    public static final VulkanPNextStruct MESH_SHADER_FEATURES_STRUCT = new VulkanPNextStruct(
+    public static final VulkanPNextStruct MESH_SHADER_FEATURES_STRUCT = McCompat.pnextStruct(VkPhysicalDeviceMeshShaderFeaturesEXT.class,
             EXTMeshShader.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT,
             VkPhysicalDeviceMeshShaderFeaturesEXT.SIZEOF);
 
@@ -89,7 +90,7 @@ public final class MeshShaderDeviceSupport {
      * {@code FEATURES + <member>} reaches into its inline base-features
      * block. No new plumbing, no reflection.</p>
      */
-    private static final VulkanPNextStruct BASE_FEATURES_STRUCT = new VulkanPNextStruct(
+    private static final VulkanPNextStruct BASE_FEATURES_STRUCT = McCompat.pnextStruct(VkPhysicalDeviceFeatures2.class,
             VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             VkPhysicalDeviceProperties2.SIZEOF);
 
@@ -133,7 +134,7 @@ public final class MeshShaderDeviceSupport {
     // review, not by any driver, which is the usual way with that class of
     // mistake.
 
-    private static final VulkanPNextStruct MESH_SHADER_PROPERTIES_STRUCT = new VulkanPNextStruct(
+    private static final VulkanPNextStruct MESH_SHADER_PROPERTIES_STRUCT = McCompat.pnextStruct(VkPhysicalDeviceMeshShaderPropertiesEXT.class,
             EXTMeshShader.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT,
             VkPhysicalDeviceMeshShaderPropertiesEXT.SIZEOF);
 
@@ -167,8 +168,8 @@ public final class MeshShaderDeviceSupport {
             EXTConditionalRendering.VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
     public static final VulkanPNextStruct CONDITIONAL_RENDERING_FEATURES_STRUCT =
-            new VulkanPNextStruct(
-                    EXTConditionalRendering
+            McCompat.pnextStruct(VkPhysicalDeviceConditionalRenderingFeaturesEXT.class,
+            EXTConditionalRendering
                             .VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT,
                     VkPhysicalDeviceConditionalRenderingFeaturesEXT.SIZEOF);
 
@@ -187,16 +188,16 @@ public final class MeshShaderDeviceSupport {
      * checked with javap - so only the extension string and the properties
      * struct are involved.
      */
-    static final String CONSERVATIVE_RASTERIZATION_EXTENSION =
+    public static final String CONSERVATIVE_RASTERIZATION_EXTENSION =
             EXTConservativeRasterization.VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME;
 
     private static final VulkanPNextStruct CONSERVATIVE_RASTERIZATION_PROPERTIES_STRUCT =
-            new VulkanPNextStruct(
-                    EXTConservativeRasterization
+            McCompat.pnextStruct(VkPhysicalDeviceConservativeRasterizationPropertiesEXT.class,
+            EXTConservativeRasterization
                             .VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONSERVATIVE_RASTERIZATION_PROPERTIES_EXT,
                     VkPhysicalDeviceConservativeRasterizationPropertiesEXT.SIZEOF);
 
-    private static final VulkanPNextStruct MAINTENANCE_3_PROPERTIES_STRUCT = new VulkanPNextStruct(
+    private static final VulkanPNextStruct MAINTENANCE_3_PROPERTIES_STRUCT = McCompat.pnextStruct(VkPhysicalDeviceMaintenance3Properties.class,
             VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_3_PROPERTIES,
             VkPhysicalDeviceMaintenance3Properties.SIZEOF);
 
@@ -209,7 +210,7 @@ public final class MeshShaderDeviceSupport {
      * variant already declares 12 bindings, so the ceiling on block count
      * is {@code maxPushDescriptors - 11}.
      */
-    private static final VulkanPNextStruct PUSH_DESCRIPTOR_PROPERTIES_STRUCT = new VulkanPNextStruct(
+    private static final VulkanPNextStruct PUSH_DESCRIPTOR_PROPERTIES_STRUCT = McCompat.pnextStruct(VkPhysicalDevicePushDescriptorPropertiesKHR.class,
             KHRPushDescriptor.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR,
             VkPhysicalDevicePushDescriptorPropertiesKHR.SIZEOF);
 
@@ -243,21 +244,93 @@ public final class MeshShaderDeviceSupport {
     }
 
     /**
-     * Called from the mixin at the head of the private
+     * The Minecraft 26.2 entry, called from that version's
+     * {@code VulkanBackendMixin} at the head of the private
      * {@code VulkanBackend.createDevice(Collection, VulkanPhysicalDevice, Set)}.
-     * Mutates {@code extensions}/{@code features} in place — both are fresh
+     * Mutates {@code extensions}/{@code features} in place - both are fresh
      * mutable copies ({@code HashSet}/{@code ObjectOpenHashSet}) built by the
-     * public {@code createDevice} overload, verified against the 26.2 jar.
+     * public {@code createDevice} overload, verified against the 26.2 jar -
+     * and then records the decisions through
+     * {@link #onDeviceFeaturesDecided}.
+     *
+     * <p>On 26.3 vanilla grew its own optional-feature-set mechanism and
+     * this method is not called: {@code MeshShaderFeatureSets} (the 26.3
+     * overlay) offers the same extensions and features as
+     * {@code FeatureSet}s, vanilla probes and enables them, and the mixin
+     * at the head of the two-argument {@code createDevice} reads the
+     * result back into {@link #onDeviceFeaturesDecided}. Every probe below
+     * therefore exists twice in spirit - once here, once in vanilla - and
+     * the decisions land in one place.
      */
     public static void onCreateDevice(Collection<String> extensions,
             VulkanPhysicalDevice physicalDevice, Set<VulkanFeature> features) {
+        VkPhysicalDevice vk = physicalDevice.vkPhysicalDevice();
+        boolean hasExtension = physicalDevice.hasDeviceExtension(EXTENSION_NAME);
+        boolean meshShader = hasExtension && isFeatureSupported(vk, MESH_SHADER_FEATURE);
+        boolean taskShader = hasExtension && isFeatureSupported(vk, TASK_SHADER_FEATURE);
+        boolean hasMemoryBudget = physicalDevice.hasDeviceExtension(MEMORY_BUDGET_EXTENSION);
+        if (hasMemoryBudget) {
+            extensions.add(MEMORY_BUDGET_EXTENSION);
+        }
+        boolean fragmentStoresAndAtomics = false;
+        boolean conditionalRendering = false;
+        boolean consRasterPresent = physicalDevice.hasDeviceExtension(CONSERVATIVE_RASTERIZATION_EXTENSION);
+        boolean consRasterEnabled = false;
+        if (meshShader && taskShader) {
+            extensions.add(EXTENSION_NAME);
+            features.add(MESH_SHADER_FEATURE);
+            features.add(TASK_SHADER_FEATURE);
+            // Probed, never assumed: requesting an unsupported feature
+            // fails device creation and takes the whole game down with it.
+            fragmentStoresAndAtomics = isFeatureSupported(vk, FRAGMENT_STORES_AND_ATOMICS);
+            if (fragmentStoresAndAtomics) {
+                features.add(FRAGMENT_STORES_AND_ATOMICS);
+            }
+            conditionalRendering = physicalDevice.hasDeviceExtension(CONDITIONAL_RENDERING_EXTENSION)
+                    && isFeatureSupported(vk, CONDITIONAL_RENDERING_FEATURE);
+            if (conditionalRendering) {
+                extensions.add(CONDITIONAL_RENDERING_EXTENSION);
+                features.add(CONDITIONAL_RENDERING_FEATURE);
+            }
+            // The extension is appended ONLY when the property is true (the
+            // reasoning is on the enabled flag in onDeviceFeaturesDecided).
+            consRasterEnabled = consRasterPresent
+                    && Boolean.getBoolean(TerrainOcclusion.PROPERTY_CONSERVATIVE_RASTER);
+            if (consRasterEnabled) {
+                extensions.add(CONSERVATIVE_RASTERIZATION_EXTENSION);
+            }
+        }
+        onDeviceFeaturesDecided(physicalDevice, hasExtension, meshShader, taskShader,
+                fragmentStoresAndAtomics, conditionalRendering, consRasterPresent,
+                consRasterEnabled, hasMemoryBudget);
+    }
+
+    /**
+     * What every version shares once the device features are decided: the
+     * memory and capability probes, the {@link MesheliumVulkanState} record
+     * and the boot log. The decisions arrive as booleans so that neither
+     * the 26.2 collections nor the 26.3 {@code FeatureSet} need to exist
+     * here.
+     *
+     * @param hasExtension               the device offers VK_EXT_mesh_shader
+     * @param meshShader                 ... and reports meshShader
+     * @param taskShader                 ... and reports taskShader; mesh
+     *                                   shaders are enabled iff both
+     * @param fragmentStoresAndAtomics   enabled (occlusion culling needs it)
+     * @param conditionalRendering       extension + feature enabled
+     * @param conservativeRasterPresent  the device offers the extension
+     * @param conservativeRasterEnabled  ... and the boot-time property asked
+     * @param memoryBudget               VK_EXT_memory_budget enabled
+     */
+    public static void onDeviceFeaturesDecided(VulkanPhysicalDevice physicalDevice,
+            boolean hasExtension, boolean meshShader, boolean taskShader,
+            boolean fragmentStoresAndAtomics, boolean conditionalRendering,
+            boolean conservativeRasterPresent, boolean conservativeRasterEnabled,
+            boolean memoryBudget) {
         String name = physicalDevice.deviceName();
         String driver = physicalDevice.driverInfo();
 
-        boolean hasExtension = physicalDevice.hasDeviceExtension(EXTENSION_NAME);
         VkPhysicalDevice vk = physicalDevice.vkPhysicalDevice();
-        boolean meshShader = hasExtension && isFeatureSupported(vk, MESH_SHADER_FEATURE);
-        boolean taskShader = hasExtension && isFeatureSupported(vk, TASK_SHADER_FEATURE);
 
         // Wave-14: the memory probe runs on every Vulkan device creation
         // (mesh shaders or not — the state line is cheap and honest either
@@ -269,19 +342,13 @@ public final class MeshShaderDeviceSupport {
         // merely-SUPPORTED extension, or only for an ENABLED one, is not
         // available here, so this covers both readings: the cost is one
         // string in a set vanilla already builds fresh per creation.
-        boolean hasMemoryBudget = physicalDevice.hasDeviceExtension(MEMORY_BUDGET_EXTENSION);
-        if (hasMemoryBudget) {
-            extensions.add(MEMORY_BUDGET_EXTENSION);
-        }
+        boolean hasMemoryBudget = memoryBudget;
         MesheliumVulkanState.setMemoryBudgetSupported(hasMemoryBudget);
         MesheliumVulkanState.setIntegratedGpu(isIntegrated(vk));
         budgetProbeDevice = vk;
         MesheliumVramState.reset();
 
         if (meshShader && taskShader) {
-            extensions.add(EXTENSION_NAME);
-            features.add(MESH_SHADER_FEATURE);
-            features.add(TASK_SHADER_FEATURE);
             // Occlusion culling's fragment shader writes visibility stamps
             // into a storage buffer, which the spec forbids without this.
             // Probed, never assumed: requesting an unsupported feature
@@ -296,9 +363,7 @@ public final class MeshShaderDeviceSupport {
             // site, so the pipeline that compiles gl_DrawID reads one flag.
             MesheliumVulkanState.setDrawIndirectSupported(true);
 
-            if (isFeatureSupported(vk, FRAGMENT_STORES_AND_ATOMICS)) {
-                features.add(FRAGMENT_STORES_AND_ATOMICS);
-            } else {
+            if (!fragmentStoresAndAtomics) {
                 MesheliumLog.LOGGER.warn(
                         "Meshelium: this device reports no fragmentStoresAndAtomics, so occlusion "
                                 + "culling cannot run (mesh-shader terrain is unaffected). "
@@ -308,12 +373,7 @@ public final class MeshShaderDeviceSupport {
             // Conditional rendering, for the phase-B predicate skip. Optional
             // both ways: absent, phase B records its draws directly, exactly
             // the pre-predicate behavior.
-            boolean condRender = physicalDevice.hasDeviceExtension(CONDITIONAL_RENDERING_EXTENSION)
-                    && isFeatureSupported(vk, CONDITIONAL_RENDERING_FEATURE);
-            if (condRender) {
-                extensions.add(CONDITIONAL_RENDERING_EXTENSION);
-                features.add(CONDITIONAL_RENDERING_FEATURE);
-            }
+            boolean condRender = conditionalRendering;
             MesheliumVulkanState.setConditionalRenderingSupported(condRender);
 
             // NEXT (c) part B, a BOOT-TIME lever. The extension is appended
@@ -327,12 +387,8 @@ public final class MeshShaderDeviceSupport {
             // answered by any run rather than left UNVERIFIED.
             boolean consRasterWanted =
                     Boolean.getBoolean(TerrainOcclusion.PROPERTY_CONSERVATIVE_RASTER);
-            boolean consRasterPresent =
-                    physicalDevice.hasDeviceExtension(CONSERVATIVE_RASTERIZATION_EXTENSION);
-            boolean consRaster = consRasterWanted && consRasterPresent;
-            if (consRaster) {
-                extensions.add(CONSERVATIVE_RASTERIZATION_EXTENSION);
-            }
+            boolean consRasterPresent = conservativeRasterPresent;
+            boolean consRaster = conservativeRasterEnabled;
             // No feature struct exists for this extension (lwjgl-vulkan
             // 3.4.1 has no VkPhysicalDeviceConservativeRasterizationFeaturesEXT,
             // javap: class not found), so `features` is untouched.

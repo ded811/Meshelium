@@ -1,78 +1,90 @@
 # Changelog
 
+## 1.6.1
+
+**Minecraft 26.3.**
+
+Meshelium now runs on Minecraft 26.3 as well as 26.2, on Fabric and on
+NeoForge. Download the file for your game version; they are all the same
+mod, and everything below applies to both.
+
+Minecraft 26.3 changed how it draws the world - terrain and everything else
+now share one render pass, and "Improved Transparency" became a new
+order-independent method - and Meshelium follows both without you doing
+anything. With Improved Transparency on, Meshelium draws the water and glass
+itself and Minecraft's own transparency pass is skipped for terrain, so the
+picture is the same as with the setting off.
+
+**NeoForge on 26.3: no loading-screen workaround needed.** NeoForge for
+26.3 currently ships with its early loading screen switched off (its
+loader ignores the setting), so the Vulkan start-up problem Meshelium works
+around on 26.2 cannot happen there. Meshelium leaves it alone and says so in
+the log. On 26.2 the workaround stays exactly as it was.
+
+**If your launcher skips a Java setting, Meshelium now tells you.**
+
+Mojang's launcher passes `-XX:StackShadowPages=32` to every Minecraft 26.3
+launch. MultiMC leaves it out (Prism Launcher fixed this through its
+metadata in September 2026), and without it the game can close without a
+word, mods or not. On 26.3, Meshelium checks for it when the game starts
+and, if it is missing, says so in the log and with a toast on the title
+screen, with the argument to add. Nothing changes when your launcher
+already passes it, and nothing changes on 26.2, which does not need it.
+Details: <https://github.com/ded811/Meshelium/blob/main/docs/TROUBLESHOOTING.md>
+
+**Sodium 0.9.2 is a release now, on both game versions.**
+
+Use Sodium 0.9.2 for your game version - the release, not the newer 0.9.3
+alpha. On 26.2, Sodium 0.9.2-beta.1 is the same build with a different
+version number, and Meshelium treats it as the same Sodium instead of
+warning about it.
+
+**Fixed: a memory-copy the graphics driver was not asked permission for.**
+
+When Meshelium's terrain records grew for the first time, they were copied
+out of a buffer that had not been created for copying. AMD's driver allowed
+it; the Vulkan rules do not, and a stricter driver could have refused. Both
+game versions have the fix.
+
 ## 1.6.0
 
-Everything below is new since **1.6.0 beta 1**, the pre-release.
+**Meshelium works with Sodium now - and together they are a lot faster.**
 
-**Meshelium works with Sodium.**
+They used to be a choice: one replaced the other. Now you get both. Sodium
+keeps building the chunks, which is what it is best at, and Meshelium draws
+them with mesh shaders.
 
-They used to be a choice: one replaced the other. Now they work together.
-Sodium builds the chunks, exactly as it always has, and Meshelium draws them
-with mesh shaders. Install both and it happens on its own - there is nothing
-to switch on, on Fabric or on NeoForge.
+Measured on a Radeon RX 9070 XT at 1920x1080, standing in the same spot in the
+same world: with Meshelium drawing, the frame is about **twice as fast as
+Sodium on its own** - 1.9x at render distance 64, and 1.8x at 96.
+
+Install both and it happens on its own; there is nothing to switch on. It works
+on Fabric and on NeoForge.
 
 Use **Sodium 0.9.2-beta.1**. Modrinth lists it under Versions as a beta, so you
-have to pick it deliberately rather than taking the top entry. Meshelium plugs
-into parts of Sodium that were never meant for other mods to touch, so another
-version may not fit; the Meshelium settings screen shows which one you have and
-says whether it matches. If anything looks wrong, start the game with
-`-Dmeshelium.sodium.adapter=false` and Sodium goes back to drawing everything
-itself.
-
-With Sodium installed the Meshelium settings screen is shorter. The settings
-that only change how Meshelium builds chunks have nothing to do while Sodium is
-doing that job, so they are hidden. They come back if you remove Sodium.
+have to pick it deliberately rather than taking the top entry. The Meshelium
+settings screen shows which version you have and says whether it is the one
+this build was made for.
 
 **New setting: GPU Visibility.**
 
 On by default, and only when Sodium is installed. Meshelium works out what you
-can actually see on the graphics card itself instead of drawing everything
-Sodium hands it. Sodium's list grows a lot whenever you move the camera, which
-is what used to make the frame rate dip while you looked around.
+can actually see on the graphics card itself, instead of drawing everything it
+is handed. That is what used to make the frame rate dip while you looked
+around.
 
-**Fixed: the game could freeze for good at high render distances, with Sodium.**
+**The settings screen is shorter with Sodium installed.**
 
-At render distance 96, turning the camera for a while could lock the picture up
-completely. The graphics card was handed one drawing command that had been
-overwritten with nonsense and sat there working on it until Minecraft gave up
-waiting. Meshelium now makes the buffer involved large enough that the
-situation cannot arise.
-
-**Fixed: terrain went missing at render distance 96 and above.**
-
-A table of per-frame drawing work was sized against a test world that turned
-out to be a quarter of the size everyone believed. At 64 it fit; at 96 it ran
-out, and when it ran out it quietly stopped drawing some of the ground. It is
-now sized from your Distance Cap, and it lives in graphics memory rather than
-system memory.
-
-**Fixed: with Sodium installed, the "switch to Vulkan" offer never appeared.**
-
-The one group it mattered most to. Switching to Vulkan is exactly what turns
-the mesh-shader path on for a Sodium player, and they were the only ones never
-asked.
-
-**Fixed: the "Meshelium is off" message never arrived if you skipped the main
-menu.**
-
-Beta 1 fixed the mod itself in that case; the message explaining why it was
-staying off still waited for a main menu you were never going to see. It now
-arrives wherever you are, once, and waits if you are in a menu or something is
-hitting you.
-
-**Also in this release**
-
-The settings screen tells you which Sodium you have and whether it is the one
-this build was made for, and the menu text is a good deal shorter and plainer
-throughout. Meshelium does a little less work per frame with Sodium installed.
+The settings that only change how Meshelium builds chunks have nothing to do
+while Sodium is doing that job, so they are hidden. They come back if you
+remove Sodium. The rest of the menu is shorter and plainer throughout.
 
 **Known: render distance 120 needs more memory than Minecraft usually has.**
 
 The Distance Cap lets you choose 120, but at that distance Minecraft runs out
-of Java heap and closes. This is not specific to Meshelium - it is Minecraft's
-own memory - but the setting offers a number the game cannot always reach.
-Raise the cap gradually, and give Minecraft more memory in your launcher before
-pushing it far.
+of Java heap and closes. That is Minecraft's own memory rather than
+Meshelium's. Raise the cap gradually, and give Minecraft more memory in your
+launcher before pushing it far.
 
 ## 1.6.0 beta 1
 

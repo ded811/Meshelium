@@ -5,6 +5,7 @@
 package com.deds.meshelium.mixin;
 
 import com.deds.meshelium.MesheliumLog;
+import com.deds.meshelium.compat.McCompat;
 import com.deds.meshelium.MesheliumBenchRecorder;
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumCpuStages;
@@ -14,16 +15,11 @@ import com.deds.meshelium.terrain.host.TerrainResidency;
 import com.deds.meshelium.vk.MesheliumProjectionCapture;
 import com.deds.meshelium.vk.MesheliumTerrainPump;
 import com.deds.meshelium.vk.TerrainDrawer;
-import com.mojang.blaze3d.buffers.GpuBufferSlice;
-import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import com.mojang.blaze3d.resource.ResourceHandle;
-import com.mojang.blaze3d.systems.RenderPass;
-import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
 
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 
 import net.minecraft.client.Camera;
-import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Options;
 import net.minecraft.client.color.block.BlockColors;
@@ -32,20 +28,20 @@ import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.chunk.ChunkSectionsToRender;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 
 import org.joml.Matrix4fc;
-import org.joml.Vector4f;
 
+import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
-import java.util.EnumMap;
-import java.util.List;
 
 /**
  * Frame-path hooks on {@link LevelRenderer}: the geometry-invalidation
@@ -77,7 +73,7 @@ import java.util.List;
  * // target ChunkSectionsToRender instead of the lambda —
  * //   &#64;Mixin(ChunkSectionsToRender.class)
  * //   &#64;Inject(method = "renderGroup(Lnet/minecraft/client/renderer/chunk/ChunkSectionLayerGroup;"
- * //           + "Lcom/mojang/blaze3d/textures/GpuSampler;)V", at = &#64;At("TAIL"))
+ * //           + "Lcom/mojang/renderpearl/api/textures/GpuSampler;)V", at = &#64;At("TAIL"))
  * //   private void meshelium$afterRenderGroup(ChunkSectionLayerGroup group, GpuSampler sampler,
  * //           CallbackInfo ci) {
  * //       if (group == ChunkSectionLayerGroup.OPAQUE
@@ -100,6 +96,11 @@ import java.util.List;
  */
 @Mixin(LevelRenderer.class)
 abstract class LevelRendererMixin {
+
+    /** Vanilla's per-frame level render state; see meshelium$captureFrameState. */
+    @Shadow
+    @Final
+    private LevelRenderState levelRenderState;
 
     @Unique
     private static boolean meshelium$pumpHookBroken;
@@ -192,18 +193,18 @@ abstract class LevelRendererMixin {
      * not even a field write — happens.
      */
     @Inject(
-            method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
-                    + "Lnet/minecraft/client/DeltaTracker;Z"
-                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
-                    + "Lorg/joml/Matrix4fc;"
-                    + "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
-                    + "Lorg/joml/Vector4f;Z)V",
+            method = "render",
             at = @At("HEAD")
     )
-    private void meshelium$captureFrameState(GraphicsResourceAllocator graphicsResourceAllocator,
-            DeltaTracker deltaTracker, boolean renderBlockOutline, CameraRenderState cameraRenderState,
-            Matrix4fc modelView, GpuBufferSlice fogBuffer, Vector4f clearColor, boolean renderSky,
-            CallbackInfo ci) {
+    private void meshelium$captureFrameState(CallbackInfo ci) {
+        // The CameraRenderState render(...) receives IS this field's value:
+        // GameRenderer.renderLevel passes gameRenderState.levelRenderState
+        // .cameraRenderState (26.2 ip 46-56, 26.3 ip 29-39), and this
+        // LevelRenderer's levelRenderState is that same object (its
+        // constructor, 26.2 ip 191-199 / 26.3 ip 213-221). Reading it here
+        // instead of declaring the parameter list is what lets one handler
+        // serve both versions, whose render(...) signatures differ.
+        CameraRenderState cameraRenderState = this.levelRenderState.cameraRenderState;
         // Wave-9 bench clock: BEFORE the gate checks, so the benchmark's
         // vanilla-baseline half (meshelium.terrainDraw flipped OFF) still
         // captures frame times. ARMED is a static final resolved from the
@@ -230,7 +231,7 @@ abstract class LevelRendererMixin {
             MesheliumProofRun.onRenderFrame();
         }
         // ---- NEXT (c1), 2026-09-16: the PRE-BOB perspective stash ----
-        // Parameter 4 is the CameraRenderState whose projectionMatrix
+        // cameraRenderState is the CameraRenderState whose projectionMatrix
         // GameRenderer.renderLevel copied at ip 75-87 before multiplying
         // the COPY by the bob pose at ip 122-135, and it is never written
         // back (one getfield at ip 81, zero putfields). So this is the
@@ -350,13 +351,11 @@ abstract class LevelRendererMixin {
      * requires that counter be ZERO for a valid A/B leg.</p>
      */
     @Inject(
-            method = "prepareChunkRenders(Lorg/joml/Matrix4fc;)"
-                    + "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;",
+            method = "prepareChunkRenders",
             at = @At("HEAD"),
             cancellable = true
     )
-    private void meshelium$beforePrepareChunkRenders(Matrix4fc viewRotationMatrix,
-            CallbackInfoReturnable<ChunkSectionsToRender> cir) {
+    private void meshelium$beforePrepareChunkRenders(CallbackInfoReturnable<ChunkSectionsToRender> cir) {
         if (MesheliumCpuStages.ARMED) {
             meshelium$prepareT0 = System.nanoTime();
             MesheliumCpuStages.noteVisibleSections(
@@ -380,10 +379,12 @@ abstract class LevelRendererMixin {
             if (atlasView == null) {
                 return; // drawer would refuse a null atlas — vanilla preps
             }
-            EnumMap<ChunkSectionLayer, Int2ObjectOpenHashMap<List<RenderPass.Draw<GpuBufferSlice[]>>>>
-                    drawGroups = new EnumMap<>(ChunkSectionLayer.class);
-            for (ChunkSectionLayer layer : ChunkSectionLayer.values()) {
-                drawGroups.put(layer, new Int2ObjectOpenHashMap<>());
+            // The empty product is version-shaped (26.2: the record; 26.3: an
+            // abstract class the candidate has not been carried to, so null
+            // = decline and vanilla prepares as usual).
+            ChunkSectionsToRender empty = McCompat.emptySectionsToRender(atlasView);
+            if (empty == null) {
+                return;
             }
             TerrainDrawer.notePrepSkipped();
             if (MesheliumCpuStages.ARMED) {
@@ -392,8 +393,7 @@ abstract class LevelRendererMixin {
                 MesheliumCpuStages.record(MesheliumCpuStages.STAGE_PREPARE_CHUNKS,
                         System.nanoTime() - meshelium$prepareT0);
             }
-            cir.setReturnValue(new ChunkSectionsToRender(
-                    atlasView, drawGroups, 0, new GpuBufferSlice[0]));
+            cir.setReturnValue(empty);
         } catch (Throwable t) {
             meshelium$skipPrepBroken = true;
             MesheliumLog.LOGGER.error(
@@ -404,12 +404,10 @@ abstract class LevelRendererMixin {
 
     /** Wave-12 stage close for the uncancelled (vanilla-prep) path. */
     @Inject(
-            method = "prepareChunkRenders(Lorg/joml/Matrix4fc;)"
-                    + "Lnet/minecraft/client/renderer/chunk/ChunkSectionsToRender;",
+            method = "prepareChunkRenders",
             at = @At("RETURN")
     )
-    private void meshelium$afterPrepareChunkRenders(Matrix4fc viewRotationMatrix,
-            CallbackInfoReturnable<ChunkSectionsToRender> cir) {
+    private void meshelium$afterPrepareChunkRenders(CallbackInfoReturnable<ChunkSectionsToRender> cir) {
         if (!MesheliumCpuStages.ARMED) {
             return;
         }
@@ -432,12 +430,7 @@ abstract class LevelRendererMixin {
      * in the game is serialized against this pump by vanilla itself.</p>
      */
     @Inject(
-            method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
-                    + "Lnet/minecraft/client/DeltaTracker;Z"
-                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
-                    + "Lorg/joml/Matrix4fc;"
-                    + "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
-                    + "Lorg/joml/Vector4f;Z)V",
+            method = "render",
             at = @At(
                     value = "INVOKE",
                     target = "Lnet/minecraft/client/renderer/chunk/SectionRenderDispatcher;"
@@ -487,12 +480,7 @@ abstract class LevelRendererMixin {
      * staging drains live, the storm suspect of the frame-gap analysis.
      */
     @Inject(
-            method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
-                    + "Lnet/minecraft/client/DeltaTracker;Z"
-                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
-                    + "Lorg/joml/Matrix4fc;"
-                    + "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
-                    + "Lorg/joml/Vector4f;Z)V",
+            method = "render",
             at = @At(
                     value = "INVOKE",
                     target = "Lnet/minecraft/client/renderer/LevelRenderer;compileSections("
@@ -507,12 +495,7 @@ abstract class LevelRendererMixin {
 
     /** 2026-08-18 attribution wave: close the whole-render-span bracket. */
     @Inject(
-            method = "render(Lcom/mojang/blaze3d/resource/GraphicsResourceAllocator;"
-                    + "Lnet/minecraft/client/DeltaTracker;Z"
-                    + "Lnet/minecraft/client/renderer/state/level/CameraRenderState;"
-                    + "Lorg/joml/Matrix4fc;"
-                    + "Lcom/mojang/blaze3d/buffers/GpuBufferSlice;"
-                    + "Lorg/joml/Vector4f;Z)V",
+            method = "render",
             at = @At("RETURN")
     )
     private void meshelium$afterRender(CallbackInfo ci) {

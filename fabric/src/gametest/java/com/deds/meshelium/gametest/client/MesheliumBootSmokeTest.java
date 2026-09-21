@@ -160,7 +160,7 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
 
         try (TestSingleplayerContext singleplayer =
                 context.worldBuilder().create()) {
-            singleplayer.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(singleplayer);
             context.takeScreenshot(
                     TestScreenshotOptions.of("00_meshelium_boot_spawn"));
             if (hello) {
@@ -659,7 +659,7 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
                 throw new AssertionError("this negative check is only meaningful without Sodium; "
                         + "the positive half lives in MesheliumSodiumStandDownTest");
             }
-            client.gui.setScreen(new OptionsScreen(client.gui.screen(), client.options, false));
+            client.gui.setScreen(HarnessCompat.optionsScreen(client.gui.screen(), client.options, false));
         });
         context.waitForScreen(OptionsScreen.class);
         context.waitTicks(2);
@@ -1178,7 +1178,7 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
     static void assertPopupArrivesWithNoTitleScreen(ClientGameTestContext context,
             String expectedBodyKey, String shotPrefix) {
         try (TestSingleplayerContext world = context.worldBuilder().create()) {
-            world.getClientLevel().waitForChunksRender();
+            HarnessCompat.waitForChunksRender(world);
 
             boolean[] pauseOnLostFocusWas = new boolean[1];
             context.runOnClient(client ->
@@ -1367,8 +1367,8 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         boolean[] bodyOk = new boolean[1];
         try {
             try (TestDedicatedServerContext server = context.worldBuilder().createServer();
-                    TestServerConnection connection = server.connect()) {
-                connection.getClientLevel().waitForChunksRender();
+                    var connection = server.connect()) {
+                HarnessCompat.waitForChunksRender(connection);
                 context.runOnClient(client -> {
                     client.options.pauseOnLostFocus = false;
                     // Non-vacuity, the mirror image of the singleplayer

@@ -29,7 +29,9 @@ plugins {
 	id 'java-library'
 }
 
-version = project.mod_version
+// 1.6.1+mc26.3: the mod version and the Minecraft it is for, derived by the
+// root build from gradle.properties and versions/mc<target>.properties.
+version = project.mod_version_full
 group = project.maven_group
 
 base {
@@ -57,6 +59,12 @@ if (!(mesheliumProofFrames ==~ /\d+/)) {
 	throw new IllegalArgumentException(
 			"meshelium.proofFrames must be a frame count; got '${mesheliumProofFrames}'")
 }
+// One run directory per Minecraft version (2026-09-20), the same rule as
+// the Fabric project: the canonical version keeps `run`, every other
+// target gets `run-mc<version>`, so a world saved by one game version is
+// never opened - and silently upgraded - by another. Read by
+// installSodiumForRun (block 3) and runs.client (block 6).
+def mesheliumRunDirName = project.mc_is_canonical ? 'run' : "run-mc${project.mc}".toString()
 
 // BLOCK 1 - the one repository ModDevGradle does not add. Its
 // RepositoriesPlugin adds NeoForged Releases, Mojang Meta and Mojang
@@ -246,7 +254,7 @@ def installSodiumForRun = tasks.register('installSodiumForRun', InstallSodiumFor
 	doNotTrackState('run/mods is shared with hand-placed jars and must reflect the command line every run')
 	wrapper.from(configurations.sodiumNeoForge)
 	install = project.hasProperty('meshelium.sodium')
-	runDir = layout.projectDirectory.dir('run')
+	runDir = layout.projectDirectory.dir(mesheliumRunDirName)
 	proofShot = mesheliumProofShot
 }
 
@@ -256,19 +264,33 @@ def installSodiumForRun = tasks.register('installSodiumForRun', InstallSodiumFor
 // loader-bound lines went behind MesheliumPlatform and a class-loader
 // check), so both compilations see an identical and complete picture. The
 // only loader-specific code in this jar is under src/main/java here.
+//
+// Every root goes through rootProject.versionedRoot (2026-09-20), exactly
+// as in fabric/build.gradle: the directory itself for the canonical
+// Minecraft version, the rename-table + overlay copy under build/versioned/
+// for a derived target. This project's own src/main is included the same
+// way rather than left as Gradle's default, because the early-window code
+// is one of the files that differs per version. See versions/README.md.
 sourceSets {
 	main {
-		java.srcDir rootProject.file('common/src/main/java')
-		resources.srcDir rootProject.file('common/src/main/resources')
-		// The Sodium adapter, exactly as fabric/build.gradle adds it. Its
-		// Sodium coordinate is the NeoForge twin, unwrapped by
-		// extractSodiumNeoForge above. mods { meshelium { sourceSet } } in
-		// block 6 hands the whole main output (common/ + sodium/ + this
-		// project) to FML through MOD_CLASSES with no further change, and
-		// the java-library `jar` packs com/deds/meshelium/sodium/** and
-		// meshelium.sodium.mixins.json the same way.
-		java.srcDir rootProject.file('sodium/src/main/java')
-		resources.srcDir rootProject.file('sodium/src/main/resources')
+		java.srcDirs = [
+				rootProject.ext.versionedRoot(project, 'neoforge/src/main/java'),
+				rootProject.ext.versionedRoot(project, 'common/src/main/java'),
+				// The Sodium adapter, exactly as fabric/build.gradle adds
+				// it. Its Sodium coordinate is the NeoForge twin, unwrapped
+				// by extractSodiumNeoForge above. mods { meshelium {
+				// sourceSet } } in block 6 hands the whole main output
+				// (common/ + sodium/ + this project) to FML through
+				// MOD_CLASSES with no further change, and the java-library
+				// `jar` packs com/deds/meshelium/sodium/** and
+				// meshelium.sodium.mixins.json the same way.
+				rootProject.ext.versionedRoot(project, 'sodium/src/main/java'),
+		].flatten()
+		resources.srcDirs = [
+				rootProject.ext.versionedRoot(project, 'neoforge/src/main/resources'),
+				rootProject.ext.versionedRoot(project, 'common/src/main/resources'),
+				rootProject.ext.versionedRoot(project, 'sodium/src/main/resources'),
+		].flatten()
 	}
 }
 
@@ -328,6 +350,10 @@ neoForge {
 	runs {
 		client {
 			client()
+
+			// The per-version run directory from block 0. ModDevGradle's
+			// default is `run`; a derived target moves to run-mc<version>.
+			gameDirectory = layout.projectDirectory.dir(mesheliumRunDirName)
 
 			// -Pmeshelium.sodium: Sodium's wrapper in run/mods for this run
 			// (and removed again on the next run without the property).
@@ -454,11 +480,19 @@ java {
 
 processResources {
 	def v = project.version
+	def build = project.mesheliumBuildExpansion
 	inputs.property 'version', v
-	// Expands only the toml; meshelium.sodium.mixins.json and the shared
-	// config pass through untouched.
+	inputs.property 'build', build.toString()
+	// Expands the toml (version and the two Minecraft version bounds) and
+	// the build-info resource the jar reads at runtime (MesheliumBuild);
+	// meshelium.sodium.mixins.json and the shared config pass through
+	// untouched. Both expansions use the one map the root build derived
+	// from versions/mc<target>.properties.
 	filesMatching('META-INF/neoforge.mods.toml') {
-		expand 'version': v
+		expand(['version': v] + build)
+	}
+	filesMatching('meshelium-build.properties') {
+		expand build
 	}
 }
 
@@ -477,18 +511,12 @@ jar {
 // produced a 1.2 MB artifact nobody uploads, sitting in release/ next to the
 // files that DO get uploaded.
 
-// Two root censuses, wired in here so a plain `./gradlew build` runs both.
-//
-// checkSodiumCoordinate is called at CONFIGURATION time, not from a task:
-// its whole job is to stop a build whose Sodium coordinate and whose
-// shipped MesheliumSodiumVersion.BUILT_AGAINST name different Sodiums, and
-// a check that only runs when somebody remembers to run `check` is a check
-// that certifies memory. It is handed THIS project's property name and
-// loader suffix, because a root property inherits into every subproject
-// and the drafted single call would have green-lit a NeoForge-only bump
-// while reading the Fabric coordinate.
-rootProject.ext.checkSodiumCoordinate('sodium_neoforge_version', 'neoforge')
-
+// The root censuses, wired in here so a plain `./gradlew build` runs them.
+// (checkSodiumCoordinate, which used to be called here at configuration
+// time, is gone since 2026-09-20: the Modrinth coordinate and the version
+// the jar reports are now both derived from one property, so there are no
+// longer two copies to compare.)
 tasks.named('check') {
 	dependsOn rootProject.tasks.named('checkLangKeys')
+	dependsOn rootProject.tasks.named('checkVersionedSources')
 }

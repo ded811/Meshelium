@@ -7,7 +7,7 @@ package com.deds.meshelium.mixin;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.vk.MesheliumDeviceTeardown;
 
-import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -40,7 +40,7 @@ abstract class VulkanDeviceMixin {
             method = "close()V",
             at = @At(
                     value = "INVOKE",
-                    target = "Lcom/mojang/blaze3d/vulkan/VulkanCommandEncoder;destroy()V",
+                    target = "Lcom/mojang/renderpearl/backend/vulkan/VulkanCommandEncoder;destroy()V",
                     shift = At.Shift.AFTER
             )
     )

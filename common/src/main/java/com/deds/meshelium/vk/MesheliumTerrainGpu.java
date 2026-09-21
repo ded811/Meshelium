@@ -15,10 +15,10 @@ import com.deds.meshelium.terrain.TerrainVertexCodec;
 import com.deds.meshelium.terrain.host.TerrainGpuHost;
 import com.deds.meshelium.terrain.host.TerrainResidency;
 
-import com.mojang.blaze3d.systems.GpuDevice;
+import com.mojang.renderpearl.api.device.GpuDevice;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -229,11 +229,18 @@ public final class MesheliumTerrainGpu implements TerrainGpuHost {
                     MesheliumScaling.arenaBlockBytes(), MesheliumScaling.arenaBlockCount());
             long regionBytes = RegionRecord.regionBufferBytes(TerrainResidency.maxRegions());
             long sectionBytes = SectionRecord.sectionBufferBytes(TerrainResidency.maxRegions());
-            regionBuffer = MesheliumVkBuffers.createDeviceLocal(vma,
-                    regionBytes, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            // TRANSFER_SRC as well as DST: growRecords copies the live records
+            // OUT of these into their replacements, and a buffer created
+            // without the source usage may not be a vkCmdCopyBuffer source
+            // (VUID-vkCmdCopyBuffer-srcBuffer-00118). AMD's driver let the
+            // first grow through anyway; the validation layer caught it on
+            // the 26.3 suite's rd48 leg, 2026-09-20. The grown replacements
+            // already carried both bits.
+            int recordUsage = VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                    | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            regionBuffer = MesheliumVkBuffers.createDeviceLocal(vma, regionBytes, recordUsage,
                     "vmaCreateBuffer(meshelium region records)");
-            sectionBuffer = MesheliumVkBuffers.createDeviceLocal(vma,
-                    sectionBytes, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            sectionBuffer = MesheliumVkBuffers.createDeviceLocal(vma, sectionBytes, recordUsage,
                     "vmaCreateBuffer(meshelium section records)");
             ring = VkStagingRing.create(vma, STAGING_BYTES);
 
