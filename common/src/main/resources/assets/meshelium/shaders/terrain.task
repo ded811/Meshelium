@@ -180,9 +180,20 @@ layout(set = 0, binding = 1, std140) uniform MesheliumScene {
 // stats[0..2] += 1 per surviving section in VisMode 0/1/2, stats[3] +=
 // quads emitted (all modes): TerrainOcclusion.recordStatsTransfer reads
 // them through the mirror. hdr[] is the layout words (debug/readback).
-layout(set = 0, binding = 7, std430) buffer SodiumMirror {
-    uint stats[4];      // SodiumGpuVisibilityLayout.MIRROR_STATS_OFFSET 0
-    uint hdr[60];       // MIRROR_LAYOUT_OFFSET 16 .. MIRROR_HEADER_BYTES 256
+// coherent: every read of the mirror goes past the per-core caches to the
+// device's coherence point. Added 2026-09-22 after the owner's RADV laptop
+// showed rows served stale for many frames; the rows now come from the
+// list (below), and this makes the 48-byte section records immune to the
+// same thing at the cost of a cache level they rarely hit anyway.
+layout(set = 0, binding = 7, std430) coherent buffer SodiumMirror {
+    uint stats[24];     // SodiumGpuVisibilityLayout.MIRROR_STATS_OFFSET 0
+                        // [0..2] survivors per VisMode, [3] quads,
+                        // [4] region rejections, [5] of those a dead row,
+                        // [6] of those a key mismatch, [7] VisMode of the
+                        // first rejection, [8..18] what it saw,
+                        // [19..23] mirror rows that disagreed with the
+                        // list's fresh copy (STAT_MIRROR_STALE)
+    uint hdr[40];       // MIRROR_LAYOUT_OFFSET 96 .. MIRROR_HEADER_BYTES 256
     uvec4 data[];       // byte 256 onward
 };
 
@@ -197,6 +208,13 @@ struct OccRegion {
     uvec4 meta;     // x = mid, y = popcount(occupancy), z/w = occ AABB packed
     uvec4 mask0;    // 256-bit BFS mask, slots 0-127 (VisMode 0 only)
     uvec4 mask1;    // slots 128-255
+    // SodiumGpuVisibilityLayout.LIST_ROW: the region's row, rewritten by
+    // the processor every frame, in the mirror row's layout. Read instead
+    // of the mirror's copy (FLAG_ROWS_FROM_LIST), which RADV served stale.
+    uvec4 row0;     // {chunkX, chunkY, chunkZ, flags}
+    uvec4 row1;     // occupancy words 0-3
+    uvec4 row2;     // occupancy words 4-7
+    uvec4 row3;     // {bufferKey, popcount, occMin, occMax}
 };
 layout(set = 0, binding = 8, std430) readonly buffer SodiumList {
     OccRegion list[];
@@ -247,10 +265,14 @@ layout(set = 0, binding = 8, std140) uniform VisibilityMasks {
 // the byte Nvidium consumes: bit0 == (cur == FrameStamp), bit1 == (prev
 // == FrameStamp-1); see occlusion/section_raster.mesh for why the byte
 // itself was replaced (cross-stage same-address store race).
-layout(set = 0, binding = 9, std430) readonly buffer PrevStamps {
+// coherent (2026-09-22): the stamps are written by the GPU a frame or a
+// pass earlier and read at the same addresses every frame, the exact shape
+// that RADV served stale for the mirror rows; a coherent read skips the
+// per-core caches.
+layout(set = 0, binding = 9, std430) coherent readonly buffer PrevStamps {
     uint prevStamps[];
 };
-layout(set = 0, binding = 10, std430) readonly buffer CurStamps {
+layout(set = 0, binding = 10, std430) coherent readonly buffer CurStamps {
     uint curStamps[];
 };
 #if MESHELIUM_SODIUM_TASK
@@ -275,7 +297,8 @@ layout(push_constant) uniform MesheliumPush {
                            // pass's record table inside data[]
     uint RegionCount;      // PUSH_REGION_COUNT 24: this draw's list-entry
                            // count (FLAG_ONE_DRAW), else 0
-    uint Reserved1;        // PUSH_RESERVED1 28
+    uint RecordPass;       // PUSH_RECORD_PASS 28: 0 = RecordBase is the SOLID
+                           // table, 1 = CUTOUT (which record probe to use)
 };
 const uint SODIUM_FLAG_STATS     = 1u;   // SodiumGpuVisibilityLayout.FLAG_STATS
 const uint SODIUM_FLAG_FACE_ALL  = 2u;   // SodiumGpuVisibilityLayout.FLAG_FACE_ALL
@@ -288,6 +311,14 @@ const uint SODIUM_FLAG_DIAG_SKIP_STAMPS = 16u;
 // the workgroup finds its region by searching the group's entries on
 // groupEnd; RegionCount (push) is the group's entry count.
 const uint SODIUM_FLAG_ONE_DRAW         = 32u;
+// Phase A also draws what was marked TWO frames ago
+// (SodiumGpuVisibilityLayout.FLAG_STAMP_HOLD). CurStamps is the other
+// ping-pong buffer and phase A runs BEFORE this frame's section raster
+// writes it, so at pass 1a/1b it still holds frame-2's marks.
+const uint SODIUM_FLAG_STAMP_HOLD       = 64u;
+// Take the row from the list entry, not the mirror
+// (SodiumGpuVisibilityLayout.FLAG_ROWS_FROM_LIST).
+const uint SODIUM_FLAG_ROWS_FROM_LIST   = 128u;
 const uint SODIUM_ROW_FLAG_LIVE  = 1u;   // SodiumGpuVisibilityLayout.ROW_FLAG_LIVE
 #else
 // Tiny GPU stats: [VisMode] += 1 per section that survives all gates —
@@ -460,15 +491,108 @@ void main() {
     // Measurement only: with DIAG_SKIP_ALL set, no row, record or stamp
     // is read and nothing is emitted - the launch and payload cost alone.
     if ((Flags & SODIUM_FLAG_DIAG_SKIP_ALL) == 0u) {
-    uvec4 r0 = data[mid * 4u + 0u];   // ivec4 {chunkX, chunkY, chunkZ, flags}
-    uvec4 r1 = data[mid * 4u + 1u];   // occupancy words 0-3
-    uvec4 r2 = data[mid * 4u + 2u];   // occupancy words 4-7
-    uvec4 r3 = data[mid * 4u + 3u];   // {bufferKey, popcount, occMin, occMax}
+    uvec4 r0;   // ivec4 {chunkX, chunkY, chunkZ, flags}
+    uvec4 r1;   // occupancy words 0-3
+    uvec4 r2;   // occupancy words 4-7
+    uvec4 r3;   // {bufferKey, popcount, occMin, occMax}
+    if ((Flags & SODIUM_FLAG_ROWS_FROM_LIST) != 0u) {
+        // The row the processor wrote into this frame's list entry. The
+        // list is rewritten every frame and has never been read stale;
+        // the mirror's copy of the same 64 bytes was, for many frames at
+        // a time, on the owner's RADV laptop.
+        r0 = e.row0;
+        r1 = e.row1;
+        r2 = e.row2;
+        r3 = e.row3;
+        if ((Flags & SODIUM_FLAG_STATS) != 0u && t == 0u) {
+            // Measure the thing being worked around: does the mirror still
+            // disagree with the fresh copy? Once per workgroup, never
+            // acted on.
+            uvec4 m3 = data[mid * 4u + 3u];
+            if (m3.x != r3.x || m3.y != r3.y) {
+                uint seen = atomicAdd(stats[19], 1u);
+                if (seen == 0u) {
+                    stats[20] = mid;
+                    stats[21] = m3.x;
+                    // Key and popcount of the fresh copy, packed, so the
+                    // log can say which side is the newer one (keys stay
+                    // well under 65536; a popcount is at most 256).
+                    stats[22] = (r3.x << 16u) | (r3.y & 0xFFFFu);
+                    stats[23] = m3.y;
+                }
+            }
+        }
+    } else {
+        r0 = data[mid * 4u + 0u];
+        r1 = data[mid * 4u + 1u];
+        r2 = data[mid * 4u + 2u];
+        r3 = data[mid * 4u + 3u];
+    }
 
     // The group check (contract I4, §5.4 step 2): a row whose key is not
     // the buffer bound at binding 0 for this draw emits nothing. A dead
     // row (live bit clear, or zero-filled after delete) emits nothing.
-    bool regionOk = (r0.w & SODIUM_ROW_FLAG_LIVE) != 0u && r3.x == GroupKey;
+    bool rowLive = (r0.w & SODIUM_ROW_FLAG_LIVE) != 0u;
+    bool keyOk = r3.x == GroupKey;
+    // The record probe (SodiumGpuVisibilityLayout.LIST_ROW_PROBE_*). With
+    // the row taken from the list the key check above cannot fail, so this
+    // is what now guarantees the section records on the card belong to the
+    // commit the row describes: the first occupied section's base vertex,
+    // read from the card, must equal what the processor committed. A
+    // mismatch refuses the region - a hole, never old offsets drawn out of
+    // a new geometry buffer.
+    uint cardProbe = 0u;
+    uint wantProbe = 0u;
+    bool recOk = true;
+    if ((Flags & SODIUM_FLAG_ROWS_FROM_LIST) != 0u && rowLive && r3.y != 0u) {
+        uint s0 = meshelium_sodiumSlotOfRank(r1, r2, 0u);
+        cardProbe = data[RecordBase + (mid * 256u + s0) * 3u].y;
+        wantProbe = (RecordPass == 0u) ? r3.z : r3.w;
+        recOk = cardProbe == wantProbe;
+    }
+    bool regionOk = rowLive && keyOk && recOk;
+    // Every workgroup this draw dispatched belongs to a region OF THIS
+    // GROUP, so in normal operation the gate never rejects: the CPU put the
+    // region in this group precisely because its key is the group's, and it
+    // declines the whole frame if its own shadow disagrees. A rejection
+    // therefore means the row on the card is not the row the CPU believes
+    // it wrote, and it costs the WHOLE region - which is what an 8x4x8
+    // hole looks like from the inside. Counted once per workgroup, by
+    // cause, so the log can tell a dead row from a stale key.
+    if (!regionOk && (Flags & SODIUM_FLAG_STATS) != 0u) {
+        uint before = atomicAdd(stats[4], 1u);
+        if (!rowLive) {
+            atomicAdd(stats[5], 1u);
+        } else {
+            atomicAdd(stats[6], 1u);
+        }
+        if (before == 0u) {
+            // The first refusal of the frame writes down what it was
+            // looking at. Exactly one invocation sees a pre-increment of
+            // zero, so these eight words are one coherent snapshot and not
+            // a mixture; every later refusal only moves the counts.
+            stats[8]  = mid;
+            stats[9]  = r3.x;         // the key the row on the card holds
+            stats[10] = GroupKey;     // the key this draw is for
+            stats[11] = slot;         // the list entry it read
+            stats[12] = FirstSlot;    // the group's first entry
+            stats[13] = RegionCount;  // entries in the group (one-draw only)
+            // With the rows from the list, the key cannot mismatch and a
+            // refusal is the record probe: what the processor committed
+            // against what the card holds. Otherwise the two popcounts.
+            bool fromList = (Flags & SODIUM_FLAG_ROWS_FROM_LIST) != 0u;
+            stats[14] = fromList ? wantProbe : e.meta.y;
+            stats[15] = fromList ? cardProbe : r3.y;
+            // Where the row says it is. The processor keeps its own record
+            // of what it last wrote for this id, so these three words
+            // settle whether this is an older copy of the RIGHT row or
+            // some other region's row read by mistake.
+            stats[16] = r0.x;
+            stats[17] = r0.y;
+            stats[18] = r0.z;
+            stats[7]  = VisMode;      // which of the four draws refused
+        }
+    }
     if (regionOk && k < r3.y) {
         uint slot = meshelium_sodiumSlotOfRank(r1, r2, k);
         // LocalSectionIndex.pack(x,y,z) = (x&7)<<5 | (y&3) | (z&7)<<2.
@@ -493,8 +617,22 @@ void main() {
             uint gidx = mid * 256u + slot;
             bool prevFresh = prevStamps[gidx] == FrameStamp - 1u;
             if (VisMode == 1u) {
-                visible = prevFresh;
+                // Phase A: marked last frame, or - with the hold - marked
+                // the frame before that. The second term reads the buffer
+                // THIS frame's raster has not written yet, which still
+                // holds FrameStamp-2, so a single frame with no marks for
+                // this region no longer takes it off the screen.
+                visible = prevFresh || ((Flags & SODIUM_FLAG_STAMP_HOLD) != 0u
+                        && curStamps[gidx] == FrameStamp - 2u);
             } else {
+                // Phase B: marked this frame and not last. The hold is NOT
+                // repeated here and cannot be: by pass 4 the raster has
+                // overwritten curStamps with FrameStamp, so the value phase
+                // A tested is gone. A section that phase A drew through the
+                // hold and the raster has now marked is therefore drawn
+                // twice in this frame - identical opaque geometry at
+                // identical depth, so identical pixels, and only for the
+                // handful of sections that lost a frame of marks.
                 visible = curStamps[gidx] == FrameStamp && !prevFresh;
             }
         }

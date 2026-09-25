@@ -149,11 +149,6 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
         // playtests).
         assertFogOverrideRaisesTheDevBanner(context);
         assertVideoSettingsButton(context, !vulkanRun);
-        // The "Meshelium..." row on vanilla's Options screen exists ONLY
-        // with Sodium installed (OptionsScreenMixin); this is the negative
-        // half of that predicate, the positive half lives in
-        // MesheliumSodiumStandDownTest.
-        assertOptionsMenuButtonAbsentStandalone(context);
         // Wave 2: armed by build.gradle's -Pmeshelium.hello=true →
         // -Dmeshelium.helloMeshlet=true (same double gate the renderer uses).
         boolean hello = vulkanRun && Boolean.getBoolean("meshelium.helloMeshlet");
@@ -628,62 +623,6 @@ public final class MesheliumBootSmokeTest implements FabricClientGameTest {
     private static String sizeLabel() {
         return Component.translatable("meshelium.options.farfield.size",
                 Component.literal("")).getString();
-    }
-
-    /**
-     * The negative half of the Options-screen row's predicate: without
-     * Sodium, vanilla's Options screen carries NO "Meshelium..." row.
-     * {@code OptionsScreenMixin} adds that row only while Sodium is
-     * installed (owner directive 2026-09-13, "when sodium is on"), because
-     * the vanilla-install layout was playtested and signed off as it
-     * stands and the Video Settings row (B0/B1) is the route there.
-     *
-     * <p>The pairing is the point: {@code MesheliumSodiumStandDownTest}
-     * proves the row is present with Sodium, this leg proves it is absent
-     * without, and either alone would pass with a mixin that never applies
-     * or one that always applies. Runs on both no-Sodium forms, from the
-     * TitleScreen {@link #assertVideoSettingsButton} leaves behind, and
-     * returns there. The vanilla grid is found first as a control, so the
-     * absence below is a real absence rather than a walk that saw nothing.
-     * If the decision ever flips to "always", invert this leg and mirror
-     * the Sodium leg's press-through here.
-     */
-    private static void assertOptionsMenuButtonAbsentStandalone(ClientGameTestContext context) {
-        context.runOnClient(client -> {
-            // Vacuous-pass guard: with Sodium on the classpath the row is
-            // SUPPOSED to be there and this leg would fail for the wrong
-            // reason. -Pmeshelium.sodium swaps the entrypoint list to the
-            // stand-down test alone, so this cannot fire on a Sodium run;
-            // it is here for the day that wiring changes.
-            if (MesheliumPlatform.isModLoaded(MesheliumGate.SODIUM_MOD_ID)) {
-                throw new AssertionError("this negative check is only meaningful without Sodium; "
-                        + "the positive half lives in MesheliumSodiumStandDownTest");
-            }
-            client.gui.setScreen(HarnessCompat.optionsScreen(client.gui.screen(), client.options, false));
-        });
-        context.waitForScreen(OptionsScreen.class);
-        context.waitTicks(2);
-        context.takeScreenshot(TestScreenshotOptions.of("B4_meshelium_options_menu_standalone"));
-        context.runOnClient(client -> {
-            Screen screen = client.gui.screen();
-            if (!(screen instanceof OptionsScreen)) {
-                throw new AssertionError("expected vanilla's Options screen, got " + screen);
-            }
-            // Control: the walk sees vanilla's own grid, so an absence below
-            // is a real absence.
-            if (findButton(screen, "options.video") == null) {
-                throw new AssertionError("the widget walk did not see vanilla's own Options grid "
-                        + "(no Video Settings button), so it could not judge the Meshelium row");
-            }
-            if (findButton(screen, "meshelium.options.menu") != null) {
-                throw new AssertionError("vanilla's Options screen has a 'Meshelium...' row "
-                        + "without Sodium installed. The row is shown only with Sodium "
-                        + "(OptionsScreenMixin); if that decision flips to always, invert this "
-                        + "leg and mirror the Sodium leg's press-through here.");
-            }
-        });
-        context.clickScreenButton("gui.done");
-        context.waitForScreen(TitleScreen.class);
     }
 
     /**

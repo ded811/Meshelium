@@ -142,7 +142,12 @@ public class MesheliumAdvancedScreen extends Screen {
         // absent from both.
         boolean greedyOverridden = !this.sodium
                 && System.getProperty("meshelium.greedyMeshing") != null;
-        if (statsOverridden || greedyOverridden) {
+        // The two troubleshooting rows lock under their flags, and exist
+        // only under Sodium.
+        boolean sodiumRowsOverridden = this.sodium
+                && (System.getProperty("meshelium.sodium.occlusion") != null
+                        || System.getProperty("meshelium.sodium.remirrorOnRefusal") != null);
+        if (statsOverridden || greedyOverridden || sodiumRowsOverridden) {
             MultiLineTextWidget banner = new MultiLineTextWidget(
                     Component.translatable("meshelium.options.dev_override"), this.font);
             banner.setMaxWidth(BANNER_WIDTH);
@@ -346,6 +351,30 @@ public class MesheliumAdvancedScreen extends Screen {
         rows.addChild(suppress);
         }
 
+        // The troubleshooting rows. Sodium-path only: built only under
+        // Sodium (without it they could never act, and a row that cannot
+        // act is furniture), and held there whenever the adapter is not
+        // drawing. Same order as Meshelium's page inside Sodium's video
+        // settings, which has to show exactly the rows these screens build
+        // under Sodium.
+        if (this.sodium) {
+        boolean adapterArmed = MesheliumGate.sodiumAdapterArmed();
+        rows.addChild(sodiumToggle("meshelium.options.sodium_occlusion",
+                "meshelium.options.tooltip.sodium_occlusion", "meshelium.sodium.occlusion",
+                adapterArmed, config.sodiumOcclusion, value -> {
+                    config.sodiumOcclusion = value;
+                    config.save();
+                    com.deds.meshelium.vk.SodiumTerrainDrawer.applyConfiguredGpuVisibility();
+                }));
+        rows.addChild(sodiumToggle("meshelium.options.sodium_record_repair",
+                "meshelium.options.tooltip.sodium_record_repair",
+                "meshelium.sodium.remirrorOnRefusal",
+                adapterArmed, config.sodiumRemirrorOnRefusal, value -> {
+                    config.sodiumRemirrorOnRefusal = value;
+                    config.save();
+                }));
+        }
+
         CycleButton<Boolean> stats = CycleButton.onOffBuilder(config.debugStats)
                 .create(Component.translatable("meshelium.options.debug_stats"), (b, value) -> {
                     config.debugStats = value;
@@ -409,6 +438,21 @@ public class MesheliumAdvancedScreen extends Screen {
      * REPLACED by why the row is locked, because that is a locked row's
      * only truthful annotation.
      */
+    /**
+     * One Sodium-path troubleshooting row: on/off, live, held while the
+     * adapter is not drawing, and held again while its launch flag is set.
+     */
+    private CycleButton<Boolean> sodiumToggle(String nameKey, String tipKey, String property,
+            boolean adapterArmed, boolean initial, java.util.function.Consumer<Boolean> onChange) {
+        CycleButton<Boolean> row = CycleButton.onOffBuilder(initial)
+                .create(Component.translatable(nameKey), (b, value) -> onChange.accept(value));
+        row.setWidth(WIDGET_WIDTH);
+        row.active = adapterArmed && System.getProperty(property) == null;
+        row.setTooltip(tip(!adapterArmed, tipKey, "meshelium.options.applies.now",
+                "meshelium.options.applies.sodium_gpu_held"));
+        return row;
+    }
+
     private Tooltip tip(String descriptionKey, String appliesKey) {
         return tip(this.gateLocked, descriptionKey, appliesKey);
     }

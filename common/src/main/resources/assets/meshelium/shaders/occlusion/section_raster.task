@@ -50,6 +50,10 @@ struct OccRegion {
     uvec4 meta;    // x = mid, y = popcount(occupancy), z/w = occ AABB
     uvec4 mask0;   // VisMode-0 BFS mask, never read here
     uvec4 mask1;
+    uvec4 row0;    // SodiumGpuVisibilityLayout.LIST_ROW: the region's row,
+    uvec4 row1;    // fresh every frame; row1/row2 are the occupancy this
+    uvec4 row2;    // raster walks, handed to the mesh stage in the payload
+    uvec4 row3;
 };
 #else
 struct OccRegion {
@@ -72,7 +76,11 @@ layout(set = 0, binding = 0, std140) uniform OccRegions {
 // Region visibility stamps written by the region raster last pass (the
 // pass-end full barrier orders them — frame-path Q1.3's inherited
 // invariant; indexed by dispatch slot).
-layout(set = 0, binding = 4, std430) readonly buffer RegionStamps {
+// coherent (2026-09-22): written by the region raster earlier in this
+// same frame and read here at a workgroup-uniform address - the shape RADV
+// served stale for the mirror rows. A stale read skips the whole region's
+// section raster, which is a whole-region hole.
+layout(set = 0, binding = 4, std430) coherent readonly buffer RegionStamps {
     uint regionStamps[];
 };
 
@@ -87,6 +95,12 @@ struct OccSectionPayload {
     uint popcount;  // occupied slots of the region: the packed mesh
                     // stage clips its last workgroup's box count on it
 #endif
+#if MESHELIUM_SODIUM
+    uvec4 occ0;     // the occupancy mask, from the list entry's fresh row:
+    uvec4 occ1;     // the mesh stage used to read it from the mirror, and
+                    // pairing a fresh popcount with a stale mask walked
+                    // ranks the mask did not have
+#endif
 };
 taskPayloadSharedEXT OccSectionPayload payload;
 
@@ -97,6 +111,10 @@ void main() {
         OccRegion e = occRegions[slot];
         payload.origin = e.origin.xyz;
         payload.regionId = e.meta.x;
+#if MESHELIUM_SODIUM
+        payload.occ0 = e.row1;
+        payload.occ1 = e.row2;
+#endif
 #if MESHELIUM_SODIUM && MESHELIUM_OCC_BOXES_PER_WG > 1
         // ceil(popcount / boxes per workgroup) workgroups, each taking
         // the next MESHELIUM_OCC_BOXES_PER_WG ranks (2026-09-13: one

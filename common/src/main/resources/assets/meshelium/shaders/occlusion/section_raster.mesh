@@ -125,7 +125,7 @@ layout(set = 0, binding = 5, std430) readonly buffer SectionRecords {
 // be the one hole in the at-least-once argument (a section the camera just
 // entered is newly visible and phase B is exactly what draws it that
 // frame).
-layout(set = 0, binding = 6, std430) readonly buffer PrevStamps {
+layout(set = 0, binding = 6, std430) coherent readonly buffer PrevStamps {
     uint prevStamps[];
 };
 layout(set = 0, binding = 7, std430) buffer PhaseBPredicate {
@@ -267,6 +267,10 @@ struct OccSectionPayload {
 #if MESHELIUM_SODIUM && MESHELIUM_OCC_BOXES_PER_WG > 1
     uint popcount;
 #endif
+#if MESHELIUM_SODIUM
+    uvec4 occ0;     // occupancy words 0-3, from the list entry's fresh row
+    uvec4 occ1;     // occupancy words 4-7
+#endif
 };
 taskPayloadSharedEXT OccSectionPayload payload;
 
@@ -325,7 +329,7 @@ void main() {
     uint b = t >> 3u;
     uint c = t & 7u;
     if (b < nb) {
-        uint slot = meshelium_sodiumSlotOfRank(rows[mid * 4u + 1u], rows[mid * 4u + 2u], firstRank + b);
+        uint slot = meshelium_sodiumSlotOfRank(payload.occ0, payload.occ1, firstRank + b);
         uint globalIdx = mid * 256u + slot;
         vec3 localChunk = vec3(
                 float((slot >> 5u) & 7u),
@@ -401,7 +405,7 @@ void main() {
     // so the row loads are scalar and SetMeshOutputsEXT stays uniform.
     uint k = gl_WorkGroupID.x;
     uint mid = payload.regionId;
-    uint slot = meshelium_sodiumSlotOfRank(rows[mid * 4u + 1u], rows[mid * 4u + 2u], k);
+    uint slot = meshelium_sodiumSlotOfRank(payload.occ0, payload.occ1, k);
     uint globalIdx = mid * 256u + slot;                // stamp index, mid*256 + Sodium slot
     vec3 localChunk = vec3(
             float((slot >> 5u) & 7u),

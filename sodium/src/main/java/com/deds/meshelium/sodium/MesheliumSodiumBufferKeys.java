@@ -79,7 +79,15 @@ final class MesheliumSodiumBufferKeys {
         return keys.size();
     }
 
-    /** Keys handed out this session. */
+    /**
+     * Keys handed out this session.
+     *
+     * <p>Reported beside a refusal, because a refusal names two keys and
+     * they mean nothing without it: keys start at 1 and never repeat, so
+     * early in a session "the row holds 1, the draw wants 2" is the only
+     * pair the arithmetic allows and says nothing at all. Against a count
+     * of, say, nine issued, the same pair is a finding.
+     */
     int issued() {
         return next;
     }

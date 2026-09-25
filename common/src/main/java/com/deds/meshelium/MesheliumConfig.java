@@ -460,6 +460,35 @@ public final class MesheliumConfig {
     public boolean sodiumGpuVisibility = true;
 
     /**
+     * GPU Occlusion Culling: the graphics card works out which chunks
+     * are hidden behind other chunks and skips them.
+     *
+     * <p>Only means anything while {@link #sodiumGpuVisibility} is on,
+     * because it is a stage of that path; off leaves the card drawing
+     * everything the chunk list offers, which is what the plain list path
+     * does anyway. The row exists because it is the largest single lever on
+     * this path and the first thing worth turning off when terrain looks
+     * wrong.
+     * JVM: {@code -Dmeshelium.sodium.occlusion=true|false} overrides.</p>
+     */
+    public boolean sodiumOcclusion = true;
+
+    /**
+     * Repair Records After A Fault: when the graphics card reports that it
+     * refused a chunk group, write every chunk record again.
+     *
+     * <p>A refusal means the card's copy of a record is not the one that
+     * was written for it. Nothing would mark that record for rewriting on
+     * its own, so without this the same piece of world keeps dropping out
+     * for as long as anything asks to draw it. Rewriting is what happens
+     * when the records are first built, so it is always correct; it only
+     * costs the writing, and only on a fault that is supposed to never
+     * happen.
+     * JVM: {@code -Dmeshelium.sodium.remirrorOnRefusal=true|false}.</p>
+     */
+    public boolean sodiumRemirrorOnRefusal = true;
+
+    /**
      * Smart Leaves Beyond: past this many chunks, NEW section builds drop
      * both faces of every opposite-facing coplanar cutout pair — the
      * leaf-against-leaf interior faces Fast graphics never meshes at all,
@@ -840,6 +869,22 @@ public final class MesheliumConfig {
         return propertyOr("meshelium.sodium.gpuDraw", get().sodiumGpuVisibility);
     }
 
+    /**
+     * {@link #sodiumOcclusion} alone. The property is NOT read here: the
+     * occlusion lever's property has always meant "whatever the GPU draw is
+     * doing, do this", so it is resolved beside the GPU draw in
+     * {@code SodiumTerrainDrawer.occlusionConfigured}, which is the only
+     * caller and the only place that knows the GPU draw's answer.
+     */
+    public static boolean sodiumOcclusionConfigured() {
+        return get().sodiumOcclusion;
+    }
+
+    /** {@code meshelium.sodium.remirrorOnRefusal} ?? {@link #sodiumRemirrorOnRefusal}. */
+    public static boolean sodiumRemirrorOnRefusalEnabled() {
+        return propertyOr("meshelium.sodium.remirrorOnRefusal", get().sodiumRemirrorOnRefusal);
+    }
+
     /** {@code meshelium.greedyMeshing} ?? {@link #greedyMeshing}. */
     public static boolean greedyMeshingEnabled() {
         return propertyOr("meshelium.greedyMeshing", get().greedyMeshing);
@@ -1087,6 +1132,11 @@ public final class MesheliumConfig {
         this.plantCullChunks = d.plantCullChunks;
         this.subPixelCullChunks = d.subPixelCullChunks;
         this.sodiumGpuVisibility = d.sodiumGpuVisibility;
+        // The troubleshooting rows. resetCoversEveryField walks every public
+        // field by reflection and fails by name, which is the only reason
+        // the omissions above were ever found.
+        this.sodiumOcclusion = d.sodiumOcclusion;
+        this.sodiumRemirrorOnRefusal = d.sodiumRemirrorOnRefusal;
         this.smartLeavesChunks = d.smartLeavesChunks;
         this.solidLeavesChunks = d.solidLeavesChunks;
         // Retention has no rows any more (Bobby owns that job since

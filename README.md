@@ -65,7 +65,8 @@ Skip this and it looks like the mod did nothing at all. If that happens, Mesheli
 
 They work together now. Sodium builds the chunks and Meshelium draws them with
 mesh shaders. Install both and it happens on its own - there is nothing to
-switch on.
+switch on. Meshelium's settings sit inside Sodium's video settings, under
+their own **Meshelium** entry.
 
 Use **Sodium 0.9.2** for your game version - the release, not the newer
 0.9.3 alpha. (On 26.2, Sodium 0.9.2-beta.1 is the same build with a
@@ -87,11 +88,11 @@ Nothing gets installed on the server. Bobby runs in your game, just like this mo
 
 ## The settings
 
-Everything is in **Options > Video Settings > Meshelium Settings...**, and every one of them defaults to the right answer. You should not need to touch any of this.
+Everything is in **Options > Video Settings > Meshelium Settings...** - with Sodium installed, it is the **Meshelium** entry in Sodium's video settings - and every one of them defaults to the right answer. You should not need to touch any of this.
 
 **Meshelium Rendering** turns the whole thing on and off. Turning it off puts Minecraft back in charge and pulls your render distance down to 32, because that is as far as Minecraft can draw on its own. Turning it back on gives your distance back.
 
-**Distance Cap** is how far the slider in Video Settings is allowed to go. Raising it does not change what you see until you also move the actual render distance slider.
+**Distance Cap** is how far the slider in Video Settings is allowed to go (with Sodium installed, Sodium's slider, up to 96). Raising it does not change what you see until you also move the actual render distance slider.
 
 **Occlusion Culling** skips terrain hidden behind other terrain. Auto switches it on past the distance where it usually starts paying off. See the note below if your graphics are modest.
 

@@ -102,6 +102,10 @@ struct OccRegion {
                    // of the occupancy mask, z = occMin packed, w = occMax
     uvec4 mask0;   // VisMode-0 BFS mask, never read here
     uvec4 mask1;
+    uvec4 row0;    // SodiumGpuVisibilityLayout.LIST_ROW, never read here;
+    uvec4 row1;    // declared so the array stride is the entry's 128 bytes
+    uvec4 row2;
+    uvec4 row3;
 };
 #else
 struct OccRegion {

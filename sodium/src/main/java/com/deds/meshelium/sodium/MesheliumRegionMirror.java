@@ -99,6 +99,33 @@ public final class MesheliumRegionMirror {
         int listedRegions;
         /** Sections in the listed masks this frame (sum of popcounts): what the GPU will be asked to consider. */
         int listedSections;
+        /**
+         * MIRRORED regions the frame walk passed over because Sodium had
+         * no device resources or no geometry buffer for them.
+         *
+         * <p>A region with no id has never had geometry and skipping it is
+         * the walk working; a region that HOLDS one had geometry when it
+         * was last committed, so finding it bufferless now is a region
+         * that draws nothing this frame and draws again the next - which
+         * is what a chunk-sized flicker looks like from the inside. It was
+         * a silent {@code continue} until 2026-09-21, so it could not be
+         * told apart from the ordinary case in any log: a walk that
+         * silently skips what it cannot use hides exactly the cases that
+         * later break.
+         */
+        int droppedMirrored;
+        /**
+         * Sections this frame's geometry bitmap holds that the mirror row
+         * cannot enumerate: geometry the GPU path cannot draw and the list
+         * path can.
+         */
+        int unreachableSections;
+        int unreachableRegions;
+        /**
+         * Regions listed now and two frames ago but not on the frame
+         * between: a region-sized hole in that middle frame.
+         */
+        int oneFrameGaps;
         long signature;
         boolean faceAll;
         long loopNanos;
@@ -119,6 +146,10 @@ public final class MesheliumRegionMirror {
             groupCount = 0;
             listedRegions = 0;
             listedSections = 0;
+            droppedMirrored = 0;
+            oneFrameGaps = 0;
+            unreachableSections = 0;
+            unreachableRegions = 0;
         }
     }
 
@@ -154,8 +185,45 @@ public final class MesheliumRegionMirror {
     private int[] shadowPop;
     private int[] shadowMin;
     private int[] shadowMax;
+
+    /**
+     * Per mid, per pass: the base vertex of the first occupied section's
+     * record as last committed (SodiumGpuVisibilityLayout.LIST_ROW_PROBE_*).
+     */
+    private int[] shadowProbe;
     private boolean[] shadowLive;
     private int[] committedEpoch;
+
+    /**
+     * The completed-list serial each mid was last listed at, for the
+     * one-frame gap check in {@code buildFrame}. Zero means never listed
+     * by this mirror, and {@code releaseMid} puts it back to zero so a
+     * reused id never inherits the last tenant's history.
+     */
+    private long[] listedAt;
+
+    /**
+     * The completed-list serial each mid was last in SODIUM's list at -
+     * {@link #listedAt} also counts a frame the region hold put it back -
+     * so the hold keys off Sodium's list and holds a region for exactly one
+     * frame. Keyed off the drawn list, a held region read as "listed last
+     * frame" on the next one and was held again, for as long as it stayed
+     * on screen, while the row promised one frame. Same zero convention.
+     */
+    private long[] sodiumListedAt;
+
+    /**
+     * The occupancy mask each mid's row was committed with, eight ints per
+     * mid: the CPU's copy of the one thing the GPU enumerates sections
+     * from.
+     *
+     * <p>Kept for the per-frame comparison in {@code buildFrame}. The task
+     * stage walks ranks of THIS mask, so a section Sodium is listing that
+     * the mask does not hold is a section the GPU can never reach, however
+     * correct everything else is. Nothing compared the two before
+     * 2026-09-21.
+     */
+    private int[] shadowMask;
 
     private boolean tracking;
     private long serial;
@@ -177,6 +245,23 @@ public final class MesheliumRegionMirror {
 
     /** buildFrame calls on this mirror; {@code ab} mode alternates on its parity. */
     private long buildFrames;
+
+    /**
+     * buildFrame calls that COMPLETED, which is the clock the one-frame
+     * gap check counts on: a call that breaks off at an invariant declines
+     * the frame, so its half-written list is not a frame anyone drew and
+     * must not be a frame anyone measures against.
+     *
+     * <p>Starts at 2, not 0: zero is the "never listed" mark in
+     * {@link #listedAt}, and a clock starting at 0 made {@code nowSerial -
+     * 2} equal it on every mirror's second frame (each newly listed region
+     * counted as a gap) and {@code nowSerial - 1} equal it on the first
+     * (with the hold on, every live region in view was held).
+     */
+    private long listSerial = 2L;
+
+    /** The last completed frame's list size, for the gap check's own control. */
+    private int prevListCount = -1;
 
     /** Decided once per buildFrame, so a frame is wholly one implementation. */
     private boolean frameUsesMap;
@@ -211,6 +296,7 @@ public final class MesheliumRegionMirror {
         int capacity = SodiumTerrainDrawer.initialCapacity();
         this.ids = new MesheliumSodiumRegionIds(capacity);
         allocateShadow(capacity);
+        SodiumTerrainDrawer.resetRowLedger();
         current = this;
     }
 
@@ -221,8 +307,12 @@ public final class MesheliumRegionMirror {
         shadowPop = new int[capacity];
         shadowMin = new int[capacity];
         shadowMax = new int[capacity];
+        shadowProbe = new int[capacity * 2];
         shadowLive = new boolean[capacity];
         committedEpoch = new int[capacity];
+        listedAt = new long[capacity];
+        sodiumListedAt = new long[capacity];
+        shadowMask = new int[capacity * 8];
         if (audit) {
             auditBase = MemoryUtil.nmemCallocChecked(capacity, 2L * PASS_BLOCK_BYTES);
             auditCapacity = capacity;
@@ -394,6 +484,11 @@ public final class MesheliumRegionMirror {
         }
     }
 
+    /** Keys handed out this session; 0 or more, never reused. See the refusal log. */
+    int bufferKeysIssued() {
+        return keys.issued();
+    }
+
     private void releaseMid(int mid, RenderRegion region) {
         if (mid >= regionOf.length || regionOf[mid] != region) {
             return; // not ours (a region of a manager this mirror never mirrored)
@@ -405,6 +500,10 @@ public final class MesheliumRegionMirror {
         }
         shadowLive[mid] = false;
         shadowKey[mid] = 0;
+        listedAt[mid] = 0L;
+        sodiumListedAt[mid] = 0L;
+        SodiumTerrainDrawer.recordRowRelease(mid);
+        Arrays.fill(shadowMask, mid * 8, mid * 8 + 8, 0);
         // Not released here: the id goes back into the lag from the dead
         // drain in commit(), right after its zero fill is queued, so a mid
         // can never be free before that fill is in a recorded CB (second
@@ -420,14 +519,43 @@ public final class MesheliumRegionMirror {
     // ------------------------------------------------------------------
 
     /** The GPU draw is wanted this frame: start (or resume) feeding the dirty list. */
+    /**
+     * Queue every loaded region for commit again, as though this mirror had
+     * just opened ({@code SodiumTerrainDrawer.PROPERTY_REMIRROR_ON_REFUSAL}).
+     *
+     * <p>Called when the card has reported refusing a region, which says
+     * its copy of some row is not what was written for it. Which row is not
+     * known - the card names one and there may be many - so the answer is
+     * all of them. Writing a row that was already right is a copy and
+     * nothing else, and the frames where this fires are frames where
+     * something is already wrong.
+     */
+    void remirrorAll() {
+        tracking = false;
+        ensureTracking();
+    }
+
     void ensureTracking() {
         if (tracking) {
             return;
         }
         tracking = true;
         // Everything mutated while asleep is unknown: re-mirror the world.
+        //
+        // The flag is cleared first because it lives on the REGION and the
+        // queue lives on the MIRROR. A region queued on a mirror that was
+        // retired before it could commit still reads dirty, and markDirty
+        // takes that to mean it is already queued here - so it is never
+        // queued at all, and because the flag is only ever cleared by a
+        // commit, no later change can queue it either. That region's row
+        // would then be frozen for the life of the mirror. A mirror opening
+        // for the first time has queued nothing, so the flag can only be
+        // another mirror's and is never worth keeping.
         Collection<RenderRegion> loaded = manager.regions.getLoadedRegions();
         for (RenderRegion region : loaded) {
+            if (region instanceof MesheliumRegionCacheHolder holder) {
+                holder.meshelium$setDirtyQueued(false);
+            }
             markDirty(region);
         }
     }
@@ -464,8 +592,12 @@ public final class MesheliumRegionMirror {
         shadowPop = Arrays.copyOf(shadowPop, capacity);
         shadowMin = Arrays.copyOf(shadowMin, capacity);
         shadowMax = Arrays.copyOf(shadowMax, capacity);
+        shadowProbe = Arrays.copyOf(shadowProbe, capacity * 2);
         shadowLive = Arrays.copyOf(shadowLive, capacity);
         committedEpoch = Arrays.copyOf(committedEpoch, capacity);
+        listedAt = Arrays.copyOf(listedAt, capacity);
+        sodiumListedAt = Arrays.copyOf(sodiumListedAt, capacity);
+        shadowMask = Arrays.copyOf(shadowMask, capacity * 8);
         if (audit) {
             long grown = MemoryUtil.nmemCallocChecked(capacity, 2L * PASS_BLOCK_BYTES);
             MemoryUtil.memCopy(auditBase, grown, (long) auditCapacity * 2L * PASS_BLOCK_BYTES);
@@ -609,6 +741,28 @@ public final class MesheliumRegionMirror {
                 pop++;
             }
         }
+        System.arraycopy(occ, 0, shadowMask, mid * 8, 8);
+        // The record probe: the base vertex of the first occupied slot's
+        // record in each pass, read from the same heap bytes this call just
+        // staged (render thread; nothing mutates them in between). The
+        // task stage finds the same slot as rank 0 of the same mask.
+        int slot0 = -1;
+        for (int w = 0; w < 8 && slot0 < 0; w++) {
+            if (occ[w] != 0) {
+                slot0 = (w << 5) | Integer.numberOfTrailingZeros(occ[w]);
+            }
+        }
+        for (int pass = 0; pass < SodiumGpuVisibilityLayout.PASS_COUNT; pass++) {
+            int probe = 0;
+            if (slot0 >= 0) {
+                SectionRenderDataStorage probeStorage = region.getStorage(passOf(pass));
+                long probeHeap = probeStorage == null ? 0L : probeStorage.getDataPointer(0);
+                if (probeHeap != 0L) {
+                    probe = MemoryUtil.memGetInt(probeHeap + (long) slot0 * RECORD_BYTES + 4L);
+                }
+            }
+            shadowProbe[mid * 2 + pass] = probe;
+        }
         int occMin = pop == 0 ? 0 : (minX | (minY << 8) | (minZ << 16));
         int occMax = pop == 0 ? 0 : (maxX | (maxY << 8) | (maxZ << 16));
         int key = live ? keys.keyOf(geometry) : 0;
@@ -630,6 +784,8 @@ public final class MesheliumRegionMirror {
         MemoryUtil.memPutInt(row + SodiumGpuVisibilityLayout.ROW_OCC_MIN, occMin);
         MemoryUtil.memPutInt(row + SodiumGpuVisibilityLayout.ROW_OCC_MAX, occMax);
         gpu.copyRow(mid, row);
+        SodiumTerrainDrawer.recordRowWrite(mid, region.getChunkX(), region.getChunkY(),
+                region.getChunkZ(), key, keys.issued());
 
         if (bufferOf[mid] != geometry) {
             if (bufferOf[mid] != null) {
@@ -712,7 +868,18 @@ public final class MesheliumRegionMirror {
         }
         out.faceAll = !faceCull;
         listCount = 0;
+        int dropped = 0;
         int capacity = ring.capacity();
+        // The one-frame gap check's clock: this call's serial if it
+        // completes. A call that breaks off leaves its marks at this value
+        // and the next call reuses it, which can only make a region look
+        // listed NOW - never listed two frames ago - so a declined frame
+        // can hide a gap but can never invent one.
+        long nowSerial = listSerial + 1L;
+        int gaps = 0;
+        int previousListCount = prevListCount;
+        int unreachable = 0;
+        int unreachableRegions = 0;
 
         if (!frustumRegions) {
             Iterator<ChunkRenderList> it = lists.iterator(false);
@@ -724,10 +891,12 @@ public final class MesheliumRegionMirror {
                 }
                 RenderRegion.DeviceResources resources = region.getResources();
                 if (resources == null) {
+                    dropped += mirroredDrop(region);
                     continue;
                 }
                 GpuBuffer geometry = resources.getGeometryBuffer();
                 if (geometry == null) {
+                    dropped += mirroredDrop(region);
                     continue;
                 }
                 int mid = resolve(region, geometry);
@@ -742,16 +911,24 @@ public final class MesheliumRegionMirror {
                 }
                 int e = append(region, mid);
                 fillGeometryMask(list, e * 8);
+                int missing = unreachableSections(region, mid, e * 8);
+                if (missing > 0) {
+                    unreachable += missing;
+                    unreachableRegions++;
+                    markDirty(region);
+                }
             }
         } else {
             computePlanes(modelView, projection);
             for (RenderRegion region : manager.regions.getLoadedRegions()) {
                 RenderRegion.DeviceResources resources = region.getResources();
                 if (resources == null) {
+                    dropped += mirroredDrop(region);
                     continue;
                 }
                 GpuBuffer geometry = resources.getGeometryBuffer();
                 if (geometry == null) {
+                    dropped += mirroredDrop(region);
                     continue;
                 }
                 float lx = (float) (region.getOriginX() - camera.x);
@@ -772,6 +949,103 @@ public final class MesheliumRegionMirror {
                 Arrays.fill(listMask, e * 8, e * 8 + 8, -1);
             }
         }
+
+        // The one-frame hold (SodiumTerrainDrawer.PROPERTY_REGION_HOLD).
+        // Sodium's list can lose a region for a single frame while its cull
+        // tree is being rebuilt, and Meshelium draws exactly that list, so
+        // the region is a chunk-sized hole for that frame. Anything listed
+        // LAST frame and not this one is put back for one more, frustum-
+        // tested and with an all-ones section mask.
+        //
+        // Placed here, after the walk and before the group sort, so a held
+        // region is grouped, counted and written into the ring slot exactly
+        // like a listed one; nothing downstream can tell them apart.
+        //
+        // The mask is all ones because a held region has no ChunkRenderList
+        // to drain a geometry bitmap from. With occlusion on the mask is
+        // never read (VisMode 1/2 come from the stamps), so this is exact;
+        // with occlusion off it offers the region's whole occupancy, which
+        // is the "draw more, never fewer" direction the frustum walk
+        // already takes.
+        // The one-frame gap: a region listed two completed frames ago, NOT
+        // listed on the frame between, and listed again now. Nothing drew it
+        // on that middle frame - not phase A, which draws what the section
+        // raster stamped, and the raster only rasterises listed regions;
+        // not phase B, which needs a stamp from the same raster; and not
+        // the list path, which draws this same list. A region is 8x4x8
+        // sections, so one of these is a chunk-sized hole for exactly one
+        // frame, which is what the owner's laptop reports seeing. Exact:
+        // no threshold, no ratio, and it cannot fire on terrain that
+        // simply went out of view, because such terrain does not come
+        // back on the very next frame.
+        //
+        // The control the count needs, and it is not optional. Sodium
+        // builds each frame's list by walking one of several cull trees
+        // (the narrowest one still valid for where the camera is), always
+        // clipped to the frustum and the fog distance, and swaps trees as
+        // its background culling results land. So a region can leave the
+        // list for one frame by design - Sodium judged it not visible then -
+        // and the list path and Sodium's own translucent pass draw that
+        // same list, so such a region is missing from every path, not just
+        // this one. Counting every such swap would bury the thing this
+        // exists to find, so a gap is only counted on a middle frame whose
+        // list was NOT materially smaller. That control sees sizes, not
+        // membership: a same-size swap still counts.
+        boolean comparable = previousListCount >= 0
+                && (long) previousListCount * 100L >= (long) listCount * 95L;
+        for (int e = 0; e < listCount; e++) {
+            int mid = listMid[e];
+            if (comparable && listedAt[mid] == nowSerial - 2L) {
+                gaps++;
+            }
+            listedAt[mid] = nowSerial;
+            sodiumListedAt[mid] = nowSerial;
+        }
+        listSerial = nowSerial;
+
+        int held = 0;
+        if (listCount < capacity && SodiumTerrainDrawer.regionHoldEnabled()) {
+            computePlanes(modelView, projection);
+            for (int mid = 0; mid < regionOf.length && listCount < capacity; mid++) {
+                if (sodiumListedAt[mid] != nowSerial - 1L || listedAt[mid] == nowSerial) {
+                    continue;   // not in Sodium's list last frame, or already in this one
+                }
+                RenderRegion region = regionOf[mid];
+                if (region == null) {
+                    continue;
+                }
+                RenderRegion.DeviceResources resources = region.getResources();
+                GpuBuffer geometry = resources == null ? null : resources.getGeometryBuffer();
+                if (geometry == null) {
+                    continue;
+                }
+                float lx = (float) (region.getOriginX() - camera.x);
+                float ly = (float) (region.getOriginY() - camera.y);
+                float lz = (float) (region.getOriginZ() - camera.z);
+                if (!boxInFrustum(lx, ly, lz, lx + 128.0f, ly + 64.0f, lz + 128.0f)) {
+                    continue;
+                }
+                // The same two cross-checks a listed region gets, but a
+                // failure SKIPS the held region instead of declining the
+                // frame: a region nobody asked for must never be able to
+                // cost the frame its rung.
+                if (!(region instanceof MesheliumRegionCacheHolder holder)
+                        || holder.meshelium$mid() != mid
+                        || !shadowLive[mid]
+                        || keys.peekKey(geometry) != shadowKey[mid]
+                        || holder.meshelium$epoch() != committedEpoch[mid]) {
+                    continue;
+                }
+                int e = append(region, mid);
+                Arrays.fill(listMask, e * 8, e * 8 + 8, -1);
+                listedAt[mid] = nowSerial;
+                held++;
+            }
+        }
+        SodiumTerrainDrawer.reportRegionsHeld(held);
+        // After the hold, so the next frame's control compares against the
+        // list Meshelium actually drew and not the shorter one Sodium gave.
+        prevListCount = listCount;
 
         // Stable counting sort by buffer key: groups are interned by a
         // linear scan (single digits of distinct buffers at any render
@@ -859,6 +1133,31 @@ public final class MesheliumRegionMirror {
             for (int w = 0; w < 8; w++) {
                 MemoryUtil.memPutInt(a + SodiumGpuVisibilityLayout.LIST_BFS_MASK + 4L * w, listMask[base + w]);
             }
+            // The row, fresh, in the mirror row's own layout
+            // (SodiumGpuVisibilityLayout.LIST_ROW). This is what the task
+            // stage and the section raster read now: the device-local copy
+            // of the same 64 bytes was being served stale by the card for
+            // many frames at a time on RADV.
+            long r = a + SodiumGpuVisibilityLayout.LIST_ROW;
+            MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_CHUNK_X, region.getChunkX());
+            MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_CHUNK_Y, region.getChunkY());
+            MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_CHUNK_Z, region.getChunkZ());
+            MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_FLAGS,
+                    shadowLive[mid] ? SodiumGpuVisibilityLayout.ROW_FLAG_LIVE : 0);
+            int maskBase = mid * 8;
+            for (int w = 0; w < 8; w++) {
+                MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_OCC_MASK + 4L * w,
+                        shadowMask[maskBase + w]);
+            }
+            MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_BUFFER_KEY, shadowKey[mid]);
+            MemoryUtil.memPutInt(r + SodiumGpuVisibilityLayout.ROW_POPCOUNT, pop);
+            // The two spare words carry the record probe, not the box
+            // (SodiumGpuVisibilityLayout.LIST_ROW_PROBE_*): the box is in
+            // meta.z/w already.
+            MemoryUtil.memPutInt(a + SodiumGpuVisibilityLayout.LIST_ROW_PROBE_SOLID,
+                    shadowProbe[mid * 2 + SodiumGpuVisibilityLayout.PASS_SOLID]);
+            MemoryUtil.memPutInt(a + SodiumGpuVisibilityLayout.LIST_ROW_PROBE_CUTOUT,
+                    shadowProbe[mid * 2 + SodiumGpuVisibilityLayout.PASS_CUTOUT]);
             long ia = indirectAddress + (long) i * INDIRECT_BYTES;
             MemoryUtil.memPutInt(ia, wg);
             MemoryUtil.memPutInt(ia + 4L, 1);
@@ -878,7 +1177,11 @@ public final class MesheliumRegionMirror {
         }
         Arrays.fill(listRegion, 0, listCount, null);
         out.listedRegions = listCount;
+        out.oneFrameGaps = gaps;
         out.listedSections = listedSections;
+        out.droppedMirrored = dropped;
+        out.unreachableSections = unreachable;
+        out.unreachableRegions = unreachableRegions;
         out.signature = sig;
         out.loopNanos = System.nanoTime() - t0;
         // The interleaved pair: alternate frames, one accumulator each,
@@ -913,6 +1216,121 @@ public final class MesheliumRegionMirror {
             return -1;
         }
         return mid;
+    }
+
+    /**
+     * 1 when the region the walk is about to pass over is one whose row
+     * says it HAS geometry, 0 otherwise.
+     *
+     * <p>Three cases are deliberately not counted, because each is the
+     * walk working rather than a hole. A region with no id has never been
+     * mirrored and has nothing to draw. A deleted one had its id taken
+     * back and its holder set to -1 by {@code onDelete}, which runs before
+     * Sodium frees anything. And a region whose last section was removed
+     * keeps its id with a row marked not-live until its own delete
+     * arrives, so it is bufferless for a reason its row already records.
+     *
+     * <p>What is left is the case worth a counter: a region the mirror
+     * committed as LIVE, with records and a buffer key on file, that has
+     * no buffer at the moment the frame's list is built. Nothing of it is
+     * drawn this frame.
+     */
+    private int mirroredDrop(RenderRegion region) {
+        if (!(region instanceof MesheliumRegionCacheHolder holder)) {
+            return 0;
+        }
+        int mid = holder.meshelium$mid();
+        return mid >= 0 && mid < shadowLive.length && regionOf[mid] == region && shadowLive[mid]
+                ? 1 : 0;
+    }
+
+    /**
+     * Sections Sodium is listing for this region that the GPU cannot
+     * reach, because the row it enumerates ranks from does not hold them.
+     *
+     * <p>The task stage walks {@code k < row.popcount} and turns each rank
+     * into a slot through the ROW's occupancy mask, then tests the frame's
+     * own geometry bitmap at that slot. So the drawn set is the
+     * INTERSECTION of the two, and a bit the frame has and the row lacks
+     * is a section drawn by nobody - not by phase A, not by phase B, not
+     * by the mask arm - while the plain list path, which reads Sodium's
+     * records directly every frame, draws it normally. That asymmetry is
+     * the whole difference between the two paths and nothing measured it.
+     *
+     * <p>The row is written by the last commit and the bitmap is this
+     * frame's, so a non-zero count here means a change reached Sodium
+     * without reaching a commit: either no hook fired for it, or the hook
+     * fired after this frame's commit had already run.
+     *
+     * <p>The region is marked dirty so the next commit repairs it, which
+     * turns a hole that would last until the region were touched again
+     * into one that lasts a frame. That is a mitigation and not the fix;
+     * the fix is upstream, wherever the change got past the hooks.
+     */
+    private int unreachableSections(RenderRegion region, int mid, int base) {
+        int m = mid * 8;
+        // The common case, and the whole cost in it is eight ANDs.
+        boolean any = false;
+        for (int w = 0; w < 8; w++) {
+            if ((listMask[base + w] & ~shadowMask[m + w]) != 0) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return 0;
+        }
+        // A bit the frame has and the row lacks is NOT yet a hole. Sodium
+        // keeps ONE geometry set per region for all three passes - the
+        // boolean on its iterator is the back-to-front reversal, not a
+        // pass filter (javap: sectionsWithGeometryIterator hands
+        // ReversibleByteArrayIterator the same byte array either way) -
+        // while the row's mask is built from the SOLID and CUTOUT record
+        // blocks alone. So every section that holds nothing but water or
+        // glass is a bit the frame has and the row correctly lacks, and on
+        // an ocean that is hundreds of them a frame. Counting those would
+        // have buried the real thing and marked half the world dirty every
+        // frame.
+        //
+        // So each suspect slot is settled against Sodium's own records,
+        // which is one 28-byte read per suspect and only for suspects: the
+        // slot is a hole only if its SOLID or CUTOUT record holds geometry
+        // that the row's mask says is not there.
+        long solid = passDataPointer(region, SodiumGpuVisibilityLayout.PASS_SOLID);
+        long cutout = passDataPointer(region, SodiumGpuVisibilityLayout.PASS_CUTOUT);
+        if (solid == 0L && cutout == 0L) {
+            return 0;
+        }
+        int missing = 0;
+        for (int w = 0; w < 8; w++) {
+            int bits = listMask[base + w] & ~shadowMask[m + w];
+            while (bits != 0) {
+                int slot = (w << 5) | Integer.numberOfTrailingZeros(bits);
+                bits &= bits - 1;
+                if (recordHasGeometry(solid, slot) || recordHasGeometry(cutout, slot)) {
+                    missing++;
+                }
+            }
+        }
+        return missing;
+    }
+
+    private static long passDataPointer(RenderRegion region, int pass) {
+        SectionRenderDataStorage storage = region.getStorage(passOf(pass));
+        return storage == null ? 0L : storage.getDataPointer(0);
+    }
+
+    /** {@link #occupancy}'s test for one slot, against a live record block. */
+    private static boolean recordHasGeometry(long block, int slot) {
+        if (block == 0L) {
+            return false;
+        }
+        long counts = block + (long) slot * RECORD_BYTES + RECORD_COUNTS;
+        int any = 0;
+        for (int i = 0; i < RECORD_RUNS; i++) {
+            any |= MemoryUtil.memGetInt(counts + 4L * i);
+        }
+        return any != 0;
     }
 
     private int append(RenderRegion region, int mid) {
@@ -1001,7 +1419,20 @@ public final class MesheliumRegionMirror {
             for (int pass = 0; pass < SodiumGpuVisibilityLayout.PASS_COUNT; pass++) {
                 SectionRenderDataStorage storage = region.getStorage(passOf(pass));
                 long heap = storage == null ? 0L : storage.getDataPointer(0);
-                mismatches += differingBytes(heap, auditBlock(mid, pass));
+                long differing = differingBytes(heap, auditBlock(mid, pass));
+                mismatches += differing;
+                if (differing > 0L) {
+                    // A region nothing marked dirty whose records are not
+                    // the records we committed: a mutation that reached
+                    // Sodium's heap without reaching any of the five hooks,
+                    // which is the one way the GPU copy can go stale and
+                    // still pass every consistency check there is. Named
+                    // out loud rather than left in a counter, because the
+                    // lever exists to be run on a machine that is not this
+                    // one.
+                    SodiumTerrainDrawer.reportAuditMismatch(mid, pass, differing,
+                            region.getChunkX(), region.getChunkY(), region.getChunkZ());
+                }
             }
         }
         auditMismatches += mismatches;
@@ -1186,6 +1617,48 @@ public final class MesheliumRegionMirror {
                     "Meshelium region mirror retired with the chunk renderer: {} B of native "
                             + "scratch freed (audit={}, {} mutations / {} deletes seen this session)",
                     freed, audit, mutationsTotal, deletesTotal);
+            // The terrain-continuity verdict, in the log of every session
+            // whether anything happened or not. Three zeroes is a reading
+            // too: a machine that reports terrain flashing and counts
+            // three zeroes here did not flash for any reason this code can
+            // see, and that is what sends the search somewhere else.
+            MesheliumLog.LOGGER.info(
+                    "Meshelium terrain continuity so far this session (stamp hold {}, regions "
+                            + "from {}; the counters are session totals, not this world's): {} "
+                            + "section(s) in {} chunk group(s) the graphics card could not reach, "
+                            + "{} one-frame region gap(s), {} region(s) dropped from a frame's "
+                            + "list for want of a geometry buffer, {} whole-frame visibility "
+                            + "dip(s), {} group(s) found with stale records by the audit (the "
+                            + "audit runs only under -Dmeshelium.sodium.mirrorAudit=true), {} draw "
+                            + "group(s) covering {} chunk group(s) left out of a frame for want of "
+                            + "a buffer, {} chunk group(s) held one extra frame, {} whole "
+                            + "chunk group(s) the graphics card itself refused to draw, after "
+                            + "which the mirror was written again {} time(s). Of the frames that "
+                            + "refused, {} read a row describing the SAME chunk the processor last "
+                            + "wrote for that id (so the card holds an older copy of the right row "
+                            + "and a row copy is not reaching it), {} read a row describing a "
+                            + "DIFFERENT place (so the card is not holding that region's row at "
+                            + "all, and the fault is the id or the addressing), and {} named an id "
+                            + "the processor has no record of writing. {} task workgroup(s) found "
+                            + "the card's copy of a chunk group record out of date and used the "
+                            + "frame's fresh copy instead.",
+                    SodiumTerrainDrawer.stampHoldEnabled() ? "ON" : "OFF",
+                    SodiumTerrainDrawer.graphRegions() ? "Sodium's list" : "the loaded set",
+                    SodiumTerrainDrawer.unreachableSectionsTotal(),
+                    SodiumTerrainDrawer.unreachableRegionsTotal(),
+                    SodiumTerrainDrawer.oneFrameGapsTotal(),
+                    SodiumTerrainDrawer.droppedRegionsTotal(),
+                    SodiumTerrainDrawer.visibilityDips(),
+                    SodiumTerrainDrawer.auditMismatchRegions(),
+                    SodiumTerrainDrawer.skippedGroupsTotal(),
+                    SodiumTerrainDrawer.skippedGroupRegions(),
+                    SodiumTerrainDrawer.regionsHeldTotal(),
+                    SodiumTerrainDrawer.regionRejectionsTotal(),
+                    SodiumTerrainDrawer.remirrorsTotal(),
+                    SodiumTerrainDrawer.rowVerdictCounts()[0],
+                    SodiumTerrainDrawer.rowVerdictCounts()[1],
+                    SodiumTerrainDrawer.rowVerdictCounts()[2],
+                    SodiumTerrainDrawer.mirrorStaleTotal());
         }
     }
 }

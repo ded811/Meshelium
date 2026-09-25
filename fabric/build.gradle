@@ -155,6 +155,15 @@ sourceSets {
 	}
 }
 
+// The stand-down suite's SodiumPageProbe names Sodium's config model and
+// screen classes (1.6.2). Compile-only, so the ordinary suite's run
+// classpath is unchanged and the probe class is simply never loaded there;
+// declared here because the gametest source set, and with it this
+// configuration, only exists once configureTests above has run.
+dependencies {
+	gametestCompileOnly "maven.modrinth:sodium:${project.sodium_version}"
+}
+
 // Wave-1 harness support: `-Pmeshelium.backend=opengl|vulkan|default` pins the
 // client gametest onto one GPU backend and tells the test which path to
 // assert. Two facts verified against the real jars (docs/VANILLA-VULKAN-SEAM.md):

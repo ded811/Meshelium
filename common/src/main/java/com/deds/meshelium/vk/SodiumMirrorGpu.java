@@ -7,6 +7,7 @@ package com.deds.meshelium.vk;
 import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.MesheliumVramState;
 import com.deds.meshelium.mixin.GpuDeviceAccessor;
+import com.deds.meshelium.mixin.VulkanCommandEncoderAccessor;
 import com.deds.meshelium.terrain.host.TerrainResidency;
 
 import com.mojang.renderpearl.api.device.GpuDevice;
@@ -16,9 +17,12 @@ import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
+import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkBufferCopy;
+import org.lwjgl.vulkan.VkBufferMemoryBarrier2;
 import org.lwjgl.vulkan.VkCommandBuffer;
+import org.lwjgl.vulkan.VkDependencyInfo;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -147,12 +151,14 @@ public final class SodiumMirrorGpu {
         VulkanCommandEncoder encoder = device.createCommandEncoder();
         long vma = device.vma();
         long bytes = SodiumGpuVisibilityLayout.mirrorBytes(capacity);
-        MesheliumVkBuffers.DeviceBuffer buffer = MesheliumVkBuffers.createDeviceLocal(vma, bytes,
-                mirrorUsage(), "vmaCreateBuffer(meshelium sodium mirror)");
+        boolean coherent = SodiumTerrainDrawer.mirrorHostCoherent();
+        MesheliumVkBuffers.DeviceBuffer buffer = allocateMirror(vma, bytes, coherent,
+                "vmaCreateBuffer(meshelium sodium mirror)");
         VkStagingRing staging = null;
         MesheliumVkBuffers.MappedBuffer ring = null;
         try {
-            staging = VkStagingRing.create(vma, SodiumGpuVisibilityLayout.STAGING_BYTES);
+            staging = VkStagingRing.create(vma, SodiumGpuVisibilityLayout.STAGING_BYTES,
+                    SodiumTerrainDrawer.stagingLag());
             ring = MesheliumVkBuffers.createHostReadback(vma, (long) STATS_RING * STATS_BYTES,
                     VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                     "vmaCreateBuffer(meshelium sodium mirror stats ring)");
@@ -167,11 +173,30 @@ public final class SodiumMirrorGpu {
         SodiumMirrorGpu gpu = new SodiumMirrorGpu(device, encoder, capacity, buffer, staging, ring);
         gpu.zeroInitialize();
         MesheliumLog.LOGGER.info(
-                "Meshelium Sodium record mirror up: {} region ids, {} MiB device-local (rows + two "
+                "Meshelium Sodium record mirror up: {} region ids, {} MiB {} (rows + two "
                         + "12 KiB pass blocks per id) + {} MiB staging ring; the task stage now "
                         + "selects Sodium's runs from these records instead of a CPU-built table.",
-                capacity, bytes >> 20, SodiumGpuVisibilityLayout.STAGING_BYTES >> 20);
+                capacity, bytes >> 20,
+                !coherent ? "device-local"
+                        : com.deds.meshelium.MesheliumVulkanState.integratedGpu()
+                                ? "in host-coherent memory (integrated GPU: copies into plain video "
+                                        + "memory were read stale on one)"
+                                : "in host-coherent memory (forced by -D"
+                                        + SodiumTerrainDrawer.PROPERTY_MIRROR_HOST_COHERENT + ")",
+                SodiumGpuVisibilityLayout.STAGING_BYTES >> 20);
         return gpu;
+    }
+
+    /**
+     * The mirror's memory: host-coherent on an integrated GPU (or when the
+     * property says so), plain device-local otherwise
+     * ({@code SodiumTerrainDrawer.PROPERTY_MIRROR_HOST_COHERENT}).
+     */
+    private static MesheliumVkBuffers.DeviceBuffer allocateMirror(long vma, long bytes,
+            boolean coherent, String what) {
+        return coherent
+                ? MesheliumVkBuffers.createDeviceCoherent(vma, bytes, mirrorUsage(), what)
+                : MesheliumVkBuffers.createDeviceLocal(vma, bytes, mirrorUsage(), what);
     }
 
     private static int mirrorUsage() {
@@ -363,7 +388,17 @@ public final class SodiumMirrorGpu {
             return;
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkCommandBuffer cb = encoder.allocateAndBeginTransientCommandBuffer();
+            // In the draws' own command buffer when we can
+            // (SodiumTerrainDrawer.PROPERTY_COMMIT_IN_DRAW_BUFFER): outside a
+            // render pass - which execute() below would have refused anyway -
+            // the encoder's live shared buffer is the one the terrain passes
+            // are about to be recorded into.
+            VulkanCommandEncoderAccessor access = (VulkanCommandEncoderAccessor) (Object) encoder;
+            boolean shared = SodiumTerrainDrawer.commitInDrawBuffer()
+                    && access.meshelium$currentRenderPass() == null;
+            VkCommandBuffer cb = shared
+                    ? access.meshelium$commandBuffer()
+                    : encoder.allocateAndBeginTransientCommandBuffer();
             for (int i = 0; i < fillCount; i++) {
                 VK10.vkCmdFillBuffer(cb, mirror.vkBuffer(), fillDst[i], fillSize[i], 0);
             }
@@ -371,27 +406,123 @@ public final class SodiumMirrorGpu {
                 VulkanCommandEncoder.memoryBarrier(cb, stack);
             }
             if (copyCount > 0) {
-                VkBufferCopy.Buffer regions = copyScratch(copyCount);
-                for (int i = 0; i < copyCount; i++) {
-                    regions.get(i).srcOffset(copySrc[i]).dstOffset(copyDst[i]).size(copySize[i]);
+                if (SodiumTerrainDrawer.splitRowCopies()) {
+                    // Pass blocks first, then rows, as two commands. The
+                    // two destination ranges are disjoint by construction
+                    // (rows live in [256, 256 + capacity*64), pass blocks
+                    // start after), so the split needs no barrier and
+                    // changes no result - only which of the driver's two
+                    // copy implementations each size is handed to.
+                    emitCopies(cb, SodiumGpuVisibilityLayout.ROW_BYTES, false);
+                    emitCopies(cb, SodiumGpuVisibilityLayout.ROW_BYTES, true);
+                } else {
+                    emitCopies(cb, -1, false);
                 }
-                regions.position(0).limit(copyCount);
-                VK10.vkCmdCopyBuffer(cb, staging.vkBuffer(), mirror.vkBuffer(), regions);
-                regions.clear();
                 commitSerial++;
             }
             VulkanCommandEncoder.memoryBarrier(cb, stack);
-            checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(sodium mirror commit)");
-            encoder.execute(cb);
+            // In the shared buffer the explicit barrier is always recorded:
+            // it names the TASK stage as the consumer, which is what makes the
+            // driver hold the task engine until the copies above are done.
+            if (shared || SodiumTerrainDrawer.commitBarrierExplicit()) {
+                explicitMirrorBarrier(cb, stack);
+            }
+            if (!shared) {
+                checkVk(VK10.vkEndCommandBuffer(cb), "vkEndCommandBuffer(sodium mirror commit)");
+                encoder.execute(cb);
+            }
         }
         copyCount = 0;
         fillCount = 0;
     }
 
     /**
+     * A second barrier over the mirror alone, naming the TASK and MESH
+     * stages as the consumers by hand
+     * ({@code SodiumTerrainDrawer.PROPERTY_COMMIT_BARRIER}).
+     *
+     * <p>Vanilla already ends this command buffer with ALL_COMMANDS to
+     * ALL_COMMANDS and MEMORY_READ|MEMORY_WRITE, which by the specification
+     * subsumes everything here, so on paper this is redundant. It exists
+     * because of what the owner's laptop reported on 2026-09-21: the task
+     * stage refusing whole regions because the ROW it read still carried an
+     * older buffer key, tens of thousands of times, on a machine where the
+     * same task stage reads the frame's list entries out of host-mapped
+     * memory without ever getting a stale one. The difference between the
+     * two is that the rows arrive by a TRANSFER copy and the list does not,
+     * which makes a transfer-write to task-shader-read dependency the one
+     * hop under suspicion - and on this hardware the task stage is a
+     * separate engine's dispatch, so that hop crosses engines.
+     *
+     * <p>Naming the stages explicitly is what one tries first when a
+     * generic barrier appears not to hold, and it is free to ship as a
+     * lever: a barrier can only ever add ordering. If it turns out to fix
+     * the machine that shows the fault, it becomes the default and this
+     * comment becomes the reason.
+     */
+    private void explicitMirrorBarrier(VkCommandBuffer cb, MemoryStack stack) {
+        // Raw VkPipelineStageFlagBits2 / VkAccessFlagBits2 values, the way
+        // vanilla's own memoryBarrier writes them (it uses 65536 =
+        // ALL_COMMANDS and 98304 = MEMORY_READ|MEMORY_WRITE): the LWJGL
+        // constants for the sync2 64-bit flags are spread across several
+        // classes and the EXT stage bits are not where the KHR ones are.
+        final long stageAllTransfer = 0x1000L;
+        final long stageTask = 0x80000L;      // TASK_SHADER_BIT_EXT
+        final long stageMesh = 0x100000L;     // MESH_SHADER_BIT_EXT
+        final long stageFragment = 0x80L;
+        final long accessTransferWrite = 0x1000L;
+        final long accessShaderRead = 0x20L;
+        final long accessShaderStorageRead = 0x200000000L; // SHADER_STORAGE_READ_BIT (0x100000000 is SAMPLED_READ)
+        VkBufferMemoryBarrier2.Buffer barrier = VkBufferMemoryBarrier2.calloc(1, stack);
+        barrier.get(0).sType$Default()
+                .srcStageMask(stageAllTransfer)
+                .srcAccessMask(accessTransferWrite)
+                .dstStageMask(stageTask | stageMesh | stageFragment)
+                .dstAccessMask(accessShaderStorageRead | accessShaderRead)
+                .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                .buffer(mirror.vkBuffer())
+                .offset(0L)
+                .size(VK10.VK_WHOLE_SIZE);
+        VkDependencyInfo info = VkDependencyInfo.calloc(stack).sType$Default()
+                .pBufferMemoryBarriers(barrier);
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cb, info);
+    }
+
+    /**
      * A reusable heap-allocated copy array: a busy commit can queue
      * thousands of regions and {@code MemoryStack} is 64 KiB per thread.
      */
+    /**
+     * Record the queued copies as one {@code vkCmdCopyBuffer}.
+     *
+     * @param rowBytes the row size to partition on, or -1 for every queued
+     *        copy in one command
+     * @param rowsOnly with a partition, true takes the copies of exactly
+     *        {@code rowBytes} and false takes all the others
+     */
+    private void emitCopies(VkCommandBuffer cb, int rowBytes, boolean rowsOnly) {
+        int n = 0;
+        for (int i = 0; i < copyCount; i++) {
+            if (rowBytes < 0 || (copySize[i] == rowBytes) == rowsOnly) {
+                n++;
+            }
+        }
+        if (n == 0) {
+            return;
+        }
+        VkBufferCopy.Buffer regions = copyScratch(n);
+        int w = 0;
+        for (int i = 0; i < copyCount; i++) {
+            if (rowBytes < 0 || (copySize[i] == rowBytes) == rowsOnly) {
+                regions.get(w++).srcOffset(copySrc[i]).dstOffset(copyDst[i]).size(copySize[i]);
+            }
+        }
+        regions.position(0).limit(n);
+        VK10.vkCmdCopyBuffer(cb, staging.vkBuffer(), mirror.vkBuffer(), regions);
+        regions.clear();
+    }
+
     private VkBufferCopy.Buffer copyScratch(int n) {
         if (copyScratch == null || copyScratch.capacity() < n) {
             if (copyScratch != null) {
@@ -442,8 +573,9 @@ public final class SodiumMirrorGpu {
                 return null;
             }
         }
-        MesheliumVkBuffers.DeviceBuffer larger = MesheliumVkBuffers.createDeviceLocal(vma, newBytes,
-                mirrorUsage(), "vmaCreateBuffer(meshelium sodium mirror grow)");
+        MesheliumVkBuffers.DeviceBuffer larger = allocateMirror(vma, newBytes,
+                SodiumTerrainDrawer.mirrorHostCoherent(),
+                "vmaCreateBuffer(meshelium sodium mirror grow)");
         SodiumMirrorGpu next = new SodiumMirrorGpu(device, encoder, newCapacity, larger,
                 staging, statsRing);
         next.commitSerial = this.commitSerial + 1L; // records moved: the skip key must see it
@@ -568,7 +700,11 @@ public final class SodiumMirrorGpu {
         }
         long base = statsRing.mappedAddress() + (statsFrame % STATS_RING) * STATS_BYTES;
         ByteBuffer slot = MemoryUtil.memByteBuffer(base, STATS_BYTES).order(ByteOrder.LITTLE_ENDIAN);
-        return new int[] {slot.getInt(0), slot.getInt(4), slot.getInt(8), slot.getInt(12)};
+        int[] words = new int[STATS_BYTES / 4];
+        for (int i = 0; i < words.length; i++) {
+            words[i] = slot.getInt(i * 4);
+        }
+        return words;
     }
 
     // ------------------------------------------------------------------

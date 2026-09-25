@@ -668,14 +668,12 @@ public final class MesheliumGate {
      * with OpenGL" is flatly untrue and the advice impossible.
      *
      * <p>And the ROUTE is split, because the drafted one does not exist on
-     * the install it was mostly for. {@code OptionsScreenMixin} returns
-     * vanilla's untouched grid when Sodium is not loaded, so there is no
-     * "Meshelium..." row in vanilla's Options screen on a standalone
-     * install, and {@code MesheliumBootSmokeTest} asserts its absence.
-     * Standalone the routes are Options > Video Settings > "Meshelium
-     * Settings..." and {@code /meshelium}; under Sodium, Video Settings
-     * usually opens Sodium's own screen, which is why the Options row
-     * exists at all. Both loaders register {@code /meshelium}.
+     * the install it was mostly for. Standalone the routes are Options >
+     * Video Settings > "Meshelium Settings..." and {@code /meshelium};
+     * under Sodium, Video Settings opens Sodium's own screen, where
+     * Meshelium has its own page since 1.6.2 ({@code MesheliumSodiumPage})
+     * with a button onto this screen. Both loaders register
+     * {@code /meshelium}.
      */
     private static String chatKeyFor(MesheliumPopupScreen.Variant variant) {
         boolean sodium = MesheliumPlatform.isModLoaded(SODIUM_MOD_ID);

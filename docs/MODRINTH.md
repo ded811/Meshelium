@@ -50,8 +50,10 @@ Sodium that were never meant for other mods to touch, so another version may
 not fit; the Meshelium settings screen shows which one you have and says
 whether it matches.
 
-With Sodium installed the Meshelium settings screen is **shorter**. The settings
-that only change how Meshelium builds chunks have nothing to do while Sodium is
+With Sodium installed, Meshelium's settings are part of Sodium's video
+settings: a **Meshelium** entry in the list on the left, with Sodium's Apply
+and Undo. Only the settings that still do something are there. The ones that
+only change how Meshelium builds chunks have nothing to do while Sodium is
 doing that job, so they are hidden - including the memory settings described
 below. They come back if you remove Sodium.
 
@@ -93,11 +95,12 @@ the world, Meshelium draws it.
 
 ## Settings
 
-A **Meshelium Settings** button at the top of Video Settings, and a **Meshelium**
-row at the bottom of Options if Sodium has replaced that screen.
+A **Meshelium Settings** button at the top of Video Settings. With Sodium
+installed, look for **Meshelium** in Sodium's video settings instead.
 
 **Distance Cap** is how you get past 32. It widens Minecraft's own render
-distance slider, up to 120 chunks. Raising the cap changes nothing on its own -
+distance slider, up to 120 chunks (with Sodium installed, Sodium's slider, up
+to 96). Raising the cap changes nothing on its own -
 you still move the normal slider afterwards. Raise it gradually: past about 64
 Minecraft itself needs more memory than a default launcher gives it, and at 120
 it can run out and close. Give Minecraft more memory before pushing it far.

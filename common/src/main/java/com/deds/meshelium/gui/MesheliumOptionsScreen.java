@@ -40,10 +40,13 @@ import java.util.function.IntSupplier;
  * (2026-08-10, 12 directives). Reached three ways: the "Meshelium
  * Settings..." button in vanilla's Video Settings screen
  * ({@code VideoSettingsScreenMixin}, the primary route on a vanilla
- * install), the "Meshelium..." row at the bottom of vanilla's Options
- * screen while Sodium is installed ({@code OptionsScreenMixin}, 2026-09-13:
- * Sodium substitutes the Video Settings screen, so that route has nowhere
- * to attach there), and the {@code /meshelium} client command. The wave-8
+ * install), the "Meshelium Settings..." button on Meshelium's page inside
+ * Sodium's video settings ({@code MesheliumSodiumPage}, 1.6.2: Sodium
+ * substitutes the Video Settings screen, so Meshelium's everyday rows live
+ * on a page there and this screen is the page's second layer, for the
+ * status line, the gate banner and Reset), and the {@code /meshelium}
+ * client command. From 2026-09-13 to 1.6.2 the Sodium route was a
+ * "Meshelium..." row at the bottom of vanilla's Options screen. The wave-8
  * ModMenu adapter was REMOVED at 1.0.0: it was one more route to this same
  * screen and the only thing stopping a clean clone from building.
  *
@@ -781,14 +784,18 @@ public final class MesheliumOptionsScreen extends Screen {
         this.capSlider = new CapSlider(config, !this.capLocked && !maxRdOverridden);
         this.capSlider.setTooltip(tip(this.capLocked, "meshelium.options.tooltip.max_rd",
                 "meshelium.options.applies.now"));
+        // Under Sodium the cap does one thing, widen Sodium's slider, and
+        // the overlay stops at the slider ceiling (1.6.2, MesheliumSodiumPage);
+        // the box stops there too, so the two screens quote one number.
         this.capBox = new ValueBox(MesheliumConfig.MIN_MAX_RENDER_DISTANCE,
-                MesheliumConfig.MAX_MAX_RENDER_DISTANCE,
+                sodium ? MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE : MesheliumConfig.MAX_MAX_RENDER_DISTANCE,
                 () -> MesheliumConfig.get().maxRenderDistance,
                 this::applyCap,
                 Component.translatable("meshelium.options.max_rd.label",
                         Component.literal("")));
         this.capBox.active = !this.capLocked && !maxRdOverridden;
-        this.capBox.setTooltip(tip(this.capLocked, "meshelium.options.tooltip.max_rd_custom",
+        this.capBox.setTooltip(tip(this.capLocked,
+                sodium ? "meshelium.options.tooltip.max_rd_custom.sodium" : "meshelium.options.tooltip.max_rd_custom",
                 "meshelium.options.applies.now"));
         this.layout.addChild(sliderRow(this.capSlider, this.capBox), s -> s.paddingTop(4));
 
@@ -1006,6 +1013,13 @@ public final class MesheliumOptionsScreen extends Screen {
                     }
                     MesheliumConfig config2 = MesheliumConfig.get();
                     config2.resetToDefaults();
+                    if (MesheliumGate.sodiumAdapterArmed()) {
+                        // The drawer caches GPU Visibility and Occlusion
+                        // Culling (Sodium); the rows' own write path
+                        // refreshes it, and a reset must too. The class
+                        // loads only here, under Sodium on Vulkan.
+                        com.deds.meshelium.vk.SodiumTerrainDrawer.applyConfiguredGpuVisibility();
+                    }
                     // The cap feeds the vanilla slider's range, so the same
                     // live-apply path the cap row uses has to run here too.
                     com.deds.meshelium.MesheliumExtendedRd.onConfigChanged(this.minecraft);

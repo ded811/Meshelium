@@ -102,6 +102,28 @@ final class MesheliumVkBuffers {
     }
 
     /**
+     * A buffer the GPU uses as its own but allocated from a HOST-COHERENT
+     * memory type: the {@link #createDeviceMapped} recipe (host-visible and
+     * host-coherent required, device-local preferred), handed back as a
+     * {@link DeviceBuffer} because nothing on the host ever touches it. VMA
+     * keeps the persistent mapping and drops it with the allocation.
+     *
+     * <p>Why this exists: on the owner's Radeon 780M under RADV, the task
+     * stage read data that {@code vkCmdCopyBuffer} had written into a plain
+     * device-local buffer stale for up to ~48 frames, even through
+     * {@code coherent} loads that skip the per-core caches - while data in a
+     * {@code createDeviceMapped} buffer (the per-frame list) was never once
+     * read stale. A host-coherent memory type is one the driver must keep
+     * coherent with writes it did not make through the GPU's caches, which
+     * is exactly the property the plain device-local buffer was missing on
+     * that machine. See {@code SodiumTerrainDrawer.PROPERTY_MIRROR_HOST_COHERENT}.
+     */
+    static DeviceBuffer createDeviceCoherent(long vma, long sizeBytes, int vkUsage, String what) {
+        MappedBuffer mapped = createDeviceMapped(vma, sizeBytes, vkUsage, what);
+        return new DeviceBuffer(mapped.vkBuffer(), mapped.allocation());
+    }
+
+    /**
      * Host-visible, host-coherent, persistently mapped, RANDOM host access
      * — the wave-6 readback flavour (the stats ring the CPU READS from;
      * SEQUENTIAL_WRITE's promise forbids reads, RANDOM_BIT lets VMA pick

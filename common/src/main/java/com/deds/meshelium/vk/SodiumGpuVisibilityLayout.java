@@ -48,14 +48,104 @@ public final class SodiumGpuVisibilityLayout {
      */
     public static final int MIRROR_STATS_OFFSET = 0;
 
-    public static final int MIRROR_STATS_BYTES = 16;
+    public static final int MIRROR_STATS_BYTES = 96;
+
+    /**
+     * Words 4-6 of the stats: the GPU's own count of task workgroups whose
+     * REGION was rejected before a single section was looked at.
+     *
+     * <p>{@code terrain.task} draws nothing at all for a region unless its
+     * row says live AND its buffer key equals the group being drawn. That
+     * gate is the only thing on this path that can take a whole 8x4x8
+     * region off the screen in one stroke, which is the shape the owner
+     * reports (2026-09-21: "8x8 chunk groups", "large groups in sync"),
+     * and it was the only part of the frame nothing measured. The CPU
+     * cross-checks its OWN shadow before listing a region and declines the
+     * frame on a mismatch, but nothing ever compared that shadow with the
+     * row the card actually holds.
+     *
+     * <p>In normal operation every dispatched workgroup belongs to a region
+     * of the group being drawn, so a rejection is not a tuning signal with
+     * a threshold: it is an anomaly, and any non-zero value is a statement
+     * that the card's copy of a row disagrees with the CPU that listed it.
+     * [4] totals them, [5] counts a clear live bit and [6] a key that did
+     * not match, so the two causes are told apart in the log.
+     */
+    public static final int STAT_REGION_REJECTED = 4, STAT_ROW_DEAD = 5, STAT_KEY_MISMATCH = 6;
+
+    /**
+     * Words 8-15: everything the FIRST rejecting workgroup of a frame was
+     * looking at when it refused. A count says a region was lost; these say
+     * which region, and which of the two possible causes it was.
+     *
+     * <p>WHAT THESE DO NOT SETTLE, corrected 2026-09-21 night. The
+     * comment here used to claim that {@code slot} landing outside
+     * {@code [firstSlot, firstSlot + regionCount)} would show a search
+     * bug. It cannot happen: the shipped search is a binary search whose
+     * {@code lo} starts at {@code FirstSlot} and only rises and whose
+     * {@code hi} starts at {@code FirstSlot + RegionCount - 1} and only
+     * falls, so its answer is clamped to the run by arithmetic; and with
+     * one-draw-per-group off, {@code RegionCount} is pushed as 0 and the
+     * test is skipped outright. The verdict was a constant. What the
+     * search CAN do and this still cannot see is land on the wrong entry
+     * INSIDE the run - which matters only if the entries the shader read
+     * are not the ones the processor wrote this frame.
+     */
+    public static final int STAT_FIRST_MID = 8, STAT_FIRST_ROW_KEY = 9,
+            STAT_FIRST_GROUP_KEY = 10, STAT_FIRST_SLOT = 11, STAT_FIRST_GROUP_START = 12,
+            STAT_FIRST_GROUP_COUNT = 13, STAT_FIRST_LIST_POP = 14, STAT_FIRST_ROW_POP = 15;
+
+    /**
+     * Words 16-18: the chunk coordinates the rejected ROW carries.
+     *
+     * <p>This is the one reading that tells the two remaining causes apart,
+     * and neither the counts nor the keys can. A row holds the region's own
+     * chunk origin, written by the same staged block as its key. If those
+     * coordinates name the region the processor put in this draw, the row
+     * is an OLDER copy of the right row and the fault is that a copy did
+     * not reach the card. If they name somewhere else entirely, the shader
+     * is reading the wrong row and the fault is in the id, the addressing
+     * or a capacity the two sides disagree about - a much simpler thing,
+     * and a completely different fix.
+     *
+     * <p>Read against the row ledger in {@code SodiumTerrainDrawer}, which
+     * is what the processor last wrote for that same id.
+     */
+    public static final int STAT_FIRST_ROW_CX = 16, STAT_FIRST_ROW_CY = 17,
+            STAT_FIRST_ROW_CZ = 18;
+
+    /**
+     * Word 7: the {@code VisMode} of the draw that refused.
+     *
+     * <p>Up to four draws a frame write these same counters - phase A and
+     * phase B, each for the solid and the cutout pass - and the snapshot
+     * belongs to whichever of them won the atomic. Without this the line
+     * cannot say which, and the two phases select their sections by
+     * completely different rules.
+     */
+    public static final int STAT_FIRST_VISMODE = 7;
+
+    /**
+     * Words 19-23: task workgroups whose MIRROR row disagreed with the list
+     * entry's fresh copy (key or popcount), counted once per workgroup, and
+     * what the first one of the frame saw: {mid, mirror key, list key in the
+     * high 16 bits and list popcount in the low 16, mirror popcount}.
+     *
+     * <p>With the rows taken from the list this costs nothing on screen; it
+     * is the proof that the thing being worked around is still happening
+     * underneath, and a direct measurement of how often. Zero here with
+     * the mirror reads marked coherent would say the stale copy lived in a
+     * cache the coherent read bypasses.
+     */
+    public static final int STAT_MIRROR_STALE = 19, STAT_STALE_MID = 20,
+            STAT_STALE_MIRROR_KEY = 21, STAT_STALE_LIST_KEY = 22, STAT_STALE_MIRROR_POP = 23;
 
     /**
      * uint[4]: capacity, rowsBase (uvec4 index, always 0 relative to
      * {@code data[]}), solidBase, cutoutBase (uvec4 indices). Debug and
      * readback only; the push constant carries RecordBase.
      */
-    public static final int MIRROR_LAYOUT_OFFSET = 16;
+    public static final int MIRROR_LAYOUT_OFFSET = 96;
 
     /** 4 uvec4 per mid; see the {@code ROW_*} offsets. */
     public static final int ROW_BYTES = 64;
@@ -128,8 +218,60 @@ public final class SodiumGpuVisibilityLayout {
 
     // ---- list ring (SodiumFrameRing): one createDeviceMapped VkBuffer, SLOTS slots ----
 
-    /** vec4 origin | uvec4 meta | uvec4 bfsMask[2]. */
-    public static final int LIST_ENTRY_BYTES = 64;
+    /**
+     * vec4 origin | uvec4 meta | uvec4 bfsMask[2] | uvec4 row[4].
+     *
+     * <p>128 bytes since 2026-09-22: the second half is a copy of the
+     * region's mirror row, written by the processor every frame from its
+     * own shadow. See {@link #LIST_ROW} for why.
+     */
+    public static final int LIST_ENTRY_BYTES = 128;
+
+    /**
+     * Byte 64 of the entry: the region's row, in exactly the mirror row's
+     * layout ({@link #ROW_CHUNK_X} .. {@link #ROW_OCC_MAX}), rewritten
+     * every frame.
+     *
+     * <p>The owner's laptop (Radeon 780M, RADV) proved over 311 refusing
+     * frames that the graphics card keeps reading an OLD copy of a region's
+     * row out of the device-local mirror, and not one frame old, which a
+     * late copy could explain: one group held its old key at stats frame 13
+     * and STILL held it at frame 17, four frames past the point where every
+     * submit has waited for the one two before it; another held key 2 after
+     * the processor had written key 6 to it. Only a cache serving a stale
+     * line for several frames does that. The rows are
+     * the one thing on this path that is tiny, read by every workgroup of
+     * a region with a uniform address (so through the per-core scalar
+     * cache), and re-read every single frame, so their lines never age
+     * out; everything else is either large enough to be evicted or, like
+     * this list, rotates through eight slots. The list has never once been
+     * stale: in every sample where the two popcounts differed, the list's
+     * was the newer one.
+     *
+     * <p>So the draw path takes the row from here. The mirror keeps the
+     * 48-byte section records, which are read per lane and are fine.
+     */
+    public static final int LIST_ROW = 64;
+
+    /**
+     * The row copy's last two words ({@code row3.z/w}) are NOT occMin/occMax
+     * in the list: nothing reads them there (the region raster takes the box
+     * from {@code meta.z/w}), so they carry the RECORD PROBE instead - the
+     * base vertex of the region's first occupied section's record, as the
+     * processor last committed it, for the SOLID and the CUTOUT pass.
+     *
+     * <p>This puts back the guarantee the key gate used to give. The rows
+     * now come from the list, so the key gate compares two copies of the
+     * same processor value and can no longer fail; but the 48-byte section
+     * records still come from the device-local mirror, which on the owner's
+     * machine was served stale. The task stage reads the probe section's
+     * record on the card and compares its base vertex with this word: equal
+     * means the card holds this commit's records, different means it does
+     * not, and the region is refused - a hole, never geometry read at old
+     * offsets out of a new buffer.
+     */
+    public static final int LIST_ROW_PROBE_SOLID = LIST_ROW + 56,
+            LIST_ROW_PROBE_CUTOUT = LIST_ROW + 60;
 
     /**
      * xyz float: the region's min corner minus the camera (double math,
@@ -178,6 +320,9 @@ public final class SodiumGpuVisibilityLayout {
             PUSH_FRAME_STAMP = 12, PUSH_FLAGS = 16, PUSH_RECORD_BASE = 20, PUSH_RESERVED0 = 24,
             PUSH_RESERVED1 = 28;
 
+    /** Word 28: 0 when this draw's RecordBase is the SOLID table, 1 CUTOUT (the probe to compare). */
+    public static final int PUSH_RECORD_PASS = PUSH_RESERVED1;
+
     /** The former RESERVED0: this draw's list-entry count (FLAG_ONE_DRAW). */
     public static final int PUSH_REGION_COUNT = PUSH_RESERVED0;
 
@@ -202,6 +347,45 @@ public final class SodiumGpuVisibilityLayout {
      * {@link #PUSH_REGION_COUNT} carries the group's entry count.
      */
     public static final int FLAG_ONE_DRAW = 32;
+
+    /**
+     * SodiumTerrainDrawer.PROPERTY_STAMP_HOLD: phase A also draws a section
+     * that was marked visible TWO frames ago, not only one.
+     *
+     * <p>Without it the whole picture rests on a single frame's marks. A
+     * section is drawn by phase A only when the section raster of the
+     * previous frame stamped it, and by phase B only when the raster of
+     * this frame did; so one frame in which a region's boxes are not
+     * rastered takes every section of that region off the screen for the
+     * NEXT frame, and nothing else can put it back. The scheme has no
+     * second leg.
+     *
+     * <p>That is what the owner's laptop showed on 2026-09-21: phase A
+     * fell from 151 section-pass emissions to 5 and back to 151 in three
+     * consecutive frames, with phase B recorded and drawing 0, the frame's
+     * own list steady at 82 sections in 3 regions, no declines, no dropped
+     * regions and no unreachable sections. The CPU side was identical on
+     * all three frames; one frame's marks simply were not there.
+     *
+     * <p>With the flag, phase A tests the OTHER ping-pong buffer as well.
+     * Read in passes 1a/1b, before this frame's raster writes it, that
+     * buffer still holds the marks of two frames ago, so a section marked
+     * then is drawn now. One lost frame of marks becomes invisible; two
+     * lost in a row would still show. The cost is one storage load per
+     * section per pass and one frame of extra retention: terrain that has
+     * just become hidden is drawn for a frame longer than it needs to be,
+     * which is the direction this renderer already errs in everywhere else
+     * ("draw more, never fewer").
+     */
+    public static final int FLAG_STAMP_HOLD = 64;
+
+    /**
+     * The task stage takes the region's row from the list entry
+     * ({@link #LIST_ROW}) instead of the mirror. Set by default;
+     * {@code SodiumTerrainDrawer.PROPERTY_ROWS_FROM_LIST} can clear it for
+     * a controlled comparison.
+     */
+    public static final int FLAG_ROWS_FROM_LIST = 128;
 
     /**
      * Group commands per ring slot, appended after the per-region

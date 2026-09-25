@@ -28,7 +28,6 @@
 		"UberGpuBufferAccessor",
 		"OptionInstanceAccessor",
 		"OptionsMixin",
-		"OptionsScreenMixin",
 		"OptionsSubScreenAccessor",
 		"ProjectionMatrixBufferMixin",
 		"RenderPassAccessor",

@@ -7,8 +7,10 @@ package com.deds.meshelium.mixin;
 import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
 import com.mojang.renderpearl.backend.vulkan.VulkanRenderPass;
 
+import org.lwjgl.vulkan.VkCommandBuffer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;
+import org.spongepowered.asm.mixin.gen.Invoker;
 
 /**
  * NEXT (c), 2026-09-15: read the backend encoder's open render pass, so the
@@ -59,4 +61,25 @@ public interface VulkanCommandEncoderAccessor {
 
     @Accessor("currentRenderPass")
     VulkanRenderPass meshelium$currentRenderPass();
+
+    /**
+     * The encoder's live shared command buffer, begun and registered with
+     * the submission on first use ({@code private VkCommandBuffer
+     * commandBuffer()}, the same method {@code createRenderPass} records
+     * into). Callers must first check {@link #meshelium$currentRenderPass()}
+     * is null: by bytecode the method hands back the live buffer even while
+     * a pass is open.
+     *
+     * <p>Why it is needed (2026-09-23): the Sodium mirror's commit copies
+     * went into a separate transient buffer spliced in by {@code execute},
+     * so they and the task-shader draws that read them were always in
+     * DIFFERENT command buffers. On RADV the task stage runs on a separate
+     * engine, and the wait that makes that engine hold for earlier work on
+     * the main one is driven by barriers inside the same command buffer.
+     * The owner's laptop showed the task stage reading this frame's commit
+     * before it had landed. Recording the commit here puts copies, barrier
+     * and draws in one buffer.
+     */
+    @Invoker("commandBuffer")
+    VkCommandBuffer meshelium$commandBuffer();
 }

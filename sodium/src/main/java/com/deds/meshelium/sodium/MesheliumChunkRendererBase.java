@@ -353,6 +353,13 @@ public abstract class MesheliumChunkRendererBase {
         long serial = ++this.attempts;
         try {
             this.mirror.ensureTracking();
+            if (SodiumTerrainDrawer.takeRemirrorRequest()) {
+                // The card refused a region three frames ago: its copy of
+                // some row is not what was written for it, and nothing else
+                // would ever mark that row dirty again. Before the commit,
+                // so this frame is the one that repairs it.
+                this.mirror.remirrorAll();
+            }
             String forced = SodiumTerrainDrawer.takeForcedDecline();
             if (forced != null) {
                 return decline("forced");
@@ -428,6 +435,10 @@ public abstract class MesheliumChunkRendererBase {
             this.cameraBlock[2] = camera.intZ;
             SodiumTerrainDrawer.reportFrameLoop(listed, this.frame.listedSections, this.frame.groupCount,
                     this.frame.loopNanos, this.frame.faceAll, searchDistance, this.searchDistanceSource);
+            SodiumTerrainDrawer.reportDroppedRegions(this.frame.droppedMirrored,
+                    this.frame.oneFrameGaps, listed);
+            SodiumTerrainDrawer.reportUnreachable(this.frame.unreachableSections,
+                    this.frame.unreachableRegions, this.frame.listedSections);
 
             boolean owned = SodiumTerrainDrawer.drawSolidOwned(this.gpu,
                     target.getColorTextureView(), target.getDepthTextureView(),

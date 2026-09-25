@@ -281,8 +281,11 @@ Meshelium does not add its own render distance control. It **widens vanilla's**.
 The Render Distance slider in Video Settings is the same slider, in the same
 place, and it now runs up to Meshelium's cap. The cap defaults to **96**; the
 Meshelium settings screen offers a 32 to 96 slider plus a Custom box that
-reaches **120**. In singleplayer the integrated server follows the option, so
-the chunks really do arrive.
+reaches **120**. With Sodium installed the ceiling is 96 on every screen: the
+overlay on Sodium's slider never goes past it, the page's slider and the box
+stop there, and a value above it from an earlier install is brought down to
+96 when Sodium builds its model. In singleplayer the integrated server follows
+the option, so the chunks really do arrive.
 
 Getting there needed root cause fixes vanilla never needed, all recorded in
 `docs/EXTENDED-RENDER-DISTANCE.md`:
@@ -581,13 +584,27 @@ Reach the settings three ways, and one of them depends on what else is
 installed:
 
 - The **Meshelium Settings...** button in vanilla's Video Settings. The
-  primary route, on every install. It is injected at the top of the options
-  list, above the Display section so it is visible without scrolling, and it
-  is added on **both** graphics backends on purpose, so an OpenGL session can
-  still open the screen and read why the mod is off.
-- A **Meshelium...** row at the bottom of vanilla's Options screen, **only
-  while Sodium is installed**. Sodium substitutes the Video Settings screen,
-  so the button above has nowhere to attach there.
+  primary route on an install without Sodium. It is injected at the top of
+  the options list, above the Display section so it is visible without
+  scrolling, and it is added on **both** graphics backends on purpose, so an
+  OpenGL session can still open the screen and read why the mod is off.
+- **Meshelium's own entry in Sodium's video settings**, only while Sodium is
+  installed (1.6.2). Sodium substitutes the Video Settings screen, so the
+  button above has nowhere to attach there; instead Meshelium registers a
+  page through Sodium's config API (`MesheliumSodiumPage`, on the same entry
+  that carries the render-distance overlay): one "General" page under a
+  Meshelium header, an everyday group (Distance Cap, GPU Visibility,
+  Distance Fog, Fog Ends At) and a "Meshelium Advanced" group (Cull
+  Sub-Pixel Detail, Debug Stat Logging, Backend Popup), plus a **Meshelium
+  Settings...** button that opens the screen described below with Sodium's
+  screen behind it. Sodium owns the controls, the pending values and
+  Apply/Undo; Meshelium's bindings write the config fields, one storage
+  handler saves the file once per Apply, and the two rows with a side
+  effect (the cap re-applies vanilla's slider range, GPU Visibility reaches
+  the live drawer) carry it as Sodium apply hooks. Sodium's own render
+  distance slider follows the cap's pending value on the same screen. From
+  2026-09-13 to 1.6.1 this route was a "Meshelium..." row at the bottom of
+  vanilla's Options screen.
 - The `/meshelium` client command, on every install and both loaders.
 
 There is no ModMenu integration: the adapter that used to provide a further
@@ -595,7 +612,8 @@ route to this same screen was deleted at 1.0.0, because it compiled against a
 jar on one developer's disk and was the only thing stopping a fresh clone from
 building.
 
-**With Sodium installed the screen is shorter, and says so.** Sodium builds
+**With Sodium installed the screen is shorter, and says so**, and the page
+inside Sodium's screen shows the same shortened set. Sodium builds
 the chunks, so every row that only Meshelium's own chunk builder reads - the
 master switch, occlusion culling and its crossover, greedy meshing, the
 tiny-plant cull, the two leaf tiers, terrain memory and idle trim - is not

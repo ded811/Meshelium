@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.6.2
+
+**Meshelium's settings now live inside Sodium's video settings.**
+
+With Sodium installed, Meshelium has its own entry in Sodium's video
+settings, in the list on the left under Sodium. It has all the settings you
+had before, and Sodium's Apply and Undo buttons work on them. The
+"Meshelium..." row at the bottom of the Options screen is gone. A
+**Meshelium Settings...** button on the new page opens Meshelium's own
+screen for the things a list of settings can't show: what Meshelium is
+doing right now, which Sodium version you have, the Enable Vulkan button,
+and Reset. Without Sodium nothing changes: the Meshelium Settings button at
+the top of Video Settings is where it always was, and `/meshelium` works
+everywhere.
+
+**Fixed: big squares of terrain flashing with GPU Visibility on.** With
+Sodium installed and the GPU Visibility (Sodium) setting on, whole squares
+of the world could blink out for a moment while chunks were loading, worst
+right after pressing F3+A. It happened on AMD's built-in graphics, the
+kind in many laptops: we tested a Radeon 780M on both Windows and Linux,
+and it's fixed on both. If you still see it on your computer, please
+report it. And if Meshelium ever catches your
+graphics card drawing from out-of-date chunk data again, it switches to a
+slower, safe way of drawing until you restart Minecraft. At most a frame or
+two can flash before it does.
+
+**Two new settings under Advanced**, on Meshelium's page in Sodium's video
+settings (they only appear with Sodium installed). Both are on by default.
+Leave them on unless you're asked to turn one off while reporting a
+problem.
+
+- **GPU Occlusion Culling:** only does anything while GPU Visibility
+  (Sodium) is on. Your graphics card skips terrain hidden behind hills,
+  mountains or anything else solid. It adds to the culling Sodium already
+  does on its own and doesn't change any Sodium setting.
+- **Repair Chunk Records:** if your graphics card ever refuses to draw part
+  of the world because its copy of Meshelium's chunk data is out of date,
+  Meshelium sends it a fresh copy. With this update's fix it shouldn't ever
+  need to.
+
+**Fixed: render distance jumping back to 12.** With Sodium installed, a
+saved render distance higher than Sodium's slider allows is now lowered to
+the slider's highest value when you open Sodium's settings, instead of
+jumping back to 12.
+
 ## 1.6.1
 
 **Minecraft 26.3.**

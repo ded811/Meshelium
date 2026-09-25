@@ -1657,6 +1657,340 @@ public final class SodiumTerrainDrawer {
     public static final String PROPERTY_PHASE_B_CPU_SKIP = "meshelium.sodium.phaseBCpuSkip";
 
     /**
+     * Absent = OFF: after the mirror commit's copies, emit a SECOND barrier
+     * over the mirror naming the task and mesh stages as the consumers.
+     *
+     * <p>Vanilla's own pass-end barrier is ALL_COMMANDS to ALL_COMMANDS and
+     * already subsumes it, so this is redundant by the specification. It is
+     * here because the owner's laptop reports the task stage reading rows
+     * that still carry an older buffer key, on hardware where that stage is
+     * a separate engine's dispatch and the rows are the only thing it reads
+     * that arrives by a transfer copy. See
+     * {@code SodiumMirrorGpu.explicitMirrorBarrier}.
+     */
+    public static final String PROPERTY_COMMIT_BARRIER = "meshelium.sodium.commitBarrier";
+
+    /**
+     * Submit intervals a staging span waits before the ring hands its bytes
+     * out again. Default 3, the number the ring was designed around;
+     * accepted range 3 to 64.
+     *
+     * <p>The ring's safety argument is that a span written during submit
+     * interval {@code s} is read by the submission that submit {@code s + 1}
+     * closes, and that submit {@code s + 3} cannot return until that
+     * submission has completed. That argument HOLDS: vanilla's
+     * {@code VulkanCommandEncoder.submit} was read from the decompiled 26.3
+     * sources and has no early return and no conditional path - every call
+     * ends the command buffer, closes the submission, increments the index
+     * and always waits on {@code awaitSubmitCompletion(index - 2)} before
+     * resetting the command pool. Every step is counted in submits and not
+     * in frames, so it is invariant to how many times a frame submits.
+     *
+     * <p>So this is a control, not a fix. It is here because a short lag
+     * would produce precisely what the owner's laptop reports - a row
+     * arriving with something other than what was written for it, and only
+     * while chunks stream, which is the only time this ring wraps - and
+     * because being able to rule that out by measurement rather than by
+     * argument is worth one property. Raising it costs staging bytes and
+     * nothing else; a ring that runs out declines the frame instead of
+     * spoiling it.
+     */
+    /**
+     * Absent = ON: the 64-byte row copies go out as their OWN
+     * {@code vkCmdCopyBuffer}, not batched in with the 12,288-byte pass
+     * blocks.
+     *
+     * <p>A commit queues, per region, two 12,288-byte pass blocks and one
+     * 64-byte row, and they all went into a single copy command. Those two
+     * sizes sit on opposite sides of the threshold where a driver chooses
+     * between a small fixed-function transfer and a compute shader that
+     * does the copying, so one command was asking for both. That is the
+     * only structural difference in the whole path between the copies that
+     * are demonstrably arriving (pass blocks: the record audit ran every
+     * frame across three chunk reloads and found no mismatch) and the ones
+     * that are not (rows).
+     *
+     * <p>Splitting them costs one extra command per commit and changes
+     * nothing else: the regions never overlap, so the two commands are
+     * independent and need no barrier between them. Default ON because it
+     * cannot be worse and might be the whole bug;
+     * {@code -Dmeshelium.sodium.splitRowCopies=false} restores one command
+     * for a controlled comparison.
+     */
+    public static final String PROPERTY_SPLIT_ROW_COPIES = "meshelium.sodium.splitRowCopies";
+
+    /**
+     * Absent = ON: the task stage and the section raster take each region's
+     * row from the per-frame list entry, not from the device-local mirror
+     * ({@code SodiumGpuVisibilityLayout.LIST_ROW}).
+     *
+     * <p>This is the fix for the owner's flashing, 2026-09-22. Over 311
+     * refusing frames on a Radeon 780M under RADV, the card read a region's
+     * mirror row as a copy many writes old - key 2 while the processor had
+     * since written keys 3 to 6 - and refused the whole 8x4x8 chunk group
+     * every time. The list entry is rewritten by the processor every frame
+     * through host-coherent memory, and in every sample where the two
+     * disagreed the list's value was the newer one.
+     *
+     * <p>{@code false} makes the task stage read the row from the mirror
+     * again, but it is NOT the old code path: the mirror block stays
+     * {@code coherent} and the section raster takes the list's copy either
+     * way. A clean run with it off therefore does not show the list copy
+     * was unnecessary.
+     */
+    public static final String PROPERTY_ROWS_FROM_LIST = "meshelium.sodium.rowsFromList";
+
+    /**
+     * Where the record mirror lives. Absent = host-coherent memory on an
+     * INTEGRATED GPU, plain device-local memory on a discrete one;
+     * {@code true} / {@code false} force it either way.
+     *
+     * <p>The fix for the owner's flashing, 2026-09-23, third attempt and
+     * the first aimed at the right layer. His run of the rows-from-list
+     * build showed the section RECORDS in the mirror were stale too, and
+     * that marking the mirror reads {@code coherent} - which skips the
+     * per-core caches - changed nothing: one group's record read 0 on the
+     * card at stats frame 30 and, at frame 78, read the value committed
+     * around frame 30 while the processor had since written another. So
+     * the stale copy is below the per-core caches, and the copies into
+     * plain video memory are not replacing it for the shader. The one
+     * buffer the task stage has never read stale is the per-frame list,
+     * which is allocated host-coherent. The mirror now is too.
+     *
+     * <p>Integrated-only by default because on a discrete card a
+     * host-visible allocation can fall back to system memory across the
+     * bus when there is no resizable BAR, which would make every record
+     * read slow; the desktop card has never shown the fault.
+     * Read when a mirror is allocated (world load, F3+A, growth).
+     */
+    public static final String PROPERTY_MIRROR_HOST_COHERENT = "meshelium.sodium.mirrorHostCoherent";
+
+    /**
+     * Absent = ON: the first time the card is caught reading an out-of-date
+     * chunk group record, the GPU path stands down for the rest of the
+     * session and the stage-1 list path draws instead - the path "GPU
+     * Visibility (Sodium)" off selects, which the owner's laptop has shown
+     * to be clean.
+     *
+     * <p>The trigger is chunk groups actually refused - by the record probe,
+     * or by the key gate when the rows come from the mirror - in a second
+     * separate frame. Refusals read exactly zero on a card that keeps the
+     * mirror fresh (full stand-down suites on the RX 9070 XT, device-local
+     * and forced host-coherent alike). A stale mirror ROW alone is only
+     * counted: with the rows taken from the list it changes nothing on
+     * screen, and latching on it (the first version of this lever did)
+     * threw away a working GPU path on the owner's laptop after two
+     * harmless readings at world load.
+     *
+     * <p>This is the guarantee, not the fix. The fix attempt is
+     * {@link #PROPERTY_MIRROR_HOST_COHERENT}; if it works, neither detector
+     * fires and nothing changes. If it does not, the player sees at most
+     * the few frames before the first report reaches the processor (the
+     * statistics are read three frames late), then no more flashing, at
+     * the list path's speed. {@code false} keeps the GPU path running
+     * regardless, for testing.
+     */
+    public static final String PROPERTY_FALLBACK_ON_STALE = "meshelium.sodium.fallbackOnStale";
+
+    /**
+     * Absent = ON: the mirror commit (its fills, copies and barriers) is
+     * recorded into vanilla's live shared command buffer - the one the
+     * terrain draws go into - instead of a separate transient buffer
+     * spliced in with {@code execute}; and it ends with a barrier naming
+     * the TASK and MESH stages explicitly as the consumers.
+     *
+     * <p>The owner's run on host-coherent memory (2026-09-23) removed the
+     * long-lived staleness and left a one-update lag at world load: the
+     * card's copy of a record one section behind the processor's, and
+     * probe records still zero on the frames with the largest commits. That
+     * is the task stage reading this frame's commit before it has landed.
+     * RADV runs the task stage on a separate engine, and makes that engine
+     * wait for earlier work on the main one from barriers recorded in the
+     * same command buffer as the draw. With the commit in its own buffer,
+     * no such wait existed - which is also why the explicit barrier
+     * ({@link #PROPERTY_COMMIT_BARRIER}) changed nothing when it was tried:
+     * it sat in the commit's buffer, not the draws'. {@code false} restores
+     * the separate buffer.
+     */
+    public static final String PROPERTY_COMMIT_IN_DRAW_BUFFER = "meshelium.sodium.commitInDrawBuffer";
+    // With this on, the explicit barrier is always recorded and
+    // PROPERTY_COMMIT_BARRIER has no effect; it matters only with this off.
+
+    /** Absent = ON; read at each commit. */
+    public static boolean commitInDrawBuffer() {
+        String v = System.getProperty(PROPERTY_COMMIT_IN_DRAW_BUFFER);
+        return v == null || Boolean.parseBoolean(v);
+    }
+
+    /**
+     * Refusing frames before the fallback latches: one isolated frame is
+     * tolerated, the second is recurring flashing.
+     */
+    private static final long FALLBACK_REFUSING_FRAMES = 2L;
+
+    /** Absent = ON; read at every stats readback. */
+    public static boolean fallbackOnStale() {
+        String v = System.getProperty(PROPERTY_FALLBACK_ON_STALE);
+        return v == null || Boolean.parseBoolean(v);
+    }
+
+    /** Whether the next mirror allocation takes host-coherent memory. */
+    public static boolean mirrorHostCoherent() {
+        String v = System.getProperty(PROPERTY_MIRROR_HOST_COHERENT);
+        if (v != null) {
+            return Boolean.parseBoolean(v);
+        }
+        return com.deds.meshelium.MesheliumVulkanState.integratedGpu();
+    }
+
+    /** Absent = ON; read per frame. */
+    public static boolean rowsFromList() {
+        String v = System.getProperty(PROPERTY_ROWS_FROM_LIST);
+        return v == null || Boolean.parseBoolean(v);
+    }
+
+    /**
+     * Task workgroups whose mirror row disagreed with the list's fresh copy,
+     * this session. The draw used the fresh copy, so none of these is a
+     * hole; the count is the size of what is being worked around.
+     */
+    private static volatile long mirrorStaleTotal;
+
+    private static volatile int mirrorStaleLogged;
+
+    /** Stale mirror rows the card saw and the list's copy overrode, this session. */
+    public static long mirrorStaleTotal() {
+        return mirrorStaleTotal;
+    }
+
+    private static void reportMirrorStale(long frame, int[] st) {
+        int n = st[SodiumGpuVisibilityLayout.STAT_MIRROR_STALE];
+        if (n == 0) {
+            return;
+        }
+        mirrorStaleTotal += n;
+        if (mirrorStaleLogged < 6) {
+            mirrorStaleLogged++;
+            MesheliumLog.LOGGER.info(
+                    "Meshelium: on stats frame {}, {} task workgroup(s) found the graphics card's "
+                            + "own copy of a chunk group record out of date (the first: group id "
+                            + "{}, the card's copy holds key {} and popcount {}, the current record "
+                            + "has key {} and popcount {}). The record was taken from this frame's "
+                            + "fresh copy instead; the section records are checked separately. "
+                            + "Total so far {}.",
+                    frame, n, st[SodiumGpuVisibilityLayout.STAT_STALE_MID],
+                    st[SodiumGpuVisibilityLayout.STAT_STALE_MIRROR_KEY],
+                    st[SodiumGpuVisibilityLayout.STAT_STALE_MIRROR_POP],
+                    st[SodiumGpuVisibilityLayout.STAT_STALE_LIST_KEY] >>> 16,
+                    st[SodiumGpuVisibilityLayout.STAT_STALE_LIST_KEY] & 0xFFFF,
+                    mirrorStaleTotal);
+        }
+    }
+
+    /** Absent = ON; read at each commit so it can be flipped from the command line. */
+    public static boolean splitRowCopies() {
+        String v = System.getProperty(PROPERTY_SPLIT_ROW_COPIES);
+        return v == null || Boolean.parseBoolean(v);
+    }
+
+    public static final String PROPERTY_STAGING_LAG = "meshelium.sodium.stagingLag";
+
+    /**
+     * Absent = ON: when the card reports that it refused a region, write the
+     * whole mirror again.
+     *
+     * <p>A refusal means the row on the card is not the row the processor
+     * believes it wrote. Whatever the cause turns out to be, the damage does
+     * not stop at the frame it happened on: nothing marks that region dirty
+     * again, so the row stays wrong and the same 8x4x8 slab of world keeps
+     * dropping out for as long as the draw keeps asking for it. That is the
+     * repeating pattern in the same places the owner describes, rather than
+     * a one-off blink.
+     *
+     * <p>Re-mirroring turns the second kind back into the first. It queues
+     * every loaded region for commit, which is exactly what happens when
+     * the mirror first opens, so it is always correct and never draws
+     * anything that was not asked for - it only costs the commits. The
+     * card's report arrives three frames late, so this cannot prevent the
+     * first flash; it stops the hundredth.
+     *
+     * <p>This is a recovery path, not a fix, and it is armed by an event
+     * that is supposed to never happen. If refusals are zero it costs
+     * nothing at all.
+     */
+    public static final String PROPERTY_REMIRROR_ON_REFUSAL =
+            "meshelium.sodium.remirrorOnRefusal";
+
+    /** Absent = ON; read when a refusal is reported. */
+    public static boolean remirrorOnRefusalEnabled() {
+        return MesheliumConfig.sodiumRemirrorOnRefusalEnabled();
+    }
+
+    /**
+     * True once after a refusal was reported, for the mirror's owner to act
+     * on at the top of the next attempt. Clears as it is read, so one
+     * refusal costs one re-mirror however many regions it covered.
+     */
+    public static boolean takeRemirrorRequest() {
+        if (!remirrorRequested) {
+            return false;
+        }
+        remirrorRequested = false;
+        remirrorsTotal++;
+        return true;
+    }
+
+    /** Times the whole mirror was written again after a refusal. */
+    public static long remirrorsTotal() {
+        return remirrorsTotal;
+    }
+
+    /** The staging ring's retirement lag for the Sodium host, clamped to [3, 64]. */
+    public static int stagingLag() {
+        int lag = Integer.getInteger(PROPERTY_STAGING_LAG,
+                SodiumGpuVisibilityLayout.FREE_FRAME_LAG);
+        return Math.max(SodiumGpuVisibilityLayout.FREE_FRAME_LAG, Math.min(64, lag));
+    }
+
+    /** Absent = OFF; read at each commit, so it can be flipped from the command line. */
+    public static boolean commitBarrierExplicit() {
+        return Boolean.parseBoolean(System.getProperty(PROPERTY_COMMIT_BARRIER));
+    }
+
+    /**
+     * Absent = OFF: a region that was in the LAST frame's draw list and is
+     * not in this one is kept for one more frame.
+     *
+     * <p>Sodium rebuilds its render list from a cull tree that every chunk
+     * build invalidates, and while chunks stream it can hand back a list
+     * for one frame that is missing a region the frames either side of it
+     * both have. Meshelium draws exactly that list, so the region is a
+     * chunk-sized hole for that frame. The owner's laptop showed four of
+     * them in 35 seconds with the list the same size or growing around
+     * them (2026-09-21).
+     *
+     * <p>Holding it for one frame draws terrain Sodium had stopped asking
+     * for, which is the "draw more, never fewer" direction: it is still
+     * depth-tested and still gated by the occlusion, so the cost is fill,
+     * and it is a handful of regions a frame rather than the whole loaded
+     * set that {@code graphRegions=false} walks.
+     *
+     * <p>Default OFF until the owner's machine says it is the right fix.
+     */
+    public static final String PROPERTY_REGION_HOLD = "meshelium.sodium.regionHold";
+
+    /**
+     * Absent = ON: phase A draws what was marked visible in either of the
+     * last two frames, not only the last one
+     * ({@link SodiumGpuVisibilityLayout#FLAG_STAMP_HOLD}).
+     *
+     * <p>{@code -Dmeshelium.sodium.stampHold=false} restores the
+     * single-frame rule, which is the A/B for anyone who sees the flicker
+     * this exists to remove.
+     */
+    public static final String PROPERTY_STAMP_HOLD = "meshelium.sodium.stampHold";
+
+    /**
      * {@code -Dmeshelium.sodium.mergePhaseA=true}: on an owned frame,
      * record the CUTOUT phase-A draw in the SAME render pass as the
      * SOLID one, at the SOLID call, and leave the CUTOUT call to the
@@ -1767,10 +2101,21 @@ public final class SodiumTerrainDrawer {
 
     private static volatile boolean occlusionEnabled = occlusionConfigured(gpuDrawEnabled);
 
-    /** The occlusion lever's effective value: on with the GPU draw unless the property says false. */
+    /**
+     * The occlusion lever's effective value: the property outright if it is
+     * set, otherwise the settings row AND the GPU draw.
+     *
+     * <p>The AND is what the property used to say on its own. Occlusion is
+     * a stage of the GPU-mirror path, so with that path off there is
+     * nothing for it to be a stage of, and a row reading ON while it does
+     * nothing would be a lie. The property keeps its old meaning - set it
+     * and it decides, whatever anything else says - because the harness and
+     * every bisect written down so far depend on that.
+     */
     private static boolean occlusionConfigured(boolean gpuDraw) {
         String v = System.getProperty(PROPERTY_OCCLUSION);
-        return v != null ? Boolean.parseBoolean(v) : gpuDraw;
+        return v != null ? Boolean.parseBoolean(v)
+                : gpuDraw && MesheliumConfig.sodiumOcclusionConfigured();
     }
 
     /**
@@ -1862,6 +2207,101 @@ public final class SodiumTerrainDrawer {
     private static final Map<String, Long> frameDeclines = new LinkedHashMap<>();
 
     private static volatile long frameDeclinesTotal;
+
+    private static volatile int droppedRegionsPerFrame;
+
+    private static volatile long droppedRegionsTotal;
+
+    private static volatile boolean droppedRegionsLogged;
+
+    private static volatile long oneFrameGapsTotal;
+
+    private static volatile int oneFrameGapRegions;
+
+    private static volatile int oneFrameGapsLogged;
+
+    private static volatile long auditMismatchRegions;
+
+    private static volatile int auditMismatchesLogged;
+
+    private static volatile long unreachableSectionsTotal;
+
+    private static volatile long unreachableRegionsTotal;
+
+    private static volatile int unreachablePerFrame;
+
+    private static volatile int unreachableLogged;
+
+    private static volatile long regionsHeldTotal;
+
+    private static volatile boolean regionsHeldLogged;
+
+    private static volatile long skippedGroupsTotal;
+
+    private static volatile long skippedGroupRegions;
+
+    private static volatile int skippedGroupsLogged;
+
+    private static volatile long regionRejectionsTotal;
+
+    private static volatile int regionRejectionsLogged;
+
+    /** Refusing frames seen, the clock the periodic line below counts on. */
+    private static volatile long regionRejectionsFrames;
+
+    /**
+     * Refusing frames whose row described the SAME chunk the processor last
+     * wrote for that id, against those where it described a different one.
+     *
+     * <p>One reading per refusing frame, not per refusal, because the card
+     * records only its first refusal of a frame. Only the first sixteen are
+     * printed in full, and sixteen lines out of tens of thousands is a
+     * sample somebody has to eyeball; these two run over every refusing
+     * frame of the session and are reported at world exit, so the verdict
+     * is a count rather than an impression.
+     */
+    private static volatile long rowSamePlaceFrames;
+
+    private static volatile long rowOtherPlaceFrames;
+
+    private static volatile long rowUnknownFrames;
+
+    private static volatile boolean remirrorRequested;
+
+    private static volatile long remirrorsTotal;
+
+    /**
+     * What the processor last wrote into each id's row, so a refusal can be
+     * read against it: {chunkX, chunkY, chunkZ, key, the key before it,
+     * writes, releases, spare} per id.
+     *
+     * <p>Render thread only, like every other row operation. It exists
+     * because the card reporting a stale key says nothing about WHY, and
+     * the questions that remain all need the processor's side of the same
+     * id: whether the row describes this region at all, how many times the
+     * id has been written, and whether it was recycled from a region that
+     * died.
+     *
+     * <p>FOUR GENERATIONS, not one, and that is the whole point. The card's
+     * report is read back {@code READBACK_LAG} frames late, and the ledger
+     * is overwritten on every commit, so comparing a three-frame-old
+     * snapshot against the ledger as it stands NOW decides the question
+     * against a reference that may have moved. Keeping the last four writes
+     * covers the lag: a match against ANY of them is the row describing a
+     * region this id really did hold when the card looked. Caught by the
+     * adversarial re-read of this instrument, 2026-09-21.
+     */
+    private static int[] rowLedger;
+
+    /**
+     * Four generations of {chunkX, chunkY, chunkZ, key}, newest first, then
+     * writes, releases and the key count at the last write.
+     */
+    private static final int LEDGER_STRIDE = 24;
+
+    private static final int LEDGER_GENERATIONS = 4;
+
+    private static final int LEDGER_WRITES = 16, LEDGER_RELEASES = 17, LEDGER_ISSUED = 18;
 
     private static volatile int commitRegionsPerFrame;
 
@@ -2172,6 +2612,301 @@ public final class SodiumTerrainDrawer {
         return "render";
     }
 
+    /** Absent = OFF; re-read every frame like the other draw-path properties. */
+    public static boolean regionHoldEnabled() {
+        return Boolean.parseBoolean(System.getProperty(PROPERTY_REGION_HOLD));
+    }
+
+    /**
+     * The graphics card rejected whole regions before looking at a single
+     * section, and said so itself.
+     *
+     * <p>This is the card disagreeing with the CPU about a row it was given.
+     * The CPU puts a region in a draw group because its buffer key IS the
+     * group's, and declines the entire frame if its own bookkeeping
+     * disagrees; so every workgroup a draw dispatches should pass the gate.
+     * One that does not means the row on the card is not the row the CPU
+     * believes it wrote, and the cost is the whole 8x4x8 region.
+     */
+    /**
+     * The processor wrote this id's row; remember what it said, keeping the
+     * three writes before it.
+     *
+     * @param keysIssued buffer keys handed out this session, so a refusal
+     *        naming keys 1 and 2 can be read against how many keys existed
+     */
+    public static void recordRowWrite(int mid, int chunkX, int chunkY, int chunkZ, int key,
+            int keysIssued) {
+        int[] ledger = ledgerFor(mid);
+        if (ledger == null) {
+            return;
+        }
+        int b = mid * LEDGER_STRIDE;
+        System.arraycopy(ledger, b, ledger, b + 4, 4 * (LEDGER_GENERATIONS - 1));
+        ledger[b] = chunkX;
+        ledger[b + 1] = chunkY;
+        ledger[b + 2] = chunkZ;
+        ledger[b + 3] = key;
+        ledger[b + LEDGER_WRITES]++;
+        ledger[b + LEDGER_ISSUED] = keysIssued;
+    }
+
+    /** This id went back to the free pool; its next region may be anywhere. */
+    public static void recordRowRelease(int mid) {
+        int[] ledger = ledgerFor(mid);
+        if (ledger != null) {
+            ledger[mid * LEDGER_STRIDE + LEDGER_RELEASES]++;
+        }
+    }
+
+    /** A new mirror: the ids mean something else now. */
+    public static void resetRowLedger() {
+        rowLedger = null;
+    }
+
+    private static int[] ledgerFor(int mid) {
+        if (mid < 0 || mid > (1 << 20)) {
+            return null;
+        }
+        int[] ledger = rowLedger;
+        int need = (mid + 1) * LEDGER_STRIDE;
+        if (ledger == null || ledger.length < need) {
+            int[] grown = new int[Math.max(need, 1024 * LEDGER_STRIDE)];
+            if (ledger != null) {
+                System.arraycopy(ledger, 0, grown, 0, ledger.length);
+            }
+            rowLedger = ledger = grown;
+        }
+        return ledger;
+    }
+
+    public static void reportRegionRejections(long frame, int total, int deadRow, int keyMismatch,
+            int[] st) {
+        regionRejectionsTotal += total;
+        regionRejectionsFrames++;
+        if (rowsFromList() && (regionRejectionsLogged < 16
+                || (regionRejectionsLogged < 40 && regionRejectionsFrames % 16L == 0L))) {
+            regionRejectionsLogged++;
+            // With the rows from the list the key cannot mismatch, so a
+            // refusal here is the record probe: the card's copy of this
+            // group's section records is not the one last committed. The
+            // region was refused, which is a hole, not wrong geometry.
+            MesheliumLog.LOGGER.warn(
+                    "Meshelium: on stats frame {} the graphics card's copy of the section records "
+                            + "of {} task workgroup(s) was out of date, so those chunk groups were "
+                            + "left out rather than drawn wrong (the first: group id {}, probe base "
+                            + "vertex {} committed, {} on the card, VisMode {}). Total so far {}.",
+                    frame, total, st[SodiumGpuVisibilityLayout.STAT_FIRST_MID],
+                    st[SodiumGpuVisibilityLayout.STAT_FIRST_LIST_POP],
+                    st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_POP],
+                    st.length > SodiumGpuVisibilityLayout.STAT_FIRST_VISMODE
+                            ? st[SodiumGpuVisibilityLayout.STAT_FIRST_VISMODE] : -1,
+                    regionRejectionsTotal);
+        }
+        if (remirrorOnRefusalEnabled()) {
+            remirrorRequested = true;
+        }
+        // The mid is read INSIDE the length guard: this runs on every
+        // refusing frame, not only the sixteen that print, so it may not
+        // assume the stats block is as wide as this build expects.
+        int verdict = st.length > SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CZ
+                ? classifyRow(st[SodiumGpuVisibilityLayout.STAT_FIRST_MID], st) : 0;
+        switch (verdict) {
+            case 1 -> rowSamePlaceFrames++;
+            case 2 -> rowOtherPlaceFrames++;
+            default -> rowUnknownFrames++;
+        }
+        // The first sixteen refusing frames, then one every sixteenth after
+        // them, to forty lines. The cap used to be sixteen and nothing ever
+        // reset it, so every number the owner ever sent described the first
+        // second of his session - and the keys are a counter that starts at
+        // 1, so "the row holds 1 and the draw wants 2" was partly the
+        // arithmetic of a young session rather than a fact about the bug.
+        // Late lines are the only ones that can say otherwise.
+        boolean periodic = regionRejectionsLogged >= 16 && regionRejectionsLogged < 40
+                && regionRejectionsFrames % 16L == 0L;
+        if (!rowsFromList() && (regionRejectionsLogged < 16 || periodic)) {
+            regionRejectionsLogged++;
+            int mid = st[SodiumGpuVisibilityLayout.STAT_FIRST_MID];
+            int rowKey = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_KEY];
+            int groupKey = st[SodiumGpuVisibilityLayout.STAT_FIRST_GROUP_KEY];
+            int slot = st[SodiumGpuVisibilityLayout.STAT_FIRST_SLOT];
+            int firstSlot = st[SodiumGpuVisibilityLayout.STAT_FIRST_GROUP_START];
+            int regionCount = st[SodiumGpuVisibilityLayout.STAT_FIRST_GROUP_COUNT];
+            boolean pastEnd = regionCount > 0 && slot >= firstSlot + regionCount;
+            MesheliumLog.LOGGER.warn(
+                    "Meshelium: the graphics card refused to draw {} whole chunk group(s) on stats "
+                            + "frame {} - {} because the row said the group was gone and {} "
+                            + "because its buffer key was not the one being drawn. The first one: "
+                            + "group id {}, the row holds key {}, the draw wanted key {}, read at "
+                            + "list entry {} of the run [{}, {}), popcount {} in the entry against "
+                            + "{} in the row. {} Total so far {}.",
+                    total, frame, deadRow, keyMismatch,
+                    mid, rowKey, groupKey, slot, firstSlot, firstSlot + regionCount,
+                    st[SodiumGpuVisibilityLayout.STAT_FIRST_LIST_POP],
+                    st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_POP],
+                    pastEnd
+                            ? "THE ENTRY IS PAST THE END OF THE RUN, which the shipped search "
+                                    + "cannot do: read this as the run bounds themselves being "
+                                    + "wrong."
+                            : "The entry is inside the run, which the shipped search guarantees "
+                                    + "by arithmetic and is therefore not evidence of anything.",
+                    regionRejectionsTotal);
+            explainRow(mid, st);
+        }
+    }
+
+    /** SAME place / a different place / no record of that id, one per refusing frame. */
+    public static long[] rowVerdictCounts() {
+        return new long[] {rowSamePlaceFrames, rowOtherPlaceFrames, rowUnknownFrames};
+    }
+
+    /**
+     * Which of the two causes this frame's first refusal looks like, tallied
+     * for every refusing frame whether or not it is printed.
+     *
+     * @return 1 same place, 2 a different place, 0 nothing known about the id
+     */
+    private static int classifyRow(int mid, int[] st) {
+        return matchedGeneration(mid, st) >= 0 ? 1
+                : (rowLedger == null || mid < 0
+                        || mid * LEDGER_STRIDE + LEDGER_STRIDE > rowLedger.length
+                        || rowLedger[mid * LEDGER_STRIDE + LEDGER_WRITES] == 0
+                        || st.length <= SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CZ ? 0 : 2);
+    }
+
+    /**
+     * Which of the four remembered writes for this id the card's row
+     * matches, or -1 for none.
+     *
+     * <p>Generation 0 is the newest. A match on 1, 2 or 3 is still the
+     * right region: it only says the processor has written that row again
+     * in the frames since the card's report was taken, which the readback
+     * lag makes ordinary.
+     */
+    private static int matchedGeneration(int mid, int[] st) {
+        if (st.length <= SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CZ || mid < 0) {
+            return -1;
+        }
+        int[] ledger = rowLedger;
+        int b = mid * LEDGER_STRIDE;
+        if (ledger == null || b + LEDGER_STRIDE > ledger.length) {
+            return -1;
+        }
+        int known = Math.min(ledger[b + LEDGER_WRITES], LEDGER_GENERATIONS);
+        int cx = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CX];
+        int cy = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CY];
+        int cz = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CZ];
+        for (int g = 0; g < known; g++) {
+            int o = b + g * 4;
+            if (ledger[o] == cx && ledger[o + 1] == cy && ledger[o + 2] == cz) {
+                return g;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * The row's own chunk coordinates against the ones the processor last
+     * wrote for that id: the same place means a copy was lost, a different
+     * place means the wrong row was read.
+     */
+    private static void explainRow(int mid, int[] st) {
+        if (st.length <= SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CZ) {
+            return;
+        }
+        int rowX = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CX];
+        int rowY = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CY];
+        int rowZ = st[SodiumGpuVisibilityLayout.STAT_FIRST_ROW_CZ];
+        int[] ledger = rowLedger;
+        int b = mid * LEDGER_STRIDE;
+        if (ledger == null || b < 0 || b + LEDGER_STRIDE > ledger.length
+                || ledger[b + LEDGER_WRITES] == 0) {
+            MesheliumLog.LOGGER.warn(
+                    "    ...the row on the card describes chunk ({}, {}, {}), and the processor has "
+                            + "no record of ever writing that id.",
+                    rowX, rowY, rowZ);
+            return;
+        }
+        int gen = matchedGeneration(mid, st);
+        MesheliumLog.LOGGER.warn(
+                "    ...the row on the card describes chunk ({}, {}, {}); the processor last wrote "
+                        + "that id as chunk ({}, {}, {}) with key {} (the write before it, key {}), "
+                        + "after {} write(s) and {} release(s), with {} key(s) issued by then. The "
+                        + "draw was VisMode {}. {}",
+                rowX, rowY, rowZ, ledger[b], ledger[b + 1], ledger[b + 2], ledger[b + 3],
+                ledger[b + 7], ledger[b + LEDGER_WRITES], ledger[b + LEDGER_RELEASES],
+                ledger[b + LEDGER_ISSUED],
+                st.length > SodiumGpuVisibilityLayout.STAT_FIRST_VISMODE
+                        ? st[SodiumGpuVisibilityLayout.STAT_FIRST_VISMODE] : -1,
+                gen == 0
+                        ? "SAME PLACE, the newest write: the card holds an older copy of the right "
+                                + "row, so a row copy did not reach it."
+                        : gen > 0
+                                ? "SAME PLACE, " + gen + " write(s) back, which the readback lag "
+                                        + "makes ordinary: still an older copy of the right row."
+                                : "A DIFFERENT PLACE in all four remembered writes: the card is not "
+                                        + "holding this region's row at all, so the fault is the id "
+                                        + "or the addressing, not the copy.");
+    }
+
+    /** Whole regions the task stage refused this session (a card/CPU row disagreement). */
+    public static long regionRejectionsTotal() {
+        return regionRejectionsTotal;
+    }
+
+    /**
+     * A buffer group that had regions to draw and no buffer to draw them
+     * from, so its whole share of the screen was left out of that frame.
+     */
+    public static void reportSkippedGroup(int regions, int groups) {
+        skippedGroupsTotal++;
+        skippedGroupRegions += regions;
+        if (skippedGroupsLogged < 8) {
+            skippedGroupsLogged++;
+            MesheliumLog.LOGGER.warn(
+                    "Meshelium: a draw group holding {} chunk group(s) had no geometry buffer at "
+                            + "draw time and was left out of this frame, out of {} group(s). With "
+                            + "one draw per buffer that is a large part of the screen gone at "
+                            + "once. Total so far: {} skipped, {} chunk group(s).",
+                    regions, groups, skippedGroupsTotal, skippedGroupRegions);
+        }
+    }
+
+    /** Draw groups left out of a frame for want of a buffer, this session. */
+    public static long skippedGroupsTotal() {
+        return skippedGroupsTotal;
+    }
+
+    public static long skippedGroupRegions() {
+        return skippedGroupRegions;
+    }
+
+    /** Regions kept for one frame after Sodium's list dropped them. */
+    public static long regionsHeldTotal() {
+        return regionsHeldTotal;
+    }
+
+    public static void reportRegionsHeld(int held) {
+        if (held > 0) {
+            regionsHeldTotal += held;
+            if (!regionsHeldLogged) {
+                regionsHeldLogged = true;
+                MesheliumLog.LOGGER.info(
+                        "Meshelium: {} chunk group(s) left Sodium's draw list this frame and were "
+                                + "kept for one more, so nothing blinks out while the list settles "
+                                + "(-D{}=false turns this off). Counted from here on.",
+                        held, PROPERTY_REGION_HOLD);
+            }
+        }
+    }
+
+    /** Absent = on; re-read every frame like the other draw-path properties. */
+    public static boolean stampHoldEnabled() {
+        String v = System.getProperty(PROPERTY_STAMP_HOLD);
+        return v == null || Boolean.parseBoolean(v);
+    }
+
     /** Absent = on, the multiWG rule; re-read every frame like the other draw-path properties. */
     public static boolean phaseBCpuSkipEnabled() {
         String v = System.getProperty(PROPERTY_PHASE_B_CPU_SKIP);
@@ -2330,6 +3065,108 @@ public final class SodiumTerrainDrawer {
         searchDistanceSource = searchSource;
     }
 
+    /**
+     * Reported by the per-frame loop: mirrored regions it passed over for
+     * want of a geometry buffer. Nothing in the renderer wanted to know
+     * before, so the walk simply skipped them; the first one of a session
+     * now says so, because a mirrored region missing from ONE frame's list
+     * is a chunk-sized hole for that frame and the counter is the only
+     * thing that can tell that apart from a frame drawn correctly.
+     */
+    public static void reportDroppedRegions(int dropped, int gaps, int listedNow) {
+        droppedRegionsPerFrame = dropped;
+        oneFrameGapRegions = gaps;
+        if (gaps > 0) {
+            oneFrameGapsTotal += gaps;
+            if (oneFrameGapsLogged < 8) {
+                oneFrameGapsLogged++;
+                MesheliumLog.LOGGER.info(
+                        "Meshelium: {} region(s) are in this frame's draw list of {} and were in "
+                                + "the list two frames ago, but were missing from the frame "
+                                + "between, whose list was not smaller. That list is Sodium's own, "
+                                + "and the list path and Sodium's translucent pass draw the same "
+                                + "one, so no path drew them on that frame. Total so far {}.",
+                        gaps, listedNow, oneFrameGapsTotal);
+            }
+        }
+        if (dropped > 0) {
+            droppedRegionsTotal += dropped;
+            if (!droppedRegionsLogged) {
+                droppedRegionsLogged = true;
+                MesheliumLog.LOGGER.info(
+                        "Meshelium: {} region(s) Meshelium holds records for had no geometry "
+                                + "buffer when this frame's draw list was built, so nothing of "
+                                + "them was drawn this frame. Expected to be rare and to recover "
+                                + "on the next frame; counted from here on and reported with any "
+                                + "visibility dip.",
+                        dropped);
+            }
+        }
+    }
+
+    /**
+     * Sections the frame offered that the GPU path cannot reach, because
+     * the mirror row they would have to be enumerated through does not
+     * hold them. The sharpest of the terrain-continuity counters: it needs
+     * no threshold, no window and no control, it is checked on every
+     * listed region of every frame, and a non-zero value is by itself a
+     * statement that the GPU path is drawing less than the list path would
+     * from the same data.
+     */
+    public static void reportUnreachable(int sections, int regions, int listedSections) {
+        unreachablePerFrame = sections;
+        if (sections > 0) {
+            unreachableSectionsTotal += sections;
+            unreachableRegionsTotal += regions;
+            if (unreachableLogged < 8) {
+                unreachableLogged++;
+                MesheliumLog.LOGGER.warn(
+                        "Meshelium: {} section(s) in {} chunk group(s) have geometry this frame "
+                                + "that the copy on the graphics card cannot reach, out of {} the "
+                                + "frame offered. Nothing draws them this frame; the plain list "
+                                + "path would have. The group(s) are marked for repair on the next "
+                                + "frame. Totals so far: {} section(s), {} group(s).",
+                        sections, regions, listedSections, unreachableSectionsTotal,
+                        unreachableRegionsTotal);
+            }
+        }
+    }
+
+    /** Sections the GPU path could not reach this session ({@link #reportUnreachable}). */
+    public static long unreachableSectionsTotal() {
+        return unreachableSectionsTotal;
+    }
+
+    public static long unreachableRegionsTotal() {
+        return unreachableRegionsTotal;
+    }
+
+    public static int unreachablePerFrame() {
+        return unreachablePerFrame;
+    }
+
+    public static int droppedRegionsPerFrame() {
+        return droppedRegionsPerFrame;
+    }
+
+    public static long droppedRegionsTotal() {
+        return droppedRegionsTotal;
+    }
+
+    /**
+     * Regions that were in the frame's draw list, missing from the next
+     * frame's, and back in the one after: a region drawn by no phase of
+     * that middle frame. The exact form of the reported flicker, and the
+     * only counter here that needs no threshold to mean something.
+     */
+    public static long oneFrameGapsTotal() {
+        return oneFrameGapsTotal;
+    }
+
+    public static int oneFrameGapRegions() {
+        return oneFrameGapRegions;
+    }
+
     /** Reported by the loop when an invariant check fails (the frame declines). */
     public static void reportInvariant(long midMissingTotal, long keyMismatchTotal) {
         midMissing = midMissingTotal;
@@ -2345,6 +3182,34 @@ public final class SodiumTerrainDrawer {
         mirrorAuditFrames = frames;
         mirrorAuditMismatches = mismatches;
         mirrorGpuReadbackMismatches = gpuMismatches;
+    }
+
+    /**
+     * One clean region whose records on Sodium's heap are not the records
+     * the mirror committed. Said out loud, up to eight times a session:
+     * the audit lever is there to be run somewhere else, and a lever whose
+     * only output is a counter nobody prints has none.
+     */
+    public static void reportAuditMismatch(int mid, int pass, long bytes,
+            int chunkX, int chunkY, int chunkZ) {
+        auditMismatchRegions++;
+        if (auditMismatchesLogged < 8) {
+            auditMismatchesLogged++;
+            MesheliumLog.LOGGER.warn(
+                    "Meshelium mirror audit: region {} at chunk {},{},{} (id {}, {} pass) is not "
+                            + "marked dirty, yet {} byte(s) of its records on Sodium's heap differ "
+                            + "from what Meshelium last copied to the graphics card. A change "
+                            + "reached Sodium without reaching any of Meshelium's five hooks, so "
+                            + "the card is drawing that region from records that are out of date. "
+                            + "Regions seen so far: {}.",
+                    mid, chunkX, chunkY, chunkZ, mid, pass == 0 ? "solid" : "cutout", bytes,
+                    auditMismatchRegions);
+        }
+    }
+
+    /** Clean regions found with stale records this session (the audit lever). */
+    public static long auditMismatchRegions() {
+        return auditMismatchRegions;
     }
 
     /**
@@ -2506,6 +3371,21 @@ public final class SodiumTerrainDrawer {
         return phaseBCpuSkips;
     }
 
+    /**
+     * One-frame disappearances of drawn terrain seen this session
+     * ({@code checkVisibilityDip}). Zero is the only good value; a session
+     * that reports flicker and counts zero here did not flicker for this
+     * reason, which is as useful a reading as a count that moves.
+     */
+    public static long visibilityDips() {
+        return visibilityDips;
+    }
+
+    /** The stats frame of the most recent dip, or -1. */
+    public static long lastVisibilityDipFrame() {
+        return lastVisibilityDipFrame;
+    }
+
     public static int instancesLive() {
         return liveInstances.size();
     }
@@ -2621,6 +3501,14 @@ public final class SodiumTerrainDrawer {
         int frameHalfMode;
         /** The phase-B skip key's copy of it (contract section 7.4). */
         int pbHalfMode;
+
+        /**
+         * The troubleshooting levers, folded into bits, as the phase-B skip
+         * key last saw them. -1 until the first decide, which is never a
+         * real fold, so the first frame after a state is created always
+         * reads as a change.
+         */
+        int pbLevers = -1;
         /** PROPERTY_MERGE_PHASE_A: the SOLID call already recorded CUTOUT's phase A. */
         boolean frameCutoutPhaseARecorded;
         int frameFlags;
@@ -2659,8 +3547,43 @@ public final class SodiumTerrainDrawer {
         /** Phase A of the same stats frames, tagged by {@code phaseBFrames}. */
         final int[] phaseACounts = new int[HISTORY];
 
+        /**
+         * The visibility-dip detector's record of what each frame OFFERED
+         * the GPU, written at the SOLID call and read three frames later
+         * when that frame's counts come back ({@code checkVisibilityDip}).
+         * Tagged by {@code dipFrames} because the ring is reused every
+         * {@link #HISTORY} frames and an untagged slot would compare a
+         * frame against a frame 64 earlier.
+         */
+        final long[] dipFrames = new long[HISTORY];
+        final int[] dipListed = new int[HISTORY];
+        final int[] dipRegions = new int[HISTORY];
+        final int[] dipDropped = new int[HISTORY];
+        final boolean[] dipSkipB = new boolean[HISTORY];
+        final boolean[] dipOcc = new boolean[HISTORY];
+
+        /** The detector's three-frame window: the left shoulder. */
+        long dipLeftFrame = -1L;
+        int dipLeftDrawn;
+        int dipLeftA;
+        int dipLeftB;
+        int dipLeftListed;
+        int dipLeftRegions;
+        int dipLeftDropped;
+
+        /** The middle frame, the one a dip would be in. */
+        long dipTroughFrame = -1L;
+        int dipTroughDrawn;
+        int dipTroughA;
+        int dipTroughB;
+        int dipTroughListed;
+        int dipTroughRegions;
+        int dipTroughDropped;
+        boolean dipTroughSkipB;
+
         InstanceState() {
             Arrays.fill(phaseBFrames, -1L);
+            Arrays.fill(dipFrames, -1L);
         }
 
         public SodiumMirrorGpu mirror() {
@@ -2945,6 +3868,8 @@ public final class SodiumTerrainDrawer {
                 | (faceAll ? SodiumGpuVisibilityLayout.FLAG_FACE_ALL : 0)
                 | (occ && distanceGate ? SodiumGpuVisibilityLayout.FLAG_DIST_GATE : 0)
                 | (ONE_DRAW ? SodiumGpuVisibilityLayout.FLAG_ONE_DRAW : 0)
+                | (occ && stampHoldEnabled() ? SodiumGpuVisibilityLayout.FLAG_STAMP_HOLD : 0)
+                | (rowsFromList() ? SodiumGpuVisibilityLayout.FLAG_ROWS_FROM_LIST : 0)
                 | DIAG_TASK_SKIP_FLAGS;
         int visMode = occ ? SodiumGpuVisibilityLayout.VIS_MODE_PHASE_A
                 : SodiumGpuVisibilityLayout.VIS_MODE_BFS;
@@ -2973,6 +3898,19 @@ public final class SodiumTerrainDrawer {
         s.frameHasOcclusion = occ;
         s.frameSkipPhaseB = skipPhaseB;
         s.drawCommands = 0;
+
+        // What this frame OFFERS the GPU, tagged with the stats frame it is
+        // about to write. The GPU's own count of what it DREW arrives at the
+        // fold, READBACK_LAG frames later, and the detector compares the two
+        // (checkVisibilityDip). listedSections is this frame's: the loop
+        // reported it a few statements ago, in attemptRung0.
+        int dipSlot = (int) (s.statsFrames % InstanceState.HISTORY);
+        s.dipFrames[dipSlot] = s.statsFrames;
+        s.dipListed[dipSlot] = listedSections;
+        s.dipRegions[dipSlot] = listedRegions;
+        s.dipDropped[dipSlot] = droppedRegionsPerFrame;
+        s.dipSkipB[dipSlot] = skipPhaseB;
+        s.dipOcc[dipSlot] = occ;
 
         // GPU timestamps bracket the FRAME on this rung (both passes and,
         // with occlusion, the rasters and phase B), unlike rung 1's per-pass
@@ -3043,8 +3981,21 @@ public final class SodiumTerrainDrawer {
             MesheliumLog.LOGGER.info(
                     "Meshelium is drawing Sodium's opaque terrain from the GPU record mirror: the "
                             + "task stage selects runs per section ({}), one indirect draw per "
-                            + "geometry buffer per phase per pass, CPU work O(regions).",
-                    occ ? "box-raster occlusion with temporal history" : "BFS-parity mode");
+                            + "geometry buffer per phase per pass, CPU work O(regions). Region "
+                            + "source: {}. Two-frame stamp hold: {}. Staging retirement lag: {} "
+                            + "submit(s). Commit barrier: {}. Row copies: {}. Rows read from: {}. "
+                            + "Mirror memory: {}. Commit recorded: {}. Fall back if records go "
+                            + "stale: {}.",
+                    occ ? "box-raster occlusion with temporal history" : "BFS-parity mode",
+                    graphRegions() ? "Sodium's own chunk list" : "loaded regions, frustum-tested",
+                    stampHoldEnabled() ? "ON" : "OFF",
+                    stagingLag(),
+                    commitInDrawBuffer() || commitBarrierExplicit() ? "explicit" : "vanilla's only",
+                    splitRowCopies() ? "their own command" : "batched with the pass blocks",
+                    rowsFromList() ? "the per-frame list (fresh)" : "the mirror",
+                    mirrorHostCoherent() ? "host-coherent" : "device-local",
+                    commitInDrawBuffer() ? "in the draws' command buffer" : "in its own command buffer",
+                    fallbackOnStale() ? "ON" : "OFF");
         }
         return true;
     }
@@ -3247,6 +4198,16 @@ public final class SodiumTerrainDrawer {
                 int first = s.groupStart[g];
                 int count = s.groupStart[g + 1] - first;
                 if (count <= 0 || s.groupBuffers[g] == null) {
+                    // A GROUP is every listed region sharing one of Sodium's
+                    // geometry buffers, and with one draw per group that is
+                    // a single command covering a large part of the screen.
+                    // Skipping one silently is the biggest hole this path
+                    // can make and nothing counted it until 2026-09-21. A
+                    // group with no entries is ordinary; one with entries
+                    // and no buffer is not, and only the second is counted.
+                    if (count > 0) {
+                        reportSkippedGroup(count, s.groupCount);
+                    }
                     continue;
                 }
                 pushDescriptorsTask(cb, p, s, s.groupBuffers[g], atlasView, atlasSampler, lightmapView);
@@ -3257,7 +4218,9 @@ public final class SodiumTerrainDrawer {
                 push.putInt(SodiumGpuVisibilityLayout.PUSH_FLAGS, s.frameFlags);
                 push.putInt(SodiumGpuVisibilityLayout.PUSH_RECORD_BASE, recordBase);
                 push.putInt(SodiumGpuVisibilityLayout.PUSH_REGION_COUNT, ONE_DRAW ? count : 0);
-                push.putInt(SodiumGpuVisibilityLayout.PUSH_RESERVED1, 0);
+                push.putInt(SodiumGpuVisibilityLayout.PUSH_RECORD_PASS,
+                        recordBase == SodiumGpuVisibilityLayout.recordBaseUvec4(s.mirror.capacity(),
+                                SodiumGpuVisibilityLayout.PASS_SOLID) ? 0 : 1);
                 VK10.vkCmdPushConstants(cb, p.pipelineLayout(), stages, 0, push);
                 if (ONE_DRAW) {
                     // PROPERTY_ONE_DRAW: the group's single command, every
@@ -3454,6 +4417,35 @@ public final class SodiumTerrainDrawer {
         gpuSectionsA = st[1];
         gpuSectionsB = st[2];
         gpuQuads = st[3] & 0xFFFFFFFFL;
+        if (st.length > SodiumGpuVisibilityLayout.STAT_KEY_MISMATCH
+                && st[SodiumGpuVisibilityLayout.STAT_REGION_REJECTED] != 0) {
+            reportRegionRejections(readFrame,
+                    st[SodiumGpuVisibilityLayout.STAT_REGION_REJECTED],
+                    st[SodiumGpuVisibilityLayout.STAT_ROW_DEAD],
+                    st[SodiumGpuVisibilityLayout.STAT_KEY_MISMATCH], st);
+        }
+        if (st.length > SodiumGpuVisibilityLayout.STAT_STALE_MIRROR_POP) {
+            reportMirrorStale(readFrame, st);
+            // The trigger is REFUSALS - chunk groups actually left off the
+            // screen - in a second distinct frame. Stale mirror ROWS alone do
+            // not count: with the rows taken from the list they change nothing
+            // on screen, and the owner's first host-coherent run latched on
+            // two of them at stats frame 7 with zero refusals, throwing away a
+            // GPU path that had drawn every group it was asked to. One
+            // isolated refusing frame is tolerated so a single startup blip
+            // does not cost the session its fast path; a second means the
+            // holes are recurring, and that is the flashing.
+            int refused = st[SodiumGpuVisibilityLayout.STAT_REGION_REJECTED];
+            if (fallbackOnStale() && !gpuDrawBroken && refused > 0
+                    && regionRejectionsFrames >= FALLBACK_REFUSING_FRAMES) {
+                latchGpuDraw("the graphics card left chunk groups off the screen on "
+                        + regionRejectionsFrames + " separate frames (the latest, stats frame "
+                        + readFrame + ", " + refused + " refused workgroup(s)) because its copy of "
+                        + "their records was out of date; the list path - the one GPU Visibility "
+                        + "off uses - draws the rest of the session, which stops the flashing. -D"
+                        + PROPERTY_FALLBACK_ON_STALE + "=false keeps the GPU path for testing");
+            }
+        }
         statsFramesRead++;
         if (st[2] > 0) {
             s.lastPhaseBStatsFrame = readFrame;
@@ -3462,6 +4454,10 @@ public final class SodiumTerrainDrawer {
         s.phaseBFrames[i] = readFrame;
         s.phaseBCounts[i] = st[2];
         s.phaseACounts[i] = st[1];
+        if (s.dipFrames[i] == readFrame) {
+            checkVisibilityDip(s, readFrame, st[1], st[2], s.dipListed[i], s.dipRegions[i],
+                    s.dipDropped[i], s.dipSkipB[i], s.dipOcc[i]);
+        }
         // NEXT (c), test-only: fold the visible set of the SAME frame, on
         // THIS thread. A suite thread cannot read the ring slot safely - it
         // is retagged when frame f+8 records, and the leg reaches it through
@@ -3522,6 +4518,19 @@ public final class SodiumTerrainDrawer {
             changed = true;
             s.pbHalfMode = s.frameHalfMode;
         }
+        // The troubleshooting levers decide WHAT phase A draws, and now
+        // that they are settings rows rather than launch flags they can be
+        // flipped while the camera sits perfectly still - the one case
+        // where nothing else in this key moves. Without this term the skip
+        // would hold the old picture until the player happened to turn, and
+        // the row would read as broken.
+        int levers = (stampHoldEnabled() ? 1 : 0)
+                | (regionHoldEnabled() ? 2 : 0)
+                | (occlusionEnabled ? 4 : 0);
+        if (levers != s.pbLevers) {
+            changed = true;
+            s.pbLevers = levers;
+        }
         if (commitSerial != s.pbCommitSerial) {
             changed = true;
             s.pbCommitSerial = commitSerial;
@@ -3542,6 +4551,232 @@ public final class SodiumTerrainDrawer {
         boolean skip = s.lastReadStatsFrame >= c + 2L && s.lastPhaseBStatsFrame <= c;
         phaseBCpuSkipArmed = skip;
         return skip;
+    }
+
+    // ------------------------------------------------------------------
+    // The visibility dip detector
+    // ------------------------------------------------------------------
+
+    /**
+     * Below this many sections a frame is too small to judge and every
+     * ratio below is noise (a sealed cave, a screen of sky, the first
+     * frames of a world).
+     */
+    private static final int DIP_MIN_SECTIONS = 64;
+
+    /**
+     * The trough must fall at least 8% below the LOWER of its two
+     * shoulders.
+     *
+     * <p>Not a quarter, which is what this first shipped with and what a
+     * moment's arithmetic refutes: at render distance 48 one Sodium region
+     * is a few tenths of a percent of the sections on screen, and even the
+     * "large chunk groups" of the report are single digits. A rule written
+     * at a quarter would have been silent through the whole thing. This is
+     * the coarse net; the exact one is the region gap counter, which needs
+     * no threshold at all.
+     */
+    private static final int DIP_TROUGH_NUM = 92;
+    private static final int DIP_TROUGH_DEN = 100;
+
+    /**
+     * The two shoulders must agree to within 6%: the window has to sit on
+     * a flat piece of trend before a hole in the middle of it means
+     * anything. Comparing the trough against the LEFT shoulder alone would
+     * have taken the drift of a moving camera for a recovery, or refused a
+     * real dip because the scene was slowly opening up - and the camera is
+     * moving in every frame this is about.
+     */
+    private static final int DIP_SHOULDER_NUM = 94;
+    private static final int DIP_SHOULDER_DEN = 100;
+
+    /**
+     * All three frames must offer the same geometry to within a twentieth.
+     *
+     * <p>Not tighter: the frames this exists to judge are frames with
+     * chunks arriving, so the offered count is moving on every one of
+     * them, and a filter that demanded it stand still would refuse to
+     * judge the only frames that matter. Not looser either: a teleport, a
+     * render-distance change or a region unloading moves it by far more
+     * than that, and those must break the reading rather than produce one.
+     */
+    private static final int DIP_LISTED_NUM = 95;
+    private static final int DIP_LISTED_DEN = 100;
+
+    /** Dips written out in full before the counter alone carries them. */
+    private static final int DIP_LOG_LIMIT = 8;
+
+    /** One line every this many dips after that, so a flood still says so. */
+    private static final int DIP_LOG_EVERY = 64;
+
+    private static volatile long visibilityDips;
+
+    private static volatile long lastVisibilityDipFrame = -1L;
+
+    private static long visibilityDipsLogged;
+
+    /**
+     * Frames where terrain the GPU was drawing stopped being drawn for ONE
+     * frame and came back, with the CPU offering the same geometry
+     * throughout: the owner-reported flicker, as a number.
+     *
+     * <p>Why a V and not a drop. A drop in drawn sections is ordinary -
+     * terrain goes behind a hill, the camera turns, a region unloads - and
+     * every one of those is a STEP: the next frame does not hand the
+     * sections back. A one-frame trough between two shoulders that agree
+     * with each other is not something occlusion does while the camera
+     * keeps moving, and it is exactly what a missed temporal stamp looks
+     * like: phase A cannot draw a section whose stamp went stale and phase
+     * B did not reveal it, so for one frame nobody draws it and the frame
+     * after, phase A has it again.
+     *
+     * <p>This is the coarse net, and it is coarse: it works on the frame's
+     * total, so it can only see a hole big enough to move that total by
+     * 8%, which is many regions at once. The exact instrument for one
+     * region is {@code oneFrameGapsTotal}, which counts the same shape on
+     * the CPU's own list with no threshold in it at all. They are kept
+     * side by side because they fail differently - the gap counter is
+     * blind to anything that happens after the list is built, and this one
+     * is blind to anything too small.
+     *
+     * <p>Why the offered count is part of the rule. Without it the rule
+     * would fire on anything that changes the frame's list - a render
+     * distance change, a teleport, a region deleted and rebuilt - and the
+     * owner would be reading a counter that moves for reasons that are not
+     * the bug. {@code listedSections} is the CPU's count of the sections
+     * this frame handed the GPU; holding it to within a twentieth across
+     * all three frames says the scene did not change, only what was drawn
+     * of it.
+     *
+     * <p>The log line carries BOTH offered counts beside the drawn one,
+     * because between them they say which half of the renderer lost the
+     * terrain. Offered counts flat while the drawn count dips: the CPU
+     * handed the GPU the same geometry and the GPU did not draw it, which
+     * is the temporal stamps, the box rasters or the phase-B pass. Offered
+     * counts dipping with it: the region left the frame's own list before
+     * the GPU ever saw it, which is the record mirror, the region ids or
+     * the frustum walk. A Sodium region is 8x4x8 sections, so one region
+     * leaving the list moves the region count visibly and the section
+     * count by a fraction of a percent - which is why both are printed and
+     * only the section count is in the rule.
+     *
+     * <p>Only occluded (rung 0a) frames are judged, and only three
+     * consecutive stats frames of one instance: a decline, a rung-1 frame,
+     * an occlusion toggle or a new chunk renderer each break the chain
+     * rather than produce a reading.
+     */
+    private static void checkVisibilityDip(InstanceState s, long frame, int phaseA, int phaseB,
+            int listed, int regions, int dropped, boolean skipB, boolean occ) {
+        int drawn = phaseA + phaseB;
+        boolean chained = occ && s.dipTroughFrame == frame - 1L && s.dipLeftFrame == frame - 2L;
+        if (chained && dipRule(s.dipLeftA, s.dipLeftB, s.dipLeftListed,
+                s.dipTroughA, s.dipTroughB, s.dipTroughListed, phaseA, phaseB, listed)) {
+            visibilityDips++;
+            lastVisibilityDipFrame = s.dipTroughFrame;
+            long n = visibilityDips;
+            if (visibilityDipsLogged < DIP_LOG_LIMIT || n % DIP_LOG_EVERY == 0L) {
+                visibilityDipsLogged++;
+                MesheliumLog.LOGGER.info(
+                        "Meshelium: terrain the graphics card was drawing vanished for ONE frame "
+                                + "and came back (dip {}). Sections drawn: {} (A {} + B {}) -> {} "
+                                + "(A {} + B {}) -> {} (A {} + B {}); the frame's own list held "
+                                + "{} -> {} -> {} sections in {} -> {} -> {} regions, and the "
+                                + "walk passed over {} -> {} -> {} mirrored regions with no "
+                                + "geometry buffer. Phase B pass on the dipped frame: {}. Stats "
+                                + "frames {}..{}, rung {}, declines {}, mirror commits {} regions "
+                                + "this frame, upload hook {}, one-frame region gaps so far {}.",
+                        n,
+                        s.dipLeftDrawn, s.dipLeftA, s.dipLeftB,
+                        s.dipTroughDrawn, s.dipTroughA, s.dipTroughB,
+                        drawn, phaseA, phaseB,
+                        s.dipLeftListed, s.dipTroughListed, listed,
+                        s.dipLeftRegions, s.dipTroughRegions, regions,
+                        s.dipLeftDropped, s.dipTroughDropped, dropped,
+                        s.dipTroughSkipB ? "SKIPPED" : "recorded",
+                        s.dipLeftFrame, frame, rung, frameDeclinesTotal,
+                        commitRegionsPerFrame, hookUpload, oneFrameGapsTotal);
+            }
+        }
+        s.dipLeftFrame = s.dipTroughFrame;
+        s.dipLeftDrawn = s.dipTroughDrawn;
+        s.dipLeftA = s.dipTroughA;
+        s.dipLeftB = s.dipTroughB;
+        s.dipLeftListed = s.dipTroughListed;
+        s.dipLeftRegions = s.dipTroughRegions;
+        s.dipLeftDropped = s.dipTroughDropped;
+        // A frame the detector may not judge poisons the window rather than
+        // being compared against: -1 can never be frame - 1.
+        s.dipTroughFrame = occ ? frame : -1L;
+        s.dipTroughDrawn = drawn;
+        s.dipTroughA = phaseA;
+        s.dipTroughB = phaseB;
+        s.dipTroughListed = listed;
+        s.dipTroughRegions = regions;
+        s.dipTroughDropped = dropped;
+        s.dipTroughSkipB = skipB;
+    }
+
+    /**
+     * The rule alone, on three frames' numbers. Public so the suite can
+     * prove WHAT it fires on - a synthetic trough, a step, a scene that
+     * changed - instead of waiting for a dip this desk has never produced
+     * ({@code assertVisibilityDipRule}).
+     */
+    public static boolean dipRuleForTest(int leftA, int leftB, int leftListed,
+            int troughA, int troughB, int troughListed, int rightA, int rightB, int rightListed) {
+        return dipRule(leftA, leftB, leftListed, troughA, troughB, troughListed,
+                rightA, rightB, rightListed);
+    }
+
+    /**
+     * <p>Phase A has to be the phase that collapsed, and that is the guard
+     * that makes the rule about a DISAPPEARANCE rather than about
+     * bookkeeping. Phase A is the steady-state draw - everything that was
+     * on screen last frame - and phase B is only the reveal, so terrain
+     * going missing always shows in A. Without this, the frame on which
+     * the phase-B CPU skip starts eliding an empty pass, or any other
+     * change in how the same picture is divided between the two phases,
+     * would read as terrain vanishing. (That particular one cannot happen
+     * today, because the skip only arms once phase B is already drawing
+     * nothing - but the rule should not depend on an argument made
+     * somewhere else in the file.)
+     *
+     * <p>The counts are section-PASS emissions, not sections: a section
+     * with both solid and cutout geometry is counted by each pass's task
+     * stage. That makes every number here about twice a section count and
+     * changes nothing, because every test below is a ratio of one of these
+     * against another.
+     */
+    private static boolean dipRule(int leftA, int leftB, int leftListed,
+            int troughA, int troughB, int troughListed, int rightA, int rightB, int rightListed) {
+        int leftDrawn = leftA + leftB;
+        int troughDrawn = troughA + troughB;
+        int rightDrawn = rightA + rightB;
+        if (leftDrawn < DIP_MIN_SECTIONS || rightDrawn < DIP_MIN_SECTIONS) {
+            return false;
+        }
+        // The shoulders carry the trend; the trough is judged against the
+        // lower of them, so a window sitting on a slope cannot produce a
+        // dip out of the slope itself.
+        int lowDrawn = Math.min(leftDrawn, rightDrawn);
+        int highDrawn = Math.max(leftDrawn, rightDrawn);
+        if ((long) lowDrawn * DIP_SHOULDER_DEN < (long) highDrawn * DIP_SHOULDER_NUM) {
+            return false;
+        }
+        if ((long) troughDrawn * DIP_TROUGH_DEN >= (long) lowDrawn * DIP_TROUGH_NUM) {
+            return false;
+        }
+        if ((long) troughA * DIP_TROUGH_DEN >= (long) Math.min(leftA, rightA) * DIP_TROUGH_NUM) {
+            return false;
+        }
+        return dipListedStable(leftListed, troughListed) && dipListedStable(leftListed, rightListed);
+    }
+
+    /** The two counts are within a twentieth of the larger: the same scene. */
+    private static boolean dipListedStable(int a, int b) {
+        int hi = Math.max(a, b);
+        int lo = Math.min(a, b);
+        return hi <= 0 || (long) lo * DIP_LISTED_DEN >= (long) hi * DIP_LISTED_NUM;
     }
 
     /** Raw-bits compare AND refresh of one stored matrix key: true iff moved. */

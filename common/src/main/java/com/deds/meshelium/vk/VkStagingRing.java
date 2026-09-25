@@ -34,6 +34,25 @@ final class VkStagingRing {
     private final long mappedAddress;
     private final int capacity;
 
+    /**
+     * Submit intervals a written span must survive before its bytes may be
+     * handed out again. Three is the number the class was written for and
+     * the number the argument below derives; it is a field, and not the
+     * constant it used to be, only so the Sodium host can raise it from the
+     * command line.
+     *
+     * <p>The derivation rests on {@code submit()} always waiting for the
+     * submit two before it, which it does - it has no early return and no
+     * conditional path - and on every step being counted in submits rather
+     * than frames, which they are, so it does not matter how many times a
+     * frame submits. Raising this is therefore a control and not a fix: it
+     * is the only way to say by measurement, rather than by argument, that
+     * a span is never handed out while the card is still reading it. A
+     * larger number costs staging bytes and nothing else, and a full ring
+     * declines the frame rather than corrupting one.
+     */
+    private final int freeFrameLag;
+
     /** Next write offset. */
     private int head;
     /** Bytes not yet retired (incl. wrap padding). */
@@ -44,19 +63,30 @@ final class VkStagingRing {
     /** FIFO of {frame, bytes} spans awaiting retirement. */
     private final ArrayDeque<long[]> spans = new ArrayDeque<>();
 
-    private VkStagingRing(long vma, MesheliumVkBuffers.MappedBuffer buffer, int capacity) {
+    private VkStagingRing(long vma, MesheliumVkBuffers.MappedBuffer buffer, int capacity,
+            int freeFrameLag) {
         this.vma = vma;
         this.vkBuffer = buffer.vkBuffer();
         this.allocation = buffer.allocation();
         this.mappedAddress = buffer.mappedAddress();
         this.capacity = capacity;
+        this.freeFrameLag = freeFrameLag;
     }
 
     static VkStagingRing create(long vma, int capacity) {
+        return create(vma, capacity, MesheliumTerrainGpu.FREE_FRAME_LAG);
+    }
+
+    static VkStagingRing create(long vma, int capacity, int freeFrameLag) {
         MesheliumVkBuffers.MappedBuffer buffer = MesheliumVkBuffers.createHostMapped(vma, capacity,
                 org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 "vmaCreateBuffer(meshelium staging ring)");
-        return new VkStagingRing(vma, buffer, capacity);
+        return new VkStagingRing(vma, buffer, capacity, freeFrameLag);
+    }
+
+    /** Submit intervals a span waits before its bytes are handed out again. */
+    int freeFrameLag() {
+        return freeFrameLag;
     }
 
     long vkBuffer() {
@@ -82,7 +112,7 @@ final class VkStagingRing {
             currentFrameBytes = 0;
         }
         currentFrame = frame;
-        while (!spans.isEmpty() && frame - spans.peekFirst()[0] >= MesheliumTerrainGpu.FREE_FRAME_LAG) {
+        while (!spans.isEmpty() && frame - spans.peekFirst()[0] >= freeFrameLag) {
             used -= spans.pollFirst()[1];
         }
     }

@@ -10,17 +10,19 @@ import com.deds.meshelium.MesheliumPlatform;
 
 import net.caffeinemc.mods.sodium.api.config.ConfigEntryPoint;
 import net.caffeinemc.mods.sodium.api.config.ConfigState;
-import net.caffeinemc.mods.sodium.api.config.option.Range;
 import net.caffeinemc.mods.sodium.api.config.structure.ConfigBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.IntegerOptionBuilder;
 import net.caffeinemc.mods.sodium.api.config.structure.ModOptionsBuilder;
 
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.OptionInstance;
 import net.minecraft.resources.Identifier;
 
 /**
- * Widens Sodium's render-distance slider to Meshelium's ceiling.
+ * Meshelium's entry in Sodium's config: the render-distance overlay, and
+ * since 1.6.2 the Meshelium page ({@link MesheliumSodiumPage}).
  *
- * <h2>The problem this solves (recon 2026-09-06, javap-verified)</h2>
+ * <h2>The problem the overlay solves (recon 2026-09-06, javap-verified)</h2>
  * <p>Sodium 0.9.2 replaces vanilla's Video Settings screen with its own,
  * and its render-distance option is a second front-end onto vanilla's
  * {@code Options.renderDistance()}: it reads and writes the vanilla
@@ -59,12 +61,32 @@ import net.minecraft.resources.Identifier;
  * on both loaders - that kept the adapter out of the NeoForge jar. The
  * timing is safe on both: {@code registerConfigLate} runs at
  * {@code Minecraft.onGameLoadFinished}, long after each loader's
- * entrypoint has installed the platform services.
+ * entrypoint has installed the platform services. Sodium's list shows the
+ * version without its {@code +mc26.x} build tag, the way Sodium shows its
+ * own, since the game version is the one thing every mod in that list has
+ * in common.
  *
+ * <h2>What the range follows (1.6.2)</h2>
  * <p>A range PROVIDER rather than a fixed range, because Meshelium's
  * ceiling is live-editable and Sodium builds its {@code Config} once per
- * session; the provider is re-evaluated when Sodium applies its screen
- * ({@link ConfigState#UPDATE_ON_APPLY}).
+ * session. It declares three triggers. The Distance Cap option on
+ * Meshelium's page, so the slider's ceiling follows the cap's PENDING value
+ * on the same screen, before Apply; {@link ConfigState#UPDATE_ON_REBUILD},
+ * so a cap changed anywhere else (the vanilla Meshelium screen, a
+ * {@code -D} override) is picked up at the next open of Sodium's screen
+ * rather than the next game start; and {@link ConfigState#UPDATE_ON_APPLY}
+ * as before. The range is a {@link MesheliumSodiumRange}: when the ceiling
+ * drops under the current render distance, the distance becomes the
+ * ceiling, not Sodium's default of 12.
+ *
+ * <p>The overlay also carries its own binding, the one field Sodium's
+ * option is otherwise left to provide. It does what Sodium's does, read
+ * and write vanilla's option, with one guard: the value is clamped to the
+ * option's CURRENT range before {@code OptionInstance.set} sees it, because
+ * that setter answers an out-of-range value with the initial 12. The cap's
+ * binding widens the range first (it runs earlier in Sodium's apply order,
+ * {@link MesheliumSodiumPage}), so the guard is never the thing that acts;
+ * it is there so that no ordering Sodium may choose later can reach 12.
  *
  * <h2>The half that lives on our side</h2>
  * <p>The slider alone would move to 96 and render 32: the integrated
@@ -90,15 +112,20 @@ public final class MesheliumSodiumConfigEntry implements ConfigEntryPoint {
     @Override
     public void registerConfigLate(ConfigBuilder builder) {
         ModOptionsBuilder mod = builder.registerOwnModOptions();
-        mod.setName("Meshelium").setVersion(version());
+        mod.setName("Meshelium").setVersion(version()).formatVersion(MesheliumSodiumConfigEntry::withoutBuildTag);
         IntegerOptionBuilder overlay = builder.createIntegerOption(RENDER_DISTANCE);
-        overlay.setRangeProvider(MesheliumSodiumConfigEntry::range, ConfigState.UPDATE_ON_APPLY);
+        overlay.setRangeProvider(MesheliumSodiumConfigEntry::range,
+                MesheliumSodiumPage.DISTANCE_CAP, ConfigState.UPDATE_ON_REBUILD, ConfigState.UPDATE_ON_APPLY);
+        overlay.setBinding(MesheliumSodiumConfigEntry::saveRenderDistance,
+                MesheliumSodiumConfigEntry::loadRenderDistance);
         mod.registerOptionOverlay(RENDER_DISTANCE, overlay, OVERLAY_PRIORITY);
+        MesheliumSodiumPage.addTo(builder, mod);
         MesheliumLog.LOGGER.info(
                 "Meshelium overlays Sodium's render-distance slider: range 2..{} (Sodium's own is "
                         + "2..32). The value is vanilla's option either way; only the range "
-                        + "differs, and it follows Meshelium's render-distance ceiling.",
-                sliderMax());
+                        + "differs, and it follows Meshelium's render-distance ceiling. Meshelium's "
+                        + "settings page is registered under its own entry in Sodium's video settings.",
+                sliderMax(MesheliumConfig.maxRenderDistanceConfigured()));
     }
 
     /**
@@ -110,17 +137,36 @@ public final class MesheliumSodiumConfigEntry implements ConfigEntryPoint {
      * Capped at the slider ceiling; above it stays behind Meshelium's own
      * custom-entry friction.
      */
-    static Range range(ConfigState state) {
-        return new Range(2, sliderMax(), 1);
+    static MesheliumSodiumRange range(ConfigState state) {
+        return new MesheliumSodiumRange(2, sliderMax(MesheliumSodiumPage.effectiveCap(state)), 1);
     }
 
-    static int sliderMax() {
-        int configured = MesheliumConfig.maxRenderDistanceConfigured();
-        boolean extendedWanted = configured > 32 && MesheliumConfig.terrainRenderingEnabled();
-        return extendedWanted ? Math.min(configured, MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE) : 32;
+    static int sliderMax(int configuredCap) {
+        boolean extendedWanted = configuredCap > 32 && MesheliumConfig.terrainRenderingEnabled();
+        return extendedWanted ? Math.min(configuredCap, MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE) : 32;
     }
 
     private static String version() {
         return MesheliumPlatform.modVersion("meshelium").orElse("unknown");
+    }
+
+    private static Integer loadRenderDistance() {
+        return Minecraft.getInstance().options.renderDistance().get();
+    }
+
+    /** Vanilla's setter, with the value held inside the option's current range first. */
+    private static void saveRenderDistance(Integer value) {
+        OptionInstance<Integer> option = Minecraft.getInstance().options.renderDistance();
+        int held = value;
+        if (option.values() instanceof OptionInstance.IntRange range) {
+            held = Math.clamp(held, range.minInclusive(), range.maxInclusive());
+        }
+        option.set(held);
+    }
+
+    /** {@code 1.6.2+mc26.3} reads as {@code 1.6.2} in Sodium's list. */
+    static String withoutBuildTag(String version) {
+        int plus = version.indexOf('+');
+        return plus > 0 ? version.substring(0, plus) : version;
     }
 }

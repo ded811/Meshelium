@@ -6,6 +6,7 @@ package com.deds.meshelium.gametest.client;
 
 import com.deds.meshelium.MesheliumConfig;
 import com.deds.meshelium.MesheliumGate;
+import com.deds.meshelium.MesheliumLog;
 import com.deds.meshelium.MesheliumPlatform;
 import com.deds.meshelium.sodium.MesheliumRegionMirror;
 import com.deds.meshelium.sodium.MesheliumRegionRunCache;
@@ -741,6 +742,14 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         if (lattice != null) {
             throw new AssertionError("GPU facing formula: " + lattice);
         }
+        // And the dip detector's rule, for the same reason and in the same
+        // place: 97_21 can only ever show that the detector stayed SILENT
+        // through a real reload, which is worth nothing until something
+        // has shown what it speaks for. Pure CPU, no world needed.
+        String dip = dipRuleFailure();
+        if (dip != null) {
+            throw new AssertionError("visibility-dip rule: " + dip);
+        }
 
         GpuLegs legs = new GpuLegs();
         pinPose(context, world, legs);
@@ -766,6 +775,7 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         runLeg(context, world, legs, "97_16", () -> legForcedDecline(context, legs, true));
         runLeg(context, world, legs, "97_17", () -> legFrustumRegions(context, legs));
         runLeg(context, world, legs, "97_20", () -> legGeometryMapParity(context));
+        runLeg(context, world, legs, "97_21", () -> legStreamingDips(context, world, legs));
         // NEXT (c1): the WALKING leg, and LAST is a hard requirement rather
         // than a preference. assertHalfResHealthy (97_18) and legOcclusionOn
         // (97_10) both assert halfResArmSkips() != 0 -> throw ABSOLUTELY, so
@@ -911,6 +921,29 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
      * compare for a reason that has nothing to do with the draw.</p>
      */
     private static void legSteadyAndParity(ClientGameTestContext context, GpuLegs legs) {
+        // The one-frame region hold is OFF for this leg's measurement, and
+        // has to be. 97_01 asserts that VisMode 0 draws EXACTLY the BFS
+        // mask the list path drew, and the hold deliberately adds regions
+        // the list path does not have - regions Sodium dropped from this
+        // frame's list that Meshelium keeps for one more. With it armed the
+        // leg failed on its own success: GPU 139 sections against the list
+        // path's 127. The equality is the instrument for the mirror, the
+        // ids, the keys and the facing formula, so it is measured without
+        // the hold; the hold has its own coverage in 97_21.
+        String heldBefore = System.getProperty(SodiumTerrainDrawer.PROPERTY_REGION_HOLD);
+        System.setProperty(SodiumTerrainDrawer.PROPERTY_REGION_HOLD, "false");
+        try {
+            legSteadyAndParityBody(context, legs);
+        } finally {
+            if (heldBefore == null) {
+                System.clearProperty(SodiumTerrainDrawer.PROPERTY_REGION_HOLD);
+            } else {
+                System.setProperty(SodiumTerrainDrawer.PROPERTY_REGION_HOLD, heldBefore);
+            }
+        }
+    }
+
+    private static void legSteadyAndParityBody(ClientGameTestContext context, GpuLegs legs) {
         long owned0 = SodiumTerrainDrawer.framesOwned();
         waitForRung(context, "0b", owned0, "97_00");
         // NEXT (c): a GUARD, not evidence. Occlusion is OFF on rung 0b, so
@@ -3313,6 +3346,205 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
     // ---- 97 helpers ----
 
     /** {@link MesheliumRegionMirror#censusForTest} on the client thread; null when no mirror is live. */
+    /**
+     * The dip rule on synthetic triples: what it fires on, and the four
+     * things it must not fire on. Returns the first failure or null.
+     *
+     * <p>Each row is (left A, left B, left listed, trough A, trough B,
+     * trough listed, right A, right B, right listed, expected). The rule is
+     * {@code SodiumTerrainDrawer.dipRuleForTest}; the numbers are the shape
+     * of a dip rather than any measured scene.
+     */
+    private static String dipRuleFailure() {
+        int[][] rows = {
+            // The thing itself: a tenth of the terrain gone for one frame,
+            // back the next, the same list offered throughout.
+            {4000, 0, 9000, 3550, 0, 9000, 3990, 0, 9000, 1},
+            // 8% exactly is the boundary and must NOT fire (the rule is a
+            // strict loss of more than 8% of the lower shoulder).
+            {4000, 0, 9000, 3680, 0, 9000, 4000, 0, 9000, 0},
+            // Terrain going behind a hill: a step, not a dip. Nothing hands
+            // it back, and this is what ordinary occlusion looks like.
+            {4000, 0, 9000, 3550, 0, 9000, 3550, 0, 9000, 0},
+            // A shallow wobble: real, and not what anyone can see.
+            {4000, 0, 9000, 3900, 0, 9000, 4000, 0, 9000, 0},
+            // The scene itself changed - a teleport, a render distance, a
+            // region unloading. The drawn count says dip, the offered count
+            // says the frame is not comparable, and the offered count wins.
+            {4000, 0, 9000, 3550, 0, 6000, 3990, 0, 9000, 0},
+            // ... including when it is the RECOVERY frame that moved.
+            {4000, 0, 9000, 3550, 0, 9000, 3990, 0, 12000, 0},
+            // Too small a scene to judge: a cave, a screen of sky, a world
+            // still building.
+            {40, 0, 200, 10, 0, 200, 40, 0, 200, 0},
+            // A trough whose right shoulder never comes back up: the two
+            // shoulders disagree, so the window is a slope and not a V.
+            {4000, 0, 9000, 3550, 0, 9000, 3600, 0, 9000, 0},
+            // The camera is opening the scene up - the shoulders drift 4%
+            // apart - and the dip in the middle is still a dip. This is
+            // the case the shoulder tolerance exists for.
+            {4000, 0, 9000, 3500, 0, 9000, 4160, 0, 9000, 1},
+            // Streaming: the offered count creeps up a couple of percent a
+            // frame and the dip is still a dip. This is the case the
+            // offered-count tolerance exists for, so it is the case that
+            // would silently kill the detector if it were ever tightened.
+            {4000, 0, 9000, 3550, 0, 9150, 3990, 0, 9300, 1},
+            // The same picture, divided differently: phase B stops carrying
+            // part of it for one frame and phase A never moves. Nothing
+            // disappeared, so this must NOT read as a disappearance - the
+            // reason phase A has to be the phase that collapsed.
+            {4000, 600, 9000, 4000, 0, 9000, 4000, 600, 9000, 0},
+            // And the same drop WITH phase A collapsing is the real thing
+            // again, so the guard cannot be passing by refusing everything.
+            {4000, 600, 9000, 3400, 0, 9000, 4000, 590, 9000, 1},
+        };
+        for (int[] r : rows) {
+            boolean got = SodiumTerrainDrawer.dipRuleForTest(r[0], r[1], r[2], r[3], r[4], r[5],
+                    r[6], r[7], r[8]);
+            boolean want = r[9] != 0;
+            if (got != want) {
+                return "A/B " + r[0] + "+" + r[1] + " / " + r[3] + "+" + r[4] + " / " + r[6] + "+"
+                        + r[7] + ", listed " + r[2] + "/" + r[5] + "/" + r[8] + ": expected "
+                        + (want ? "a dip" : "no dip") + ", got " + (got ? "a dip" : "no dip");
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 97_21: the visibility-dip detector stays silent through a real
+     * reload, and says so about enough frames to mean it.
+     *
+     * <h2>What this proves and what it does not</h2>
+     * <p>It does NOT reproduce the owner's flicker. That was reported on a
+     * Radeon 780M under RADV at render distance 48 where the terrain pass
+     * alone costs 3-7 ms a frame, and this runs at render distance 5 on a
+     * desk where it costs tens of microseconds. What it proves is the
+     * other half, and the half that decides whether his log is readable:
+     * that a session which streams thousands of sections in and out, with
+     * regions created, deleted and rebuilt throughout, does not make the
+     * counter move. A detector that fires on ordinary streaming would send
+     * him a number that says nothing.
+     *
+     * <h2>Why it cannot pass vacuously</h2>
+     * <p>Three counters must move by real amounts before the silence is
+     * allowed to mean anything: owned frames (the rung drew), folded stats
+     * frames (the detector actually ran on them, three frames at a time),
+     * and the upload hook (chunks really did arrive). The rule itself is
+     * proven separately, before any leg runs.
+     */
+    private static void legStreamingDips(ClientGameTestContext context,
+            TestSingleplayerContext world, GpuLegs legs) {
+        long dipsBefore = SodiumTerrainDrawer.visibilityDips();
+        long ownedBefore = SodiumTerrainDrawer.framesOwned();
+        long foldedBefore = SodiumTerrainDrawer.statsFramesRead();
+        long uploadsBefore = SodiumTerrainDrawer.hookUpload();
+        long declinesBefore = SodiumTerrainDrawer.frameDeclinesTotal();
+        long droppedBefore = SodiumTerrainDrawer.droppedRegionsTotal();
+        long gapsBefore = SodiumTerrainDrawer.oneFrameGapsTotal();
+        long unreachableBefore = SodiumTerrainDrawer.unreachableSectionsTotal();
+
+        // The streaming is made by the RENDER DISTANCE, not by moving the
+        // player, and that is the whole design of this leg.
+        //
+        // It teleported far and back for two runs, which is what 97_03
+        // does and is the bigger storm - and it killed the player both
+        // times. `surfaceAt` asks the server's MOTION_BLOCKING heightmap
+        // for a column whose chunk is not generated or no longer loaded,
+        // which answers with the bottom of the world, so the teleport put
+        // him at y = -63, inside bedrock, and he suffocated. The return
+        // teleport then waited on a chunk-render predicate that a death
+        // screen never satisfies (leg timed out), and 97_19 after it
+        // refused to hold a key with a screen open. Both failures were
+        // this leg's, and neither was about anything it tests.
+        //
+        // A render-distance change is the same storm without the hazard:
+        // Sodium destroys every region and builds a new RenderSectionManager
+        // (97_04 and 97_13 rely on exactly that), so the mirror is
+        // rebuilt from nothing, every id is re-acquired and every record
+        // re-committed, with the player standing still on known ground.
+        int rdBefore = renderDistance(context);
+        int rdOther = rdBefore >= 24 ? rdBefore - 8 : rdBefore + 8;
+        setRenderDistance(context, rdOther);
+        context.waitTicks(100);
+        waitForUploadsToSettle(context);
+        setRenderDistance(context, rdBefore);
+        HarnessCompat.waitForChunksRender(world);
+        context.waitTicks(100);
+        waitForUploadsToSettle(context);
+
+        long owned = SodiumTerrainDrawer.framesOwned() - ownedBefore;
+        long folded = SodiumTerrainDrawer.statsFramesRead() - foldedBefore;
+        long uploads = SodiumTerrainDrawer.hookUpload() - uploadsBefore;
+        long dips = SodiumTerrainDrawer.visibilityDips() - dipsBefore;
+        long droppedRegions = SodiumTerrainDrawer.droppedRegionsTotal() - droppedBefore;
+        long gaps = SodiumTerrainDrawer.oneFrameGapsTotal() - gapsBefore;
+        long unreachable = SodiumTerrainDrawer.unreachableSectionsTotal() - unreachableBefore;
+        String counts = "owned frames " + owned + ", stats frames folded " + folded
+                + ", upload hook +" + uploads + ", declines +"
+                + (SodiumTerrainDrawer.frameDeclinesTotal() - declinesBefore)
+                + ", mirrored regions dropped from a frame's list +" + droppedRegions
+                + ", one-frame region gaps +" + gaps
+                + ", unreachable sections +" + unreachable;
+        assertNotBroken("97_21");
+        // The leg moves the player twice and the leg after it holds a key,
+        // which a death screen would swallow. Say so here rather than let
+        // 97_19 fail for 97_21's reason, as it did on the first run.
+        String screen = context.computeOnClient(client -> client.gui.screen() == null
+                ? null : client.gui.screen().getClass().getName());
+        if (screen != null) {
+            throw new AssertionError("97_21 HARNESS: a screen is open after the two teleports ("
+                    + screen + "); the player did not survive the trip and every leg after this "
+                    + "one is now testing a dead player (" + counts + ")");
+        }
+        if (owned < 100L) {
+            throw new AssertionError("97_21 VACUOUS: the rung drew " + owned + " owned frames "
+                    + "across two reloads (" + counts + "); the detector had nothing to judge");
+        }
+        if (folded < 100L) {
+            throw new AssertionError("97_21 VACUOUS: only " + folded + " stats frames were folded "
+                    + "(" + counts + "); the detector runs at the fold, so silence over this many "
+                    + "frames is not a statement");
+        }
+        if (uploads < 50L) {
+            throw new AssertionError("97_21 VACUOUS: the upload hook moved by " + uploads
+                    + " across a render distance of " + rdBefore + " -> " + rdOther + " -> "
+                    + rdBefore + " (" + counts + "); no chunks streamed, so nothing was tested");
+        }
+        if (dips != 0L) {
+            throw new AssertionError("97_21: the visibility-dip detector fired " + dips
+                    + " time(s) during an ordinary reload (last at stats frame "
+                    + SodiumTerrainDrawer.lastVisibilityDipFrame() + ", " + counts + "). Either "
+                    + "terrain really did vanish for a frame on this desk, or the rule is loose "
+                    + "enough to fire on streaming - and until that is settled the counter cannot "
+                    + "be read as evidence of anything on anyone else's machine");
+        }
+        if (unreachable != 0L) {
+            throw new AssertionError("97_21: " + unreachable + " section(s) held geometry that "
+                    + "the copy on the graphics card could not reach (" + counts + "). The task "
+                    + "stage enumerates ranks of the row's occupancy mask, so a section the frame "
+                    + "lists and the mask does not hold is drawn by nothing, while the list path "
+                    + "would have drawn it. If this happens on this desk it is not a remote "
+                    + "machine's problem");
+        }
+        if (gaps != 0L) {
+            throw new AssertionError("97_21: " + gaps + " region(s) were in a frame's draw list, "
+                    + "missing from the next frame's, and back in the one after (" + counts
+                    + "). Each one is a region drawn by no phase of that middle frame - the exact "
+                    + "shape of the flicker reported from the owner's laptop - and seeing it here "
+                    + "makes this desk the place to debug it");
+        }
+        if (droppedRegions != 0L) {
+            throw new AssertionError("97_21: the frame walk passed over " + droppedRegions
+                    + " region(s) that the mirror had committed as live, because Sodium had no "
+                    + "geometry buffer for them at that moment (" + counts + "). Each one is a "
+                    + "region drawn in no phase of that frame - a chunk-sized hole for one frame - "
+                    + "and if it happens on this desk it is not a remote machine's problem");
+        }
+        System.out.println("[Meshelium] 97_21: no visibility dips (" + counts + ")");
+        context.takeScreenshot(TestScreenshotOptions.of("97_21_after_streaming"));
+    }
+
     private static int[] census(ClientGameTestContext context) {
         return context.computeOnClient(client -> MesheliumRegionMirror.censusForTest());
     }
@@ -3628,19 +3860,6 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         context.runOnClient(client -> client.gui.setScreen(
                 HarnessCompat.optionsScreen(client.gui.screen(), client.options, true)));
         context.waitTicks(2);
-        // The pause-menu shape (inWorld = true) of the "Meshelium..." row.
-        // assertOptionsMenuButtonUnderSodium pins the title-screen shape;
-        // inWorld only selects the header's second button and the grid path
-        // is shared (OptionsScreen.init ip 122-385), so this one check pins
-        // both constructor shapes for free, with no extra screenshot.
-        context.runOnClient(client -> {
-            if (findButton(client.gui.screen(), "meshelium.options.menu") == null) {
-                throw new AssertionError("no 'Meshelium...' row on the in-world Options screen "
-                        + "(the pause-menu shape, inWorld=true) with Sodium installed, although "
-                        + "the title-screen shape has one; the two share the grid path, so "
-                        + "OptionsScreenMixin is not what changed here");
-            }
-        });
         context.clickScreenButton("options.video"); // Sodium substitutes the screen this opens
         context.waitTicks(5);
         int[] got = new int[1];
@@ -3676,11 +3895,12 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
      * Meshelium reaches its own screen by adding a button to vanilla's
      * Video Settings ({@code VideoSettingsScreenMixin}); Sodium substitutes
      * that screen, so the button has nowhere to attach and, until the
-     * "Meshelium..." row on vanilla's Options screen
-     * ({@code OptionsScreenMixin}, owner directive 2026-09-13), the
-     * {@code /meshelium} command silently became the only route in. That
-     * row is the menu route now, and {@link #assertOptionsMenuButtonUnderSodium}
-     * pins it on every Sodium form.
+     * "Meshelium..." row on vanilla's Options screen (2026-09-13), the
+     * {@code /meshelium} command silently became the only route in. Since
+     * 1.6.2 the menu route under Sodium is Meshelium's own page inside
+     * Sodium's video settings, and {@link #assertMesheliumPageInSodiumScreen}
+     * pins it on every Sodium form; the vanilla screen photographed here is
+     * the page's second layer (status, banner, Reset), reached from it.
      *
      * <p>The render-distance range is the other one. Vanilla stops at 32
      * and Meshelium widens the option past it — a feature that has nothing
@@ -3721,176 +3941,291 @@ public final class MesheliumSodiumStandDownTest implements FabricClientGameTest 
         context.runOnClient(client -> client.gui.setScreen(null));
         context.waitTicks(2);
 
-        assertOptionsMenuButtonUnderSodium(context);
+        assertMesheliumPageInSodiumScreen(context);
     }
 
     /**
-     * The "Meshelium..." row at the bottom of vanilla's Options screen,
-     * the route the owner asked for when Sodium is on (2026-09-13:
-     * "maybe just at the bottom of the options menu??"), added by
-     * {@code OptionsScreenMixin} only while Sodium is installed.
+     * Meshelium's page inside Sodium's video settings (1.6.2), the route
+     * that replaced the "Meshelium..." Options row: owner directive
+     * 2026-09-20, "do that when sodiums installed instead of the seperate
+     * menu button on the menu area".
      *
-     * <p>Runs on every Sodium form (Vulkan, OpenGL, and the declined
-     * adapter), starting from the TitleScreen the caller leaves behind.
-     * The predicate is pinned from both sides: this leg proves the row is
-     * there with Sodium, and {@code MesheliumBootSmokeTest} proves it is
-     * absent without; either alone would pass with a mixin that never
-     * applies or one that always applies.
+     * <p>Runs on every Sodium form (Vulkan, OpenGL, the declined adapter)
+     * from the TitleScreen the caller leaves behind. Fabric's click helper
+     * and this class's widget walk are blind to Sodium's widgets, so
+     * nothing here asserts presence through them; the census goes through
+     * Sodium's built config model ({@code SodiumPageProbe}), with Sodium's
+     * own entry as the control, and the click goes through the real
+     * control element's geometry and the screen's own mouse routing.
      *
-     * <p>What is asserted and why each piece is separate. The widget walk
-     * sees vanilla's own grid first (a control: an absence below is then a
-     * real absence, and the row displaced nothing). Presence, then
-     * {@code active} and {@code visible}, then geometry: flush with the
-     * grid's left and right edges (full width like the other rows), below
-     * every grid button, and above Done (inside the content area, on
-     * screen). Fabric's click helper walks {@code Screen.renderables} and
-     * presses the first Button whose translated label matches, via
-     * {@code onPress}, without checking active or visible (the 95 leg
-     * already relies on this for the grid), so the press-through below
-     * proves the handler fires and the screen changes, not that a player
-     * could click the button; visibility is asserted separately rather
-     * than inferred from the press. Exactly one match of the label, before
-     * and after the round trip: Done on the Meshelium screen must return
-     * the SAME Options instance (parent wiring right, no
-     * VideoSettingsScreen rebuild branch fired), and 26.2's
-     * {@code Screen.init(int,int)} only repositions an initialized screen,
-     * so a second row after re-entry would mean {@code init()} re-ran.
+     * <p>What is pinned, and why each piece is separate. (1) The row is
+     * gone from vanilla's Options screen. (2) Opening Sodium's screen must
+     * not rewrite a stored value the config can legitimately hold: an
+     * off-lattice fog end survives, and a cap above the page's slider comes
+     * down to the slider's top rather than to the default (D-019's class;
+     * Sodium validates every mod's options at every open). (3) The page
+     * lists exactly the rows the vanilla screens build under Sodium, in
+     * order, and the adapter-only rows are enabled exactly when the
+     * adapter is armed, on every form. (4) A change made through the real
+     * control is STAGED: nothing reaches the config until Apply, and Apply
+     * writes the field, the file, and the dependent row's enabled state.
+     * (5) The three-flag Backend Popup binding, through the model.
      */
-    private static void assertOptionsMenuButtonUnderSodium(ClientGameTestContext context) {
-        String menuKey = "meshelium.options.menu";
-        String tooltipKey = "meshelium.options.tooltip.menu";
-        OptionsScreen[] menu = new OptionsScreen[1];
+    private static void assertMesheliumPageInSodiumScreen(ClientGameTestContext context) {
+        int[] before = new int[3];
+        MesheliumConfig.FogMode[] fogBefore = new MesheliumConfig.FogMode[1];
         context.runOnClient(client -> {
-            // Key presence first. Both walkers below (findButton here and
-            // fabric's clickScreenButton) compare TRANSLATED strings, and a
-            // missing key degrades to the raw key on both sides, so a typo'd
-            // or absent en_us.json entry would still match, still click,
-            // and leave both legs green while the player reads a raw key.
-            if (!Language.getInstance().has(menuKey) || !Language.getInstance().has(tooltipKey)) {
-                throw new AssertionError("en_us.json is missing the Options-screen row's key ("
-                        + menuKey + " or " + tooltipKey + "); the walkers compare translated "
-                        + "strings and would match the raw key, so this has to be pinned "
-                        + "before the button is looked for");
-            }
-            // The TitleScreen shape (inWorld = false, as TitleScreen builds
-            // it); assertSodiumSliderAcceptsTheWidenedRange pins the
-            // pause-menu shape.
-            menu[0] = HarnessCompat.optionsScreen(client.gui.screen(), client.options, false);
-            client.gui.setScreen(menu[0]);
+            MesheliumConfig config = MesheliumConfig.get();
+            before[0] = config.maxRenderDistance;
+            before[1] = config.fogEndPercent;
+            before[2] = config.showVulkanPrompt ? 1 : 0;
+            fogBefore[0] = config.fogMode;
+            config.maxRenderDistance = 100; // above the page's 96 slider
+            config.fogEndPercent = 137;     // off the vanilla slider's 5% lattice
+            config.showVulkanPrompt = true;
+            config.fogMode = MesheliumConfig.FogMode.OFF;
+            config.save();
         });
+
+        // The player's route: Options, Video Settings, Sodium's screen.
+        context.runOnClient(client -> client.gui.setScreen(
+                HarnessCompat.optionsScreen(client.gui.screen(), client.options, false)));
         context.waitForScreen(OptionsScreen.class);
         context.waitTicks(2);
-
         context.runOnClient(client -> {
             Screen screen = client.gui.screen();
-            if (!(screen instanceof OptionsScreen)) {
-                throw new AssertionError("expected vanilla's Options screen, got " + screen);
+            if (findButton(screen, "options.video") == null) {
+                throw new AssertionError("the widget walk did not see vanilla's own Options grid, "
+                        + "so it could not judge whether the old Meshelium row is gone");
             }
-            // Control: the walk sees vanilla's own grid (video: left column
-            // row 1; sounds: right column row 0, per javap of OptionsScreen
-            // .init's RowHelper order) and the footer, so an absence below
-            // is a real absence and the row displaced none of them.
-            Button video = findButton(screen, "options.video");
-            Button sounds = findButton(screen, "options.sounds");
-            Button done = findButton(screen, "gui.done");
-            if (video == null || sounds == null || done == null) {
-                throw new AssertionError("the widget walk did not see vanilla's own Options grid "
-                        + "(video=" + video + ", sounds=" + sounds + ", done=" + done + "), so "
-                        + "nothing about the Meshelium row could be judged; either the walk is "
-                        + "wrong or the row displaced vanilla's buttons");
-            }
-            Button ours = findButton(screen, menuKey);
-            if (ours == null) {
-                throw new AssertionError("no 'Meshelium...' button on vanilla's Options screen "
-                        + "with Sodium installed; Sodium replaces the Video Settings supplier, so "
-                        + "this button is the only menu route in");
-            }
-            // Fabric's click helper presses through Button.onPress without
-            // checking either flag, so the press-through further down would
-            // pass on a button a player could not click. This is the only
-            // interactability pin; do not drop it as redundant.
-            if (!ours.active || !ours.visible) {
-                throw new AssertionError("the 'Meshelium...' row exists but is not clickable "
-                        + "(active=" + ours.active + ", visible=" + ours.visible + ")");
-            }
-            // Full width like the other rows: flush with the left column's
-            // left edge and the right column's right edge. The wrapper
-            // column has no slack (316 both rows), so these are exact.
-            if (ours.getX() != video.getX() || ours.getRight() != sounds.getRight()) {
-                throw new AssertionError("the 'Meshelium...' row is not flush with the grid: "
-                        + "ours x=" + ours.getX() + " right=" + ours.getRight()
-                        + ", grid x=" + video.getX() + " right=" + sounds.getRight());
-            }
-            // Below the grid: under the Video Settings row, and under every
-            // other content button (the whole grid, whatever vanilla adds
-            // to it later).
-            if (ours.getY() < video.getBottom()) {
-                throw new AssertionError("the 'Meshelium...' row (y=" + ours.getY()
-                        + ") is not below the grid's Video Settings row (bottom=" + video.getBottom() + ")");
-            }
-            int gridBottom = Integer.MIN_VALUE;
             List<AbstractWidget> widgets = new ArrayList<>();
             collectWidgets(screen, widgets);
             for (AbstractWidget widget : widgets) {
-                if (widget instanceof Button && widget != ours && widget != done) {
-                    gridBottom = Math.max(gridBottom, widget.getBottom());
+                if (widget instanceof Button && widget.getMessage().getString().equals("Meshelium...")) {
+                    throw new AssertionError("the 'Meshelium...' row is still on vanilla's Options screen; "
+                            + "1.6.2 moved Meshelium into Sodium's video settings instead");
                 }
             }
-            if (ours.getY() < gridBottom) {
-                throw new AssertionError("the 'Meshelium...' row (y=" + ours.getY()
-                        + ") overlaps the grid (lowest grid button bottom=" + gridBottom + ")");
-            }
-            // Inside the content area: above Done, which the footer pins on
-            // screen. At the harness's 240 px logical floor this is the
-            // tightest case (ours bottom 207 against Done y 213).
-            if (ours.getBottom() > done.getY()) {
-                throw new AssertionError("the 'Meshelium...' row (bottom=" + ours.getBottom()
-                        + ") runs into the footer (Done y=" + done.getY() + ")");
-            }
-            int matches = countButtons(screen, menuKey);
-            if (matches != 1) {
-                throw new AssertionError("expected exactly one 'Meshelium...' row on the Options "
-                        + "screen, found " + matches);
-            }
         });
-        context.takeScreenshot(TestScreenshotOptions.of("91_meshelium_options_menu_under_sodium"));
-
-        // Press-through: the handler fires and the Meshelium screen opens
-        // with this Options screen as its parent. Ten ticks for the settled
-        // header, as assertStatusHeaderTellsTheTruth does; the banner and
-        // status wording are that leg's business, not re-asserted here.
-        context.clickScreenButton(menuKey);
-        context.waitForScreen(MesheliumOptionsScreen.class);
-        context.waitTicks(10);
-        context.takeScreenshot(TestScreenshotOptions.of(
-                "94_meshelium_options_from_options_menu_under_sodium"));
+        context.clickScreenButton("options.video");
+        context.waitTicks(5);
         context.runOnClient(client -> {
-            if (!(client.gui.screen() instanceof MesheliumOptionsScreen)) {
-                throw new AssertionError("the 'Meshelium...' row did not open the Meshelium "
-                        + "settings screen, got " + client.gui.screen());
+            Screen screen = client.gui.screen();
+            if (!SodiumPageProbe.isSodiumScreen(screen)) {
+                throw new AssertionError("expected Sodium's video settings behind vanilla's Video "
+                        + "Settings button, got " + screen);
+            }
+            MesheliumConfig config = MesheliumConfig.get();
+            if (config.fogEndPercent != 137) {
+                throw new AssertionError("opening Sodium's screen rewrote fogEndPercent 137 to "
+                        + config.fogEndPercent + "; the page's range must accept every value the "
+                        + "config can hold, or Sodium's validation resets it (D-019)");
+            }
+            if (config.maxRenderDistance != MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE) {
+                throw new AssertionError("a cap of 100, above the page's slider, should read as "
+                        + MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE + " after Sodium's screen "
+                        + "validated it (brought to the edge, not to the default); got "
+                        + config.maxRenderDistance);
+            }
+            // Sodium queues the storage handler on a validation rewrite and
+            // flushes it from Apply only, so the file still says 100 here;
+            // the first Apply below is where it must read 96.
+            if (readConfigFile().get("maxRenderDistance").getAsInt() != 100) {
+                throw new AssertionError("meshelium.json changed at screen open; Sodium flushes storage "
+                        + "handlers only from Apply, so something else saved the file");
             }
         });
 
-        // Done returns to the SAME Options instance, and the row is still
-        // there exactly once (re-entry repositions, it does not re-init).
-        context.clickScreenButton("gui.done");
+        // The model census, with Sodium's own entry as the control.
+        context.runOnClient(client -> {
+            var mod = SodiumPageProbe.mesheliumEntry();
+            List<String> pages = SodiumPageProbe.pageNames(mod);
+            List<String> expectedPages = List.of(Component.translatable("meshelium.options.sodium_page").getString());
+            if (!pages.equals(expectedPages)) {
+                throw new AssertionError("Meshelium's Sodium entry lists pages " + pages + ", expected "
+                        + expectedPages);
+            }
+            List<String> groups = SodiumPageProbe.groupNames(mod);
+            List<String> expectedGroups = List.of("",
+                    Component.translatable("meshelium.options.sodium_group.advanced").getString(), "");
+            if (!groups.equals(expectedGroups)) {
+                throw new AssertionError("Meshelium's page has groups " + groups + ", expected "
+                        + expectedGroups);
+            }
+            List<String> names = SodiumPageProbe.optionNames(mod);
+            List<String> expected = new ArrayList<>();
+            for (String key : new String[] {"meshelium.options.max_rd", "meshelium.options.sodium_gpu",
+                    "meshelium.options.fog", "meshelium.options.fog_end", "meshelium.options.detail_cull",
+                    "meshelium.options.sodium_occlusion", "meshelium.options.sodium_record_repair",
+                    "meshelium.options.debug_stats", "meshelium.options.popup", "meshelium.options.open"}) {
+                expected.add(Component.translatable(key).getString());
+            }
+            if (!names.equals(expected)) {
+                throw new AssertionError("Meshelium's page lists " + names + ", expected " + expected
+                        + ". The page must show exactly the rows the vanilla screens build under "
+                        + "Sodium (2026-09-16: a row that cannot act is furniture)");
+            }
+            // The page's own rules, re-derived: the adapter-only rows follow
+            // the gate, and every row with a -D override lever is held while
+            // that property is set (the harness passes -Dmeshelium.maxRenderDistance
+            // under -Pmeshelium.rd, so the cap's term is not academic).
+            boolean armed = MesheliumGate.sodiumAdapterArmed();
+            java.util.Map<net.minecraft.resources.Identifier, Boolean> expectedEnabled = new java.util.LinkedHashMap<>();
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.DISTANCE_CAP,
+                    System.getProperty("meshelium.maxRenderDistance") == null);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.GPU_VISIBILITY,
+                    armed && System.getProperty("meshelium.sodium.gpuDraw") == null);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE,
+                    System.getProperty("meshelium.fogMode") == null);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.SUB_PIXEL_CULL, armed);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.SODIUM_OCCLUSION,
+                    armed && System.getProperty("meshelium.sodium.occlusion") == null);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.RECORD_REPAIR,
+                    armed && System.getProperty("meshelium.sodium.remirrorOnRefusal") == null);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.DEBUG_STATS,
+                    armed && System.getProperty("meshelium.debugStats") == null);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.BACKEND_POPUP, true);
+            expectedEnabled.put(com.deds.meshelium.sodium.MesheliumSodiumPage.FULL_SCREEN, true);
+            for (var entry : expectedEnabled.entrySet()) {
+                if (SodiumPageProbe.isEnabled(entry.getKey()) != entry.getValue()) {
+                    throw new AssertionError(entry.getKey() + " is " + (entry.getValue() ? "disabled" : "enabled")
+                            + " (adapter armed: " + armed + "); the row's enabled rule is the gate and its "
+                            + "-D override lever, nothing else");
+                }
+            }
+            if (SodiumPageProbe.isEnabled(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_END)) {
+                throw new AssertionError("Fog Ends At is enabled while Distance Fog is Off; it follows "
+                        + "the fog mode's pending value");
+            }
+        });
+
+        context.runOnClient(client -> SodiumPageProbe.jumpToMesheliumPage(client.gui.screen()));
+        context.waitTicks(3);
+        context.takeScreenshot(TestScreenshotOptions.of("91_meshelium_page_in_sodium_screen"));
+
+        // Distance Fog through the real control: Off cycles to the next
+        // mode (Minecraft Default), staged, not saved. If the synthesized
+        // click does not route (a harness question, not a product one), the
+        // model stages it and the failure text of the next assertion says
+        // which path ran. Then the dependency: Fog Ends At must follow the
+        // PENDING mode, on while it is Match View Distance, off otherwise,
+        // before anything is applied; the apply below carries SCALED.
+        Object[] pendingFog = new Object[1];
+        boolean[] viaClick = new boolean[1];
+        context.runOnClient(client -> {
+            Screen screen = client.gui.screen();
+            int[] at = SodiumPageProbe.visibleControlCentre(screen,
+                    com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE);
+            if (at == null) {
+                throw new AssertionError("the Distance Fog row is outside the option list's visible "
+                        + "band after jumping to Meshelium's page");
+            }
+            SodiumPageProbe.click(screen, at[0], at[1]);
+            viaClick[0] = SodiumPageProbe.hasChanged(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE);
+            if (!viaClick[0]) {
+                SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE,
+                        MesheliumConfig.FogMode.VANILLA);
+            }
+            Object clickedTo = SodiumPageProbe.pending(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE);
+            if (clickedTo == MesheliumConfig.FogMode.OFF) {
+                throw new AssertionError("Distance Fog did not change (click routed: " + viaClick[0] + ")");
+            }
+            if (MesheliumConfig.get().fogMode != MesheliumConfig.FogMode.OFF) {
+                throw new AssertionError("the fog mode reached the config before Apply (click routed: "
+                        + viaClick[0] + "); Sodium's page must stage changes");
+            }
+            if (SodiumPageProbe.isEnabled(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_END)) {
+                throw new AssertionError("Fog Ends At is enabled with the pending mode " + clickedTo
+                        + "; it is live only for Match View Distance");
+            }
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE,
+                    MesheliumConfig.FogMode.SCALED);
+            if (!SodiumPageProbe.isEnabled(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_END)) {
+                throw new AssertionError("Fog Ends At stayed disabled with Match View Distance pending; "
+                        + "its enabled provider must read the fog mode's PENDING value");
+            }
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE,
+                    MesheliumConfig.FogMode.OFF);
+            if (SodiumPageProbe.isEnabled(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_END)) {
+                throw new AssertionError("Fog Ends At stayed enabled after the pending mode went back to Off");
+            }
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE,
+                    MesheliumConfig.FogMode.SCALED);
+            pendingFog[0] = SodiumPageProbe.pending(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE);
+            if (pendingFog[0] != MesheliumConfig.FogMode.SCALED) {
+                throw new AssertionError("staging Match View Distance left the pending mode at " + pendingFog[0]);
+            }
+        });
+        context.waitTicks(2);
+        context.takeScreenshot(TestScreenshotOptions.of("91_meshelium_page_fog_pending"));
+        MesheliumLog.LOGGER.info("[stand-down] Distance Fog staged via {}",
+                viaClick[0] ? "the real control's click routing" : "the model (click did not route)");
+
+        context.runOnClient(client -> {
+            SodiumPageProbe.applyAll();
+            MesheliumConfig config = MesheliumConfig.get();
+            if (config.fogMode != pendingFog[0]) {
+                throw new AssertionError("Apply left fogMode at " + config.fogMode + ", pending was "
+                        + pendingFog[0]);
+            }
+            String onDisk = readConfigFile().get("fogMode").getAsString();
+            if (!onDisk.equals(((MesheliumConfig.FogMode) pendingFog[0]).name())) {
+                throw new AssertionError("meshelium.json says fogMode " + onDisk + " after Apply; the "
+                        + "storage handler did not save");
+            }
+            if (readConfigFile().get("maxRenderDistance").getAsInt() != MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE) {
+                throw new AssertionError("the cap clamped at screen open (100 to "
+                        + MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE + ") did not reach meshelium.json "
+                        + "with the first Apply; the storage handler writes every field");
+            }
+            if (!SodiumPageProbe.isEnabled(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_END)) {
+                throw new AssertionError("Fog Ends At is disabled after applying Match View Distance");
+            }
+            // The three-flag binding, through the model.
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.BACKEND_POPUP, Boolean.FALSE);
+            if (!config.showVulkanPrompt) {
+                throw new AssertionError("Backend Popup reached the config before Apply");
+            }
+            SodiumPageProbe.applyAll();
+            if (config.showVulkanPrompt || !config.noMeshShaderNoticeShown || !config.vulkanFailedNoticeShown) {
+                throw new AssertionError("Backend Popup off must also mark both once-per-install notices "
+                        + "shown, as the vanilla Advanced screen does; got prompt=" + config.showVulkanPrompt
+                        + " noMesh=" + config.noMeshShaderNoticeShown + " failed=" + config.vulkanFailedNoticeShown);
+            }
+            if (readConfigFile().get("showVulkanPrompt").getAsBoolean()) {
+                throw new AssertionError("meshelium.json still says showVulkanPrompt true after Apply");
+            }
+        });
+        context.waitTicks(2);
+        context.takeScreenshot(TestScreenshotOptions.of("91_meshelium_page_after_apply"));
+
+        // Put everything back through the same path, then leave by Sodium's
+        // own Close, which returns to vanilla's Options screen.
+        context.runOnClient(client -> {
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_MODE, fogBefore[0]);
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.BACKEND_POPUP, before[2] == 1);
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.DISTANCE_CAP,
+                    Math.min(before[0], MesheliumConfig.SLIDER_MAX_RENDER_DISTANCE));
+            SodiumPageProbe.modify(com.deds.meshelium.sodium.MesheliumSodiumPage.FOG_END, before[1]);
+            SodiumPageProbe.applyAll();
+            MesheliumConfig config = MesheliumConfig.get();
+            config.maxRenderDistance = before[0];
+            config.fogEndPercent = before[1];
+            config.save();
+            client.gui.screen().onClose();
+        });
         context.waitForScreen(OptionsScreen.class);
-        context.runOnClient(client -> {
-            if (client.gui.screen() != menu[0]) {
-                throw new AssertionError("Done on the Meshelium screen must return the SAME "
-                        + "Options screen it was opened from, got " + client.gui.screen()
-                        + "; either the parent wiring is wrong or onClose took the "
-                        + "VideoSettingsScreen rebuild branch for a plain Options parent");
-            }
-            int matches = countButtons(client.gui.screen(), menuKey);
-            if (matches != 1) {
-                throw new AssertionError("after returning from the Meshelium screen the Options "
-                        + "screen has " + matches + " 'Meshelium...' rows; init() re-ran on an "
-                        + "initialized screen, which 26.2's Screen.init(int,int) guard forbids");
-            }
-        });
         context.clickScreenButton("gui.done");
         context.waitForScreen(TitleScreen.class);
+    }
+
+    private static com.google.gson.JsonObject readConfigFile() {
+        Path path = MesheliumPlatform.configDir().resolve("meshelium.json");
+        try {
+            return com.google.gson.JsonParser.parseString(Files.readString(path)).getAsJsonObject();
+        } catch (java.io.IOException e) {
+            throw new AssertionError("could not read " + path, e);
+        }
     }
 
     /**
